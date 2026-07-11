@@ -1,1 +1,5 @@
+---
+description: Orient and brainstorm before opening a change
+order: 1
+---
 Run `ds template explore` silently. Do not respond to the user until you have read the full output. Then follow its instructions.

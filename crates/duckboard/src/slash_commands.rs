@@ -21,6 +21,7 @@ pub fn system_registry() -> Vec<SlashCommand> {
         name: "help".into(),
         description: "Duckboard help (local). Agent: //help".into(),
         kind: SlashCommandKind::System,
+        order_key: None,
     }]
 }
 
@@ -69,7 +70,8 @@ pub fn parse_submit_slash(text: &str) -> SubmitSlash {
 
 /// Fixed prefix + kind sections from the live catalog for local `/help`.
 ///
-/// Empty kind sections are omitted. Entries within a section are sorted by name.
+/// Empty kind sections are omitted. System/Agent sections sort by name;
+/// Workflow sorts by order_key then name (unknown order last).
 pub fn build_system_help_body(catalog: &[SlashCommand], harness_id: Option<&str>) -> String {
     let mut out = String::from(
         "Running system command `/help`.\n\
@@ -109,7 +111,15 @@ fn append_kind_section(
     if entries.is_empty() {
         return;
     }
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    entries.sort_by(|a, b| {
+        if kind == SlashCommandKind::Workflow {
+            slash_order_rank(a.order_key)
+                .cmp(&slash_order_rank(b.order_key))
+                .then_with(|| a.name.cmp(&b.name))
+        } else {
+            a.name.cmp(&b.name)
+        }
+    });
     out.push('\n');
     out.push_str("## ");
     out.push_str(title);
@@ -131,6 +141,14 @@ pub fn slash_kind_rank(kind: SlashCommandKind) -> u8 {
         SlashCommandKind::System => 0,
         SlashCommandKind::Workflow => 1,
         SlashCommandKind::Agent => 2,
+    }
+}
+
+/// Workflow order key rank: `Some` ascending first; `None` last.
+pub fn slash_order_rank(order_key: Option<u32>) -> (u8, u32) {
+    match order_key {
+        Some(k) => (0, k),
+        None => (1, 0),
     }
 }
 
@@ -160,6 +178,7 @@ pub fn build_completion_catalog(
             name: cmd.name,
             description: cmd.description,
             kind: SlashCommandKind::System,
+            order_key: cmd.order_key,
         });
     }
 
@@ -177,6 +196,7 @@ pub fn build_completion_catalog(
             name: cmd.name,
             description: cmd.description,
             kind,
+            order_key: cmd.order_key,
         });
     }
 
@@ -192,6 +212,7 @@ mod tests {
             name: name.into(),
             description: format!("{name} system"),
             kind: SlashCommandKind::System,
+            order_key: None,
         }
     }
 
@@ -201,6 +222,7 @@ mod tests {
             name: name.into(),
             description: format!("{name} disc"),
             kind: SlashCommandKind::Agent,
+            order_key: None,
         }
     }
 
@@ -362,6 +384,7 @@ mod tests {
                 name: "ds-spec".into(),
                 description: "Spec stage".into(),
                 kind: SlashCommandKind::Workflow,
+                order_key: Some(40),
             },
         ];
         // WHEN help body is built
@@ -374,6 +397,35 @@ mod tests {
         assert!(
             !body.contains("## Agent skills"),
             "empty agent section must be omitted: {body}"
+        );
+    }
+
+    // @spec chat/slash-commands Local system submit: Help Workflow section lists by order key then name
+    #[test]
+    fn help_workflow_section_lists_by_order_key_then_name() {
+        // GIVEN a completion catalog with at least two Workflow entries that have different order keys
+        let catalog = vec![
+            SlashCommand {
+                name: "ds-spec".into(),
+                description: "Spec".into(),
+                kind: SlashCommandKind::Workflow,
+                order_key: Some(40),
+            },
+            SlashCommand {
+                name: "ds-explore".into(),
+                description: "Explore".into(),
+                kind: SlashCommandKind::Workflow,
+                order_key: Some(10),
+            },
+        ];
+        // WHEN the /help system message body is built
+        let body = build_system_help_body(&catalog, None);
+        // THEN the Workflow section lists those entries in ascending order-key order
+        let explore = body.find("/ds-explore").expect("ds-explore in body");
+        let spec = body.find("/ds-spec").expect("ds-spec in body");
+        assert!(
+            explore < spec,
+            "expected /ds-explore before /ds-spec in:\n{body}"
         );
     }
 

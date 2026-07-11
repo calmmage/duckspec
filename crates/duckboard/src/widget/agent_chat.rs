@@ -2030,7 +2030,7 @@ fn completion_divider<'a>() -> Element<'a, Msg> {
 
 /// Filter and score commands by fuzzy-matching `query` against command names.
 /// Returns `(index_into_commands, score)` sorted by descending score, then
-/// System → Workflow → Agent on ties.
+/// System → Workflow → Agent, then Workflow order_key (None last), then name.
 pub fn filter_commands(commands: &[SlashCommand], query: &str) -> Vec<(usize, i32)> {
     let mut matches: Vec<(usize, i32)> = commands
         .iter()
@@ -2038,9 +2038,15 @@ pub fn filter_commands(commands: &[SlashCommand], query: &str) -> Vec<(usize, i3
         .filter_map(|(i, cmd)| fuzzy_score(query, &cmd.name).map(|s| (i, s)))
         .collect();
     matches.sort_by(|a, b| {
-        b.1.cmp(&a.1).then_with(|| {
-            slash_kind_rank(commands[a.0].kind).cmp(&slash_kind_rank(commands[b.0].kind))
-        })
+        let ca = &commands[a.0];
+        let cb = &commands[b.0];
+        b.1.cmp(&a.1)
+            .then_with(|| slash_kind_rank(ca.kind).cmp(&slash_kind_rank(cb.kind)))
+            .then_with(|| {
+                crate::slash_commands::slash_order_rank(ca.order_key)
+                    .cmp(&crate::slash_commands::slash_order_rank(cb.order_key))
+            })
+            .then_with(|| ca.name.cmp(&cb.name))
     });
     matches
 }
@@ -2099,6 +2105,7 @@ mod tests {
             name: name.into(),
             description: name.into(),
             kind,
+            order_key: None,
         }
     }
 
@@ -2147,6 +2154,49 @@ mod tests {
         assert_eq!(commands[filtered[0].0].kind, SlashCommandKind::System);
         assert_eq!(commands[filtered[1].0].kind, SlashCommandKind::Workflow);
         assert_eq!(commands[filtered[2].0].kind, SlashCommandKind::Agent);
+    }
+
+    fn workflow(name: &str, order_key: Option<u32>) -> SlashCommand {
+        SlashCommand {
+            name: name.into(),
+            description: name.into(),
+            kind: SlashCommandKind::Workflow,
+            order_key,
+        }
+    }
+
+    // @spec chat/slash-commands Kind cues in completion: Equal scores order Workflow by order key then name
+    #[test]
+    fn equal_scores_order_workflow_by_order_key_then_name() {
+        // GIVEN two Workflow catalog entries with equal fuzzy scores for the current query
+        // AND the first has a higher order key than the second
+        let commands = vec![
+            workflow("ds-spec", Some(40)),
+            workflow("ds-explore", Some(10)),
+        ];
+        // WHEN the filtered completion list is built
+        let filtered = filter_commands(&commands, "");
+        // THEN the entry with the lower order key appears before the entry with the higher order key
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(commands[filtered[0].0].name, "ds-explore");
+        assert_eq!(commands[filtered[1].0].name, "ds-spec");
+    }
+
+    // @spec chat/slash-commands Kind cues in completion: Workflow without order key sorts after ordered Workflow
+    #[test]
+    fn workflow_without_order_key_sorts_after_ordered_workflow() {
+        // GIVEN two Workflow catalog entries with equal fuzzy scores for the current query
+        // AND one entry has an order key and the other has no order key
+        let commands = vec![
+            workflow("ds-custom", None),
+            workflow("ds-explore", Some(10)),
+        ];
+        // WHEN the filtered completion list is built
+        let filtered = filter_commands(&commands, "");
+        // THEN the entry with an order key appears before the entry without an order key
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(commands[filtered[0].0].name, "ds-explore");
+        assert_eq!(commands[filtered[1].0].name, "ds-custom");
     }
 
     /// @spec harness/model-picker Harness-grouped choices: Choices present each model under its harness

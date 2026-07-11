@@ -186,6 +186,8 @@ pub struct SlashCommand {
     pub name: String,
     pub description: String,
     pub kind: SlashCommandKind,
+    /// Tenths from frontmatter `order` (`3.1` → 31). `None` → after ordered peers.
+    pub order_key: Option<u32>,
 }
 
 #[cfg(test)]
