@@ -20,6 +20,8 @@ pub struct Config {
     pub model_defaults: HashMap<String, ModelRef>,
     /// Chat affordances: under-input agent hints.
     pub chat: ChatConfig,
+    /// Global version-control workflow for agent standing instructions.
+    pub vcs: VcsConfig,
 }
 
 /// Global chat UI flags (all projects / instances).
@@ -28,6 +30,90 @@ pub struct Config {
 pub struct ChatConfig {
     /// Under-input agent (oneshot) suggestions after a turn. Default off.
     pub agent_input_hints: bool,
+}
+
+/// Global VCS preferences (all projects / instances).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VcsConfig {
+    /// How the agent should treat version control. Injected into first-turn
+    /// priming. Default: plain git.
+    pub workflow: VcsWorkflow,
+}
+
+/// Logical VCS workflow the agent is told to follow.
+///
+/// `Worktrees` is agent-facing guidance only in this cut — multi-worktree
+/// session plumbing (per-change cwd) is not implemented yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VcsWorkflow {
+    /// Plain git (branch / commit / push).
+    #[default]
+    Git,
+    /// Jujutsu (`jj`) with a git backend.
+    Jj,
+    /// Git with one worktree per parallel change (logical only for now).
+    Worktrees,
+}
+
+impl VcsWorkflow {
+    pub const ALL: [VcsWorkflow; 3] = [Self::Git, Self::Jj, Self::Worktrees];
+
+    /// Short label for Settings pickers.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Git => "Git",
+            Self::Jj => "Jujutsu (jj)",
+            Self::Worktrees => "Git worktrees",
+        }
+    }
+
+    /// Standing instructions injected into the first-turn priming body.
+    pub fn standing_instructions(self) -> &'static str {
+        match self {
+            Self::Git => {
+                "Version control: plain git.\n\
+                 - Use `git` commands for all version control operations\n\
+                 - Do NOT use `jj` commands\n\
+                 - NEVER commit automatically — always show the suggested commit \
+                 message and wait for explicit user confirmation before running \
+                 `git commit`\n\
+                 - Do NOT run destructive git commands (force push, hard reset, \
+                 checkout that discards work) without explicit confirmation"
+            }
+            Self::Jj => {
+                "Version control: jujutsu (jj).\n\
+                 - Use `jj` commands for all version control operations\n\
+                 - Do NOT use `git` commands\n\
+                 - NEVER commit automatically — always show the suggested commit \
+                 message and wait for explicit user confirmation before running \
+                 `jj commit`\n\
+                 - Do NOT run destructive jj commands (like `jj abandon`, \
+                 `jj squash --force`) without explicit confirmation"
+            }
+            Self::Worktrees => {
+                "Version control: git with worktrees (one worktree per parallel \
+                 change).\n\
+                 - Prefer a dedicated git worktree for each change when working \
+                 in parallel; do not thrash the primary tree with unrelated work\n\
+                 - Use plain `git` and `git worktree` — not `jj`\n\
+                 - NEVER commit automatically — always show the suggested commit \
+                 message and wait for explicit user confirmation before running \
+                 `git commit`\n\
+                 - Do NOT run destructive git commands without explicit confirmation\n\
+                 - Multi-worktree session plumbing is not automatic yet: if no \
+                 worktree exists for a change, stay on the current tree and state \
+                 that constraint"
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for VcsWorkflow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -61,6 +147,7 @@ impl Default for Config {
             projects: ProjectsConfig::default(),
             model_defaults: HashMap::new(),
             chat: ChatConfig::default(),
+            vcs: VcsConfig::default(),
         }
     }
 }
@@ -261,5 +348,49 @@ auto_messages = true
         .expect("legacy chat table");
         // THEN load succeeds and agent_input_hints is honored
         assert!(cfg.chat.agent_input_hints);
+    }
+
+    #[test]
+    fn default_vcs_workflow_is_git() {
+        assert_eq!(Config::default().vcs.workflow, VcsWorkflow::Git);
+        assert_eq!(VcsConfig::default().workflow, VcsWorkflow::Git);
+    }
+
+    #[test]
+    fn missing_vcs_table_deserializes_to_git() {
+        let cfg: Config = toml::from_str("").expect("empty toml");
+        assert_eq!(cfg.vcs.workflow, VcsWorkflow::Git);
+    }
+
+    #[test]
+    fn vcs_workflow_round_trips_toml() {
+        let cfg: Config = toml::from_str(
+            r#"
+[vcs]
+workflow = "jj"
+"#,
+        )
+        .expect("vcs table");
+        assert_eq!(cfg.vcs.workflow, VcsWorkflow::Jj);
+
+        let cfg: Config = toml::from_str(
+            r#"
+[vcs]
+workflow = "worktrees"
+"#,
+        )
+        .expect("worktrees");
+        assert_eq!(cfg.vcs.workflow, VcsWorkflow::Worktrees);
+    }
+
+    #[test]
+    fn standing_instructions_mention_tool_for_each_workflow() {
+        assert!(VcsWorkflow::Git.standing_instructions().contains("`git`"));
+        assert!(VcsWorkflow::Jj.standing_instructions().contains("`jj`"));
+        assert!(
+            VcsWorkflow::Worktrees
+                .standing_instructions()
+                .contains("worktree")
+        );
     }
 }

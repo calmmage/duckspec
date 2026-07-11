@@ -13,6 +13,7 @@ pub mod pan_row;
 pub mod project_picker;
 pub mod quick_idea;
 pub mod sidebar;
+pub mod stale_build;
 pub mod status_bar;
 pub mod streaming_indicator;
 pub mod tab_bar;

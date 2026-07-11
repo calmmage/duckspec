@@ -27,7 +27,7 @@ segment (not multiple Answer segments for the same uncommitted draft).
 - **AND** the reasoning body is not part of the Answer segment
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2291
+> - crates/duckboard/src/widget/agent_chat.rs:2479
 
 ### Scenario: Contiguous tools yield one Activity with multiple rows
 
@@ -41,7 +41,7 @@ segment (not multiple Answer segments for the same uncommitted draft).
 - **AND** the segment has one row per tool call
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2324
+> - crates/duckboard/src/widget/agent_chat.rs:2512
 
 ### Scenario: Thought, tools, thought, answer yields four segments in order
 
@@ -53,7 +53,7 @@ segment (not multiple Answer segments for the same uncommitted draft).
 - **THEN** the segments are Thinking, Activity, Thinking, Answer in that order
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2351
+> - crates/duckboard/src/widget/agent_chat.rs:2539
 
 ### Scenario: Live pending reasoning appears on an open Thinking segment
 
@@ -65,7 +65,7 @@ segment (not multiple Answer segments for the same uncommitted draft).
 - **THEN** a live Thinking segment includes that pending reasoning text
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2375
+> - crates/duckboard/src/widget/agent_chat.rs:2563
 
 ### Scenario: Live reasoning with an open answer draft yields Thinking then one Answer
 
@@ -79,7 +79,7 @@ segment (not multiple Answer segments for the same uncommitted draft).
 - **AND** there is exactly one Answer segment for that open draft
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2398
+> - crates/duckboard/src/widget/agent_chat.rs:2586
 
 ## Requirement: Activity pairing
 
@@ -98,7 +98,7 @@ generic "done" placeholder alone.
 - **AND** the row carries the tool summary and the result body
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2434
+> - crates/duckboard/src/widget/agent_chat.rs:2622
 
 ### Scenario: Non-adjacent use and result still pair by id
 
@@ -114,7 +114,7 @@ generic "done" placeholder alone.
 - **AND** no row is labeled only as a generic done placeholder
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2457
+> - crates/duckboard/src/widget/agent_chat.rs:2645
 
 ### Scenario: Orphan result is a named done row
 
@@ -124,7 +124,7 @@ generic "done" placeholder alone.
 - **AND** the row is not labeled only as a generic done placeholder
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2489
+> - crates/duckboard/src/widget/agent_chat.rs:2677
 
 ## Requirement: Collapse defaults
 
@@ -133,6 +133,13 @@ auto-collapse when a following Answer segment appears or the turn completes, unl
 user has toggled that segment. An Activity segment SHALL auto-collapse when the turn
 settles (following Answer or turn complete), unless the user has toggled it. On reload of
 a finished turn, Thinking and Activity SHALL start collapsed.
+
+A User segment whose message is marked as the synthetic first-turn priming inject SHALL
+start collapsed (including on reload). A non-priming User segment SHALL remain expanded.
+Syncing collapse state SHALL NOT force-collapse a priming User segment the user has
+expanded; re-hide after a temporary expand is a separate timed path, not the Thinking /
+Activity settle rule. Ordinary User, Answer, and System segments remain non-collapsible
+except for this priming User case.
 
 > test: code
 
@@ -143,7 +150,7 @@ a finished turn, Thinking and Activity SHALL start collapsed.
 - **THEN** the Thinking segment is collapsed
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2649
+> - crates/duckboard/src/widget/agent_chat.rs:2837
 
 ### Scenario: User-expanded Thinking is not auto-collapsed
 
@@ -152,7 +159,7 @@ a finished turn, Thinking and Activity SHALL start collapsed.
 - **THEN** the Thinking segment remains expanded
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2706
+> - crates/duckboard/src/widget/agent_chat.rs:2894
 
 ### Scenario: Settled Activity starts collapsed
 
@@ -161,7 +168,36 @@ a finished turn, Thinking and Activity SHALL start collapsed.
 - **THEN** the Activity segment is collapsed
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2746
+> - crates/duckboard/src/widget/agent_chat.rs:2934
+
+### Scenario: Priming Setup starts collapsed
+
+- **GIVEN** a session whose first user message is the synthetic priming inject
+- **AND** a later non-priming user message exists
+- **WHEN** the transcript collapse state is synced
+- **THEN** the priming User segment is collapsed
+- **AND** the non-priming User segment is not collapsed
+
+> test: code
+> - crates/duckboard/src/widget/agent_chat.rs:3058
+
+### Scenario: User-expanded priming is not force-collapsed by sync
+
+- **GIVEN** a priming User segment the user has expanded
+- **WHEN** collapse state is synced again without a timed re-collapse
+- **THEN** the priming User segment remains expanded
+
+> test: code
+> - crates/duckboard/src/widget/agent_chat.rs:3128
+
+### Scenario: Timed re-collapse forces priming collapsed
+
+- **GIVEN** a priming User segment that is currently expanded
+- **WHEN** the priming re-collapse path runs for that segment
+- **THEN** the priming User segment is collapsed
+
+> test: code
+> - crates/duckboard/src/widget/agent_chat.rs:3157
 
 ## Requirement: Segment presentation
 
@@ -169,6 +205,10 @@ Collapsed Thinking SHALL label by line count (no duration). Collapsed Activity S
 summarize as a count plus sample tool names. Expanded Activity SHALL show one quiet row
 per tool (status + summary) with truncated output under the row when present — group
 expand only, with no nested per-tool expand state.
+
+A collapsed priming User segment SHALL label with a Setup prefix and that segment's line
+count. An expanded priming User segment MAY use a short Setup header with a chevron; its
+body SHALL remain readable as user-card content when open.
 
 > test: code
 
@@ -180,7 +220,7 @@ expand only, with no nested per-tool expand state.
 - **AND** the label does not include a duration
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2511
+> - crates/duckboard/src/widget/agent_chat.rs:2699
 
 ### Scenario: Activity collapsed label includes count and sample names
 
@@ -190,7 +230,7 @@ expand only, with no nested per-tool expand state.
 - **AND** the label includes sample tool names from the rows
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2544
+> - crates/duckboard/src/widget/agent_chat.rs:2732
 
 ### Scenario: Expanded activity exposes status, summary, and truncated output
 
@@ -206,7 +246,17 @@ expand only, with no nested per-tool expand state.
 - **AND** no separate per-tool expand state is required to show that truncated output
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2576
+> - crates/duckboard/src/widget/agent_chat.rs:2764
+
+### Scenario: Priming collapsed label uses Setup and line count
+
+- **GIVEN** a priming User segment whose body has a known number of lines
+- **WHEN** the collapsed label for that segment is produced
+- **THEN** the label includes `Setup`
+- **AND** the label includes that line count
+
+> test: code
+> - crates/duckboard/src/widget/agent_chat.rs:3181
 
 ## Requirement: Meta-card line background
 

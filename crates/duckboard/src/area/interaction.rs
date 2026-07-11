@@ -331,6 +331,9 @@ pub struct AgentSession {
     /// loaded. Drives the `CurrentScopeHook` blurb on the first turn.
     pub scope_kind: ScopeKind,
     pub agent_handle: Option<AgentHandle>,
+    /// User requested a title refresh while the agent handle was cold. Cleared
+    /// when the oneshot is started on `Ready` (or when the request is dropped).
+    pub pending_title_refresh: bool,
     pub chat_input: EditorState,
     /// Transient per-input attachment side table: id → bytes/media_type/label.
     /// Populated by `AttachImage` paste actions, drained into the
@@ -349,6 +352,9 @@ pub struct AgentSession {
     /// label and to resolve the effective model when `session.selected_model`
     /// is `None`.
     pub project_model_default: Option<ModelRef>,
+    /// Global VCS workflow for first-turn priming inject. Transient — stamped
+    /// from `Config.vcs.workflow` on each chat update path.
+    pub vcs_workflow: crate::config::VcsWorkflow,
     /// Set when the user changes the per-chat model via the picker; consumed
     /// by `update_with_side_effects` to persist the session. Transient.
     pub model_dirty: bool,
@@ -466,15 +472,19 @@ impl AgentSession {
             session,
             scope_kind,
             agent_handle: None,
+            pending_title_refresh: false,
             chat_input: EditorState::new(""),
             input_attachments: HashMap::new(),
-            chat_commands: Vec::new(),
+            // System registry is duckboard-owned — available before harness
+            // discovery fills in Workflow/Agent entries.
+            chat_commands: crate::slash_commands::system_registry(),
             chat_completion: agent_chat::CompletionState::default(),
             chat_blocks: Vec::new(),
             chat_editors: Vec::new(),
             chat_collapse: Vec::new(),
             esc_count: 0,
             project_model_default: None,
+            vcs_workflow: crate::config::VcsWorkflow::default(),
             model_dirty: false,
             agent_input_tokens: 0,
             agent_output_tokens: 0,
@@ -691,6 +701,21 @@ impl InteractionState {
     pub fn find_terminal_index(&self, id: u64) -> Option<usize> {
         self.terminals.iter().position(|t| t.id == id)
     }
+
+    /// Drain every session's `pending_priming_recollapse` into
+    /// `(routing_key, segment_idx, expand_gen)` jobs for main to schedule.
+    /// Routing key is `{instance_id}/{session_id}` (same shape as agent events).
+    /// A second drain on the same tick is a no-op (flags already cleared).
+    pub fn take_pending_priming_recollapses(&mut self) -> Vec<(String, usize, u64)> {
+        let ix_id = self.instance_id;
+        let mut out = Vec::new();
+        for ax in &mut self.sessions {
+            if let Some((idx, expand_gen)) = ax.pending_priming_recollapse.take() {
+                out.push((format!("{ix_id}/{}", ax.session.id), idx, expand_gen));
+            }
+        }
+        out
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -712,6 +737,73 @@ mod tests {
             })
             .expect("scope hook always produces orientation")
             .text
+    }
+
+    /// Expanding priming Setup sets a pending re-collapse job; draining the
+    /// interaction produces that job once and clears the flag (second drain empty).
+    #[test]
+    fn expanding_priming_setup_drains_into_recollapse_jobs() {
+        use crate::chat_store::{ChatMessage, ContentBlock, Role};
+        use crate::highlight::SyntaxHighlighter;
+
+        let hl = SyntaxHighlighter::new();
+        let mut ix = InteractionState::default();
+        let mut ax = AgentSession::new("exploration-1".into(), ScopeKind::Exploration);
+        ax.session.messages.push(ChatMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text("priming body".into())],
+            timestamp: String::new(),
+            is_priming: true,
+        });
+        materialize_chat_ui(&mut ax, &hl);
+        assert!(
+            ax.chat_blocks.first().is_some_and(|b| b.is_priming),
+            "expected priming Setup block"
+        );
+        assert!(
+            ax.chat_collapse.first().is_some_and(|s| s.collapsed),
+            "priming Setup should start collapsed"
+        );
+        ix.sessions.push(ax);
+        ix.active_session = 0;
+
+        // WHEN the user expands Setup (ToggleCollapse on the Interaction path).
+        update(
+            &mut ix,
+            Msg::AgentChat(agent_chat::Msg::ToggleCollapse(0)),
+            &hl,
+            false,
+        );
+
+        let ax = ix.active().expect("session");
+        assert!(
+            !ax.chat_collapse[0].collapsed,
+            "Setup should be expanded after toggle"
+        );
+        assert!(
+            ax.pending_priming_recollapse.is_some(),
+            "expand must stage a pending re-collapse job for main to schedule"
+        );
+        let expected_gen = ax.priming_expand_gen;
+
+        // THEN drain yields one job and clears the flag; second drain is empty.
+        let jobs = ix.take_pending_priming_recollapses();
+        assert_eq!(jobs.len(), 1, "expected one re-collapse job: {jobs:?}");
+        let (key, idx, expand_gen) = &jobs[0];
+        assert!(
+            key.ends_with(&format!("/{}", ix.active().unwrap().session.id)),
+            "routing key should include session id: {key}"
+        );
+        assert_eq!(*idx, 0);
+        assert_eq!(*expand_gen, expected_gen);
+        assert!(
+            ix.active().unwrap().pending_priming_recollapse.is_none(),
+            "flag must be cleared on take"
+        );
+        assert!(
+            ix.take_pending_priming_recollapses().is_empty(),
+            "second drain is a no-op"
+        );
     }
 
     // @spec chat/default-prompts Next-action list: Empty exploration session seeds explore
@@ -765,6 +857,73 @@ mod tests {
         assert_eq!(ax.next_actions[0].send, "/ds-explore");
     }
 
+    /// @spec chat/slash-commands Local system submit: Bare /help records user then system messages
+    #[test]
+    fn bare_help_records_user_then_system_messages() {
+        use crate::chat_store::{ContentBlock, Role};
+        use crate::highlight::SyntaxHighlighter;
+
+        // GIVEN a chat session ready to send
+        let mut ax = AgentSession::new("exploration-1".into(), ScopeKind::Exploration);
+        ax.chat_commands = crate::slash_commands::system_registry();
+        let hl = SyntaxHighlighter::new();
+        // WHEN the user submits bare `/help` (local handler)
+        run_system_help(&mut ax, &hl);
+        // THEN user message `/help` then a system message
+        assert_eq!(ax.session.messages.len(), 2);
+        assert_eq!(ax.session.messages[0].role, Role::User);
+        assert!(matches!(
+            &ax.session.messages[0].content[..],
+            [ContentBlock::Text(t)] if t == "/help"
+        ));
+        assert_eq!(ax.session.messages[1].role, Role::System);
+        assert!(!ax.session.is_streaming);
+        assert!(ax.agent_handle.is_none());
+    }
+
+    #[test]
+    fn fresh_session_seeds_system_help_in_catalog() {
+        // GIVEN a brand-new session (no CommandsAvailable yet)
+        let ax = AgentSession::new("exploration-1".into(), ScopeKind::Exploration);
+        // THEN System `help` is already in the completion catalog
+        let help = ax
+            .chat_commands
+            .iter()
+            .find(|c| c.name == "help")
+            .expect("help seeded");
+        assert_eq!(help.kind, duckchat::SlashCommandKind::System);
+    }
+
+    /// @spec chat/slash-commands Local system submit: Local /help leaves selection attachments intact
+    #[test]
+    fn local_help_leaves_selection_attachments_intact() {
+        use crate::highlight::SyntaxHighlighter;
+
+        // GIVEN a chat session with a pending selection attachment
+        let mut ax = AgentSession::new("exploration-1".into(), ScopeKind::Exploration);
+        ax.selection_tentative = Some(SelectionContext {
+            source: SelectionSource::Tab {
+                display_path: "src/main.rs".into(),
+            },
+            range: SelectionRange {
+                start_line: 0,
+                start_col: 0,
+                end_line: 0,
+                end_col: 4,
+            },
+            text: "fn x".into(),
+        });
+        let hl = SyntaxHighlighter::new();
+        // WHEN the user submits bare `/help`
+        run_system_help(&mut ax, &hl);
+        // THEN the selection attachment is still pending
+        assert!(
+            ax.selection_tentative.is_some(),
+            "local help must not consume tentative selection"
+        );
+        assert!(!ax.session.is_streaming);
+    }
+
     /// @spec harness/selection Default model resolution: An empty cascade resolves to grok-4.5
     #[test]
     fn empty_cascade_resolves_to_grok_4_5() {
@@ -792,7 +951,8 @@ mod tests {
     #[test]
     fn priming_body_carries_scope_orientation() {
         let blurb = scope_blurb(ScopeKind::Change, "foo");
-        let body = assemble_priming_body(Some("AGENTS conventions"), Some(&blurb));
+        let vcs = crate::config::VcsWorkflow::Git.standing_instructions();
+        let body = assemble_priming_body(Some("AGENTS conventions"), Some(&blurb), vcs);
         assert!(
             body.contains(&blurb),
             "first-turn body must carry the scope orientation: {body}"
@@ -809,8 +969,9 @@ mod tests {
     #[test]
     fn priming_body_present_without_agents_md() {
         let blurb = scope_blurb(ScopeKind::Change, "foo");
+        let vcs = crate::config::VcsWorkflow::Git.standing_instructions();
         // No AGENTS.md → still primed, and the orientation still rides the body.
-        let body = assemble_priming_body(None, Some(&blurb));
+        let body = assemble_priming_body(None, Some(&blurb), vcs);
         assert!(
             body.contains(&blurb),
             "orientation must be present even with no AGENTS.md: {body}"
@@ -822,6 +983,21 @@ mod tests {
         assert!(
             should_prime(None, false),
             "a fresh session is primed regardless of AGENTS.md presence"
+        );
+    }
+
+    #[test]
+    fn priming_body_includes_vcs_workflow_instructions() {
+        let blurb = scope_blurb(ScopeKind::Exploration, "exp-1");
+        let vcs = crate::config::VcsWorkflow::Jj.standing_instructions();
+        let body = assemble_priming_body(None, Some(&blurb), vcs);
+        assert!(
+            body.contains("`jj`"),
+            "jj workflow instructions must ride the priming body: {body}"
+        );
+        assert!(
+            body.contains("Do NOT use `git`"),
+            "jj workflow must forbid bare git: {body}"
         );
     }
 
@@ -1954,7 +2130,7 @@ fn handle_agent_chat(
                 input_empty,
                 &ax.obvious_chrome,
             ) {
-                send_prompt_text(ax, text, highlighter);
+                dispatch_user_submit(ax, text, highlighter);
             }
         }
         agent_chat::Msg::SendPressed => {
@@ -1999,7 +2175,7 @@ fn handle_agent_chat(
                     (None, None) => None,
                 };
                 if let Some(text) = text {
-                    send_prompt_text(ax, text, highlighter);
+                    dispatch_user_submit(ax, text, highlighter);
                 }
             }
         }
@@ -2037,7 +2213,7 @@ fn handle_agent_chat(
             ) else {
                 return;
             };
-            send_prompt_text(ax, text, highlighter);
+            dispatch_user_submit(ax, text, highlighter);
         }
         agent_chat::Msg::CancelPressed => {
             if let Some(handle) = &ax.agent_handle {
@@ -2221,17 +2397,25 @@ fn should_prime(resumable_session_id: Option<&str>, has_prior_messages: bool) ->
 
 /// Assemble the first-turn priming body from the available orientation parts:
 /// AGENTS.md conventions (if present), the scope orientation blurb (if any),
-/// and the always-present path-reference note — joined and closed with the
-/// single-dot-ack instruction. All orientation rides this message body so it
-/// survives the CLI's silently-dropped `--append-system-prompt` channel; the
-/// path note alone keeps the body non-empty even when no `AGENTS.md` exists.
-fn assemble_priming_body(agents_md: Option<&str>, scope_blurb: Option<&str>) -> String {
+/// the VCS workflow standing instructions, and the always-present
+/// path-reference note — joined and closed with the single-dot-ack
+/// instruction. All orientation rides this message body so it survives the
+/// CLI's silently-dropped `--append-system-prompt` channel; the path note
+/// alone keeps the body non-empty even when no `AGENTS.md` exists.
+fn assemble_priming_body(
+    agents_md: Option<&str>,
+    scope_blurb: Option<&str>,
+    vcs_instructions: &str,
+) -> String {
     let mut parts: Vec<&str> = Vec::new();
     if let Some(t) = agents_md {
         parts.push(t);
     }
     if let Some(t) = scope_blurb {
         parts.push(t);
+    }
+    if !vcs_instructions.is_empty() {
+        parts.push(vcs_instructions);
     }
     parts.push(PATH_REFERENCE_NOTE);
     format!(
@@ -2283,11 +2467,24 @@ pub fn recover_from_lost_session(ax: &mut AgentSession, highlighter: &SyntaxHigh
         return;
     };
 
+    // Re-parse so `//help` recovers as agent prompt `/help`, not the display form.
+    // Local system messages never needed an agent turn — do not re-dispatch.
+    let Some(agent_text) = crate::slash_commands::agent_prompt_for_recovery(&text) else {
+        ax.session.is_streaming = false;
+        if let Some(handle) = ax.agent_handle.as_ref()
+            && let Err(e) = crate::chat_store::save_session(&ax.session, Some(handle.working_dir()))
+        {
+            tracing::error!("failed to persist cleared session id: {e}");
+        }
+        materialize_chat_ui(ax, highlighter);
+        return;
+    };
+
     let history = &ax.session.messages[..last_idx];
     let prompt = if history.is_empty() {
-        text.clone()
+        agent_text.clone()
     } else {
-        build_history_preamble(history) + &text
+        build_history_preamble(history) + &agent_text
     };
 
     let mut system_additions = Vec::new();
@@ -2346,10 +2543,88 @@ pub fn recover_from_lost_session(ax: &mut AgentSession, highlighter: &SyntaxHigh
     );
 }
 
-/// Send `text` as a new user turn on the active agent handle. Pushes the user
-/// message into the session, marks streaming, clears the input, and rebuilds
-/// the chat editor blocks. No-op if no agent handle is attached.
+/// Route a user submit: local system commands (`/help`) or agent turns
+/// (including `//name` escape where display and prompt may differ).
+pub fn dispatch_user_submit(
+    ax: &mut AgentSession,
+    text: String,
+    highlighter: &SyntaxHighlighter,
+) {
+    match crate::slash_commands::parse_submit_slash(&text) {
+        crate::slash_commands::SubmitSlash::LocalHelp => {
+            run_system_help(ax, highlighter);
+        }
+        crate::slash_commands::SubmitSlash::Agent { display, prompt } => {
+            send_agent_turn(ax, display, prompt, highlighter);
+        }
+    }
+}
+
+/// Compatibility entry: treat `text` as both user-bubble and agent prompt after
+/// slash routing (same as [`dispatch_user_submit`]).
 pub fn send_prompt_text(ax: &mut AgentSession, text: String, highlighter: &SyntaxHighlighter) {
+    dispatch_user_submit(ax, text, highlighter);
+}
+
+/// Local `/help`: user + system messages, no agent turn, no selection consume.
+pub fn run_system_help(ax: &mut AgentSession, highlighter: &SyntaxHighlighter) {
+    use crate::chat_store::{ChatMessage, ContentBlock, Role};
+
+    ax.clear_agent_default_prompts();
+
+    let harness = resolve_turn_model(
+        ax.session.selected_model.as_ref(),
+        ax.project_model_default.as_ref(),
+    )
+    .harness;
+    let body = crate::slash_commands::build_system_help_body(
+        &ax.chat_commands,
+        Some(harness.as_str()),
+    );
+
+    ax.session.messages.push(ChatMessage {
+        role: Role::User,
+        content: vec![ContentBlock::Text("/help".into())],
+        timestamp: String::new(),
+        is_priming: false,
+    });
+    ax.session.messages.push(ChatMessage {
+        role: Role::System,
+        content: vec![ContentBlock::Text(body)],
+        timestamp: String::new(),
+        is_priming: false,
+    });
+    // Local path: never stream, never prime, never burn selection attachments.
+    ax.session.is_streaming = false;
+    ax.session.pending_text.clear();
+    ax.session.pending_reasoning.clear();
+
+    let root = ax
+        .agent_handle
+        .as_ref()
+        .map(|h| h.working_dir().to_path_buf());
+    if let Err(e) = crate::chat_store::save_session(&ax.session, root.as_deref()) {
+        tracing::error!("failed to persist chat session on system help: {e}");
+    }
+
+    if ax.stick_to_bottom {
+        ax.pending_snap_to_bottom = true;
+    }
+
+    ax.chat_input = EditorState::new("");
+    rehighlight_input(&mut ax.chat_input, highlighter);
+    ax.chat_completion.visible = false;
+    materialize_chat_ui(ax, highlighter);
+}
+
+/// Send an agent turn. `display` is stored as the user message; `prompt` is what
+/// the harness receives (may differ when the user used `//` escape).
+fn send_agent_turn(
+    ax: &mut AgentSession,
+    display: String,
+    prompt_text: String,
+    highlighter: &SyntaxHighlighter,
+) {
     use duckchat::{ContextHook, TurnRequest};
 
     // Stale agent defaults must not outlive a new turn.
@@ -2390,7 +2665,12 @@ pub fn send_prompt_text(ax: &mut AgentSession, text: String, highlighter: &Synta
             change_facts: ax.scope_facts.clone(),
         };
         let scope_blurb = crate::scope::CurrentScopeHook.compute(&scope).map(|o| o.text);
-        let priming_text = assemble_priming_body(agents_md.as_deref(), scope_blurb.as_deref());
+        let vcs_instructions = ax.vcs_workflow.standing_instructions();
+        let priming_text = assemble_priming_body(
+            agents_md.as_deref(),
+            scope_blurb.as_deref(),
+            vcs_instructions,
+        );
 
         ax.session.messages.push(crate::chat_store::ChatMessage {
             role: crate::chat_store::Role::User,
@@ -2406,7 +2686,8 @@ pub fn send_prompt_text(ax: &mut AgentSession, text: String, highlighter: &Synta
         }
 
         ax.priming_in_flight = true;
-        ax.pending_followup_prompt = Some(text);
+        // Stash the original user-facing text so follow-up re-parses `//` escape.
+        ax.pending_followup_prompt = Some(display);
 
         let mut req = TurnRequest::new(priming_text, handle.working_dir().to_path_buf());
         // All orientation now rides the message body above; `system_additions`
@@ -2439,9 +2720,9 @@ pub fn send_prompt_text(ax: &mut AgentSession, text: String, highlighter: &Synta
     // Happens for legacy sessions saved before session-id persistence, or if
     // the server-side session has been pruned.
     let prompt = if ax.resumable_session_id().is_none() && !ax.session.messages.is_empty() {
-        build_history_preamble(&ax.session.messages) + &text
+        build_history_preamble(&ax.session.messages) + &prompt_text
     } else {
-        text.clone()
+        prompt_text
     };
 
     // First time Claude sees this conversation — include a scope orientation
@@ -2505,7 +2786,7 @@ pub fn send_prompt_text(ax: &mut AgentSession, text: String, highlighter: &Synta
 
     ax.session.messages.push(crate::chat_store::ChatMessage {
         role: crate::chat_store::Role::User,
-        content: vec![crate::chat_store::ContentBlock::Text(text)],
+        content: vec![crate::chat_store::ContentBlock::Text(display)],
         timestamp: String::new(),
         is_priming: false,
     });
@@ -3139,7 +3420,13 @@ pub fn update_with_side_effects(
     project_root: Option<&std::path::Path>,
     highlighter: &SyntaxHighlighter,
     agent_input_hints: bool,
+    vcs_workflow: crate::config::VcsWorkflow,
 ) {
+    // Stamp VCS workflow before any submit so first-turn priming sees the
+    // current Settings value.
+    if let Some(ax) = state.active_mut() {
+        ax.vcs_workflow = vcs_workflow;
+    }
     update(
         state,
         msg,
