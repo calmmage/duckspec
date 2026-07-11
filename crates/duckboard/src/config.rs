@@ -79,6 +79,12 @@ impl VcsWorkflow {
                  - NEVER commit automatically — always show the suggested commit \
                  message and wait for explicit user confirmation before running \
                  `git commit`\n\
+                 - When committing work for a duckspec change (including \
+                 post-archive `commit`), commit **only** paths that belong to \
+                 that change (`git add` those paths, then commit). Do **not** \
+                 commit the entire dirty tree by default; leave unrelated dirty \
+                 paths uncommitted. If nothing dirty belongs to the change, \
+                 report that and do not invent a commit\n\
                  - Do NOT run destructive git commands (force push, hard reset, \
                  checkout that discards work) without explicit confirmation"
             }
@@ -89,6 +95,12 @@ impl VcsWorkflow {
                  - NEVER commit automatically — always show the suggested commit \
                  message and wait for explicit user confirmation before running \
                  `jj commit`\n\
+                 - When committing work for a duckspec change (including \
+                 post-archive `commit`), commit **only** paths that belong to \
+                 that change (`jj commit` with those filesets). Do **not** \
+                 commit the entire dirty tree by default; leave unrelated dirty \
+                 paths uncommitted. If nothing dirty belongs to the change, \
+                 report that and do not invent a commit\n\
                  - Do NOT run destructive jj commands (like `jj abandon`, \
                  `jj squash --force`) without explicit confirmation"
             }
@@ -101,6 +113,12 @@ impl VcsWorkflow {
                  - NEVER commit automatically — always show the suggested commit \
                  message and wait for explicit user confirmation before running \
                  `git commit`\n\
+                 - When committing work for a duckspec change (including \
+                 post-archive `commit`), commit **only** paths that belong to \
+                 that change (`git add` those paths, then commit). Do **not** \
+                 commit the entire dirty tree by default; leave unrelated dirty \
+                 paths uncommitted. If nothing dirty belongs to the change, \
+                 report that and do not invent a commit\n\
                  - Do NOT run destructive git commands without explicit confirmation\n\
                  - Multi-worktree session plumbing is not automatic yet: if no \
                  worktree exists for a change, stay on the current tree and state \
@@ -392,5 +410,24 @@ workflow = "worktrees"
                 .standing_instructions()
                 .contains("worktree")
         );
+    }
+
+    #[test]
+    fn standing_instructions_require_path_scoped_change_commit() {
+        for workflow in VcsWorkflow::ALL {
+            let text = workflow.standing_instructions();
+            assert!(
+                text.contains("only") && text.to_lowercase().contains("path"),
+                "{workflow:?}: expected path-scoped / change-only commit guidance"
+            );
+            assert!(
+                text.contains("entire dirty tree") || text.contains("whole dirty"),
+                "{workflow:?}: expected explicit ban on whole-tree commit default"
+            );
+            assert!(
+                text.contains("do not invent a commit"),
+                "{workflow:?}: expected empty-set / no-invent guidance"
+            );
+        }
     }
 }
