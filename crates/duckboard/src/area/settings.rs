@@ -7,7 +7,7 @@ use iced::widget::{
 };
 use iced::{Center, Element, Length};
 
-use crate::config::{self, Config};
+use crate::config::{self, Config, VcsWorkflow};
 use crate::theme;
 use crate::widget::agent_chat::{self, ModelChoice};
 
@@ -30,6 +30,7 @@ pub enum Message {
     /// Project-level default model picked (`id == None` → no default).
     ModelDefaultSelected(ModelChoice),
     AgentInputHintsToggled(bool),
+    VcsWorkflowSelected(VcsWorkflow),
     ResetDefaults,
 }
 
@@ -74,6 +75,10 @@ pub fn update(
         }
         Message::AgentInputHintsToggled(on) => {
             config.chat.agent_input_hints = on;
+            let _ = config::save(config);
+        }
+        Message::VcsWorkflowSelected(workflow) => {
+            config.vcs.workflow = workflow;
             let _ = config::save(config);
         }
         Message::ResetDefaults => {
@@ -121,6 +126,7 @@ pub fn view<'a>(
     .style(theme::dashboard_action);
 
     let chat_section = chat_section(config);
+    let vcs_section = vcs_section(config);
 
     let mut body = column![
         heading,
@@ -130,6 +136,8 @@ pub fn view<'a>(
         content_section,
         Space::new().height(theme::SPACING_XL),
         chat_section,
+        Space::new().height(theme::SPACING_XL),
+        vcs_section,
     ];
     // Per-project model default — only meaningful with a project open.
     if let Some(root) = project_root {
@@ -180,6 +188,47 @@ fn chat_section<'a>(config: &Config) -> Element<'a, Message> {
         Space::new().height(theme::SPACING_SM),
         agent_row,
         agent_help,
+    ]
+    .spacing(theme::SPACING_XS)
+    .into()
+}
+
+fn vcs_section<'a>(config: &Config) -> Element<'a, Message> {
+    let label = text("Version control")
+        .size(theme::font_md())
+        .color(theme::text_primary());
+    let desc = text(
+        "How the agent should treat version control. Injected into the first \
+         chat turn of every new session. Applies to all projects.",
+    )
+    .size(theme::font_sm())
+    .color(theme::text_muted());
+
+    let picker = pick_list(
+        VcsWorkflow::ALL.to_vec(),
+        Some(config.vcs.workflow),
+        Message::VcsWorkflowSelected,
+    )
+    .width(280)
+    .style(theme::pick_list_style)
+    .menu_style(theme::pick_list_menu);
+
+    let help = text(match config.vcs.workflow {
+        VcsWorkflow::Git => "Plain git: branch, commit, push. No jj.",
+        VcsWorkflow::Jj => "Jujutsu (jj): use jj only; never auto-commit.",
+        VcsWorkflow::Worktrees => {
+            "Git worktrees for parallel changes (agent guidance only for now)."
+        }
+    })
+    .size(theme::font_sm())
+    .color(theme::text_muted());
+
+    column![
+        label,
+        desc,
+        Space::new().height(theme::SPACING_SM),
+        picker,
+        help,
     ]
     .spacing(theme::SPACING_XS)
     .into()

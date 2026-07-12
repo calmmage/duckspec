@@ -193,6 +193,105 @@ pub fn title_summarization_target(session: &ChatSession) -> Option<TitleTarget> 
     None
 }
 
+/// Build a title-refresh summarizer target from the session's **current**
+/// conversation: all non-priming, non-bare-slash user turns joined in order.
+/// Unlike [`title_summarization_target`], later user turns are included so a
+/// retitle can track topic drift. Returns `None` when nothing is summarizable.
+pub fn title_refresh_target(session: &ChatSession) -> Option<TitleTarget> {
+    let mut last_command_source: Option<String> = None;
+    let mut parts: Vec<String> = Vec::new();
+    for msg in &session.messages {
+        if !matches!(msg.role, Role::User) || msg.is_priming {
+            continue;
+        }
+        let Some(text) = msg.content.iter().find_map(|b| match b {
+            ContentBlock::Text(t) => Some(t.clone()),
+            _ => None,
+        }) else {
+            continue;
+        };
+        if starts_with_slash_command(&text) {
+            last_command_source = Some(text.clone());
+        }
+        if is_bare_slash_command(&text) {
+            continue;
+        }
+        parts.push(text);
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(TitleTarget {
+        message: parts.join("\n\n"),
+        command_hint_source: last_command_source,
+    })
+}
+
+/// Commit a manual exploration rename. Non-empty trimmed text becomes the new
+/// `display_name` and returns `true`. Blank or whitespace-only input leaves
+/// the name unchanged and returns `false`.
+pub fn rename_exploration(exp: &mut Exploration, name: &str) -> bool {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    exp.display_name = trimmed.to_string();
+    true
+}
+
+/// Apply a title string to a session. When `force` is false, an existing title
+/// is left alone (first-turn auto-title). When `force` is true, a non-empty
+/// title overwrites. Empty/whitespace titles never write. Returns whether the
+/// session title was updated.
+pub fn apply_session_title_value(session: &mut ChatSession, title: &str, force: bool) -> bool {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if session.title.is_some() && !force {
+        return false;
+    }
+    session.title = Some(trimmed.to_string());
+    true
+}
+
+/// Full title write shared by first-turn auto-title and force refresh: session
+/// title (honoring `force`) plus optional exploration `display_name`. Empty or
+/// rejected titles leave both unchanged. Returns whether the session title was
+/// written.
+pub fn apply_title_labels(
+    session: &mut ChatSession,
+    exploration: Option<&mut Exploration>,
+    title: &str,
+    force: bool,
+) -> bool {
+    if !apply_session_title_value(session, title, force) {
+        return false;
+    }
+    if let Some(exp) = exploration
+        && let Some(written) = session.title.as_deref()
+    {
+        exp.display_name = written.to_string();
+    }
+    true
+}
+
+/// Map a title-summary oneshot result to an accepted title. Empty strings and
+/// errors yield `None` so callers leave existing labels alone.
+pub fn accept_title_summary_result(result: &Result<String, String>) -> Option<String> {
+    match result {
+        Ok(t) => {
+            let t = t.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        }
+        Err(_) => None,
+    }
+}
+
 /// True when `text` starts with a `/` followed by a non-empty token. Used
 /// to detect command-bearing turns regardless of whether they have content
 /// after the command.
@@ -204,14 +303,19 @@ fn starts_with_slash_command(text: &str) -> bool {
     rest.chars().next().is_some_and(|c| !c.is_whitespace())
 }
 
-/// True when `text` is exactly a slash command with no trailing content
+/// True when `text` is exactly a single-slash command with no trailing content
 /// (e.g. `/ds-apply`, `   /ds-apply  `). Leading/trailing whitespace is
 /// ignored; anything else after the command token makes it non-bare.
+/// Double-slash escape forms (`//help`) are not bare.
 pub fn is_bare_slash_command(text: &str) -> bool {
     let trimmed = text.trim();
     let Some(rest) = trimmed.strip_prefix('/') else {
         return false;
     };
+    // Second leading `/` is the agent escape form (`//name`), not bare `/name`.
+    if rest.starts_with('/') {
+        return false;
+    }
     !rest.is_empty() && !rest.chars().any(char::is_whitespace)
 }
 
@@ -646,11 +750,15 @@ mod tests {
     fn is_bare_slash_command_basics() {
         assert!(is_bare_slash_command("/ds-apply"));
         assert!(is_bare_slash_command("  /ds-apply  "));
+        assert!(is_bare_slash_command("/help"));
         assert!(!is_bare_slash_command("/ds-apply now"));
         assert!(!is_bare_slash_command("hello"));
         assert!(!is_bare_slash_command(""));
         assert!(!is_bare_slash_command("/"));
         assert!(!is_bare_slash_command("/ next"));
+        // Double-slash escape is not a bare single-slash command.
+        assert!(!is_bare_slash_command("//help"));
+        assert!(!is_bare_slash_command("  //help  "));
     }
 
     #[test]
@@ -720,6 +828,170 @@ mod tests {
         let t = title_summarization_target(&s).unwrap();
         assert_eq!(t.message, "real text");
         assert_eq!(t.command_hint_source.as_deref(), Some("/ds-apply"));
+    }
+
+    // ── exploration list labels (rename + refresh) ──────────────────────
+
+    /// @spec exploration/list-labels Manual rename updates the exploration label: Non-empty rename replaces the list label and persists
+    #[test]
+    fn rename_exploration_non_empty_replaces_and_persists() {
+        let tmp = FsTmp::new();
+        with_home(tmp.path(), || {
+            let root = tmp.path().join("proj-rename");
+            std::fs::create_dir_all(&root).unwrap();
+
+            let mut exp = Exploration {
+                id: "exploration-1".into(),
+                display_name: "Exploration 3".into(),
+                idea_path: None,
+                session_count: 0,
+            };
+            assert!(rename_exploration(&mut exp, "Cloud agent options"));
+            assert_eq!(exp.display_name, "Cloud agent options");
+
+            save_explorations(std::slice::from_ref(&exp), 1, Some(&root));
+            let (loaded, _) = load_explorations(Some(&root));
+            let found = loaded.iter().find(|e| e.id == "exploration-1").unwrap();
+            assert_eq!(found.display_name, "Cloud agent options");
+        });
+    }
+
+    /// @spec exploration/list-labels Manual rename updates the exploration label: Blank rename leaves the label unchanged
+    #[test]
+    fn rename_exploration_blank_leaves_label_unchanged() {
+        let mut exp = Exploration {
+            id: "exploration-1".into(),
+            display_name: "Cloud agent options".into(),
+            idea_path: None,
+            session_count: 0,
+        };
+        assert!(!rename_exploration(&mut exp, "   "));
+        assert!(!rename_exploration(&mut exp, ""));
+        assert_eq!(exp.display_name, "Cloud agent options");
+    }
+
+    /// @spec exploration/list-labels Refresh retitles from the active session chat: Refresh input includes later user turns when present
+    #[test]
+    fn refresh_target_includes_later_user_turns() {
+        let s = session_with(vec![
+            user_msg("Hello"),
+            assistant_msg("hi"),
+            user_msg("Focus on rename and retitle in the CHANGE list"),
+        ]);
+        let t = title_refresh_target(&s).unwrap();
+        assert!(t.message.contains("Hello"));
+        assert!(t
+            .message
+            .contains("Focus on rename and retitle in the CHANGE list"));
+        // First-turn auto path still only returns the first message.
+        let first = title_summarization_target(&s).unwrap();
+        assert_eq!(first.message, "Hello");
+    }
+
+    /// @spec exploration/list-labels Refresh retitles from the active session chat: Refresh with no summarizable content leaves labels unchanged
+    #[test]
+    fn refresh_with_no_content_leaves_labels_unchanged() {
+        let mut exp = Exploration {
+            id: "exploration-1".into(),
+            display_name: "Keep me".into(),
+            idea_path: None,
+            session_count: 0,
+        };
+        let mut session = session_with(vec![user_msg("/ds-apply"), priming_msg("AGENTS.md")]);
+        session.title = Some("Keep me".into());
+
+        // WHEN refresh has no summarizable target, the full-write path is not used.
+        assert!(title_refresh_target(&session).is_none());
+        assert!(!apply_title_labels(
+            &mut session,
+            Some(&mut exp),
+            "",
+            true
+        ));
+        assert_eq!(exp.display_name, "Keep me");
+        assert_eq!(session.title.as_deref(), Some("Keep me"));
+    }
+
+    /// @spec exploration/list-labels Refresh retitles from the active session chat: Refresh overwrites an existing title and exploration label
+    #[test]
+    fn refresh_overwrites_existing_title_and_exploration_label() {
+        let mut exp = Exploration {
+            id: "exploration-1".into(),
+            display_name: "Old title".into(),
+            idea_path: None,
+            session_count: 0,
+        };
+        let mut session = session_with(vec![user_msg("talk about new direction")]);
+        session.title = Some("Old title".into());
+
+        // Full-write helper is the same path production force-refresh uses.
+        assert!(apply_title_labels(
+            &mut session,
+            Some(&mut exp),
+            "New direction",
+            true
+        ));
+        assert_eq!(session.title.as_deref(), Some("New direction"));
+        assert_eq!(exp.display_name, "New direction");
+        // Auto first-turn path would not overwrite without force.
+        assert!(!apply_title_labels(
+            &mut session,
+            Some(&mut exp),
+            "Should not stick",
+            false
+        ));
+        assert_eq!(session.title.as_deref(), Some("New direction"));
+        assert_eq!(exp.display_name, "New direction");
+    }
+
+    /// @spec exploration/list-labels Refresh retitles from the active session chat: Failed or empty refresh leaves labels unchanged
+    #[test]
+    fn failed_or_empty_refresh_leaves_labels_unchanged() {
+        let mut exp = Exploration {
+            id: "exploration-1".into(),
+            display_name: "Keep me".into(),
+            idea_path: None,
+            session_count: 0,
+        };
+        let mut session = session_with(vec![user_msg("content")]);
+        session.title = Some("Keep me".into());
+
+        for result in [
+            Err("timeout".into()),
+            Ok(String::new()),
+            Ok("   ".into()),
+        ] {
+            if let Some(title) = accept_title_summary_result(&result) {
+                apply_title_labels(&mut session, Some(&mut exp), &title, true);
+            }
+        }
+        assert_eq!(exp.display_name, "Keep me");
+        assert_eq!(session.title.as_deref(), Some("Keep me"));
+    }
+
+    /// Step 04: cold handle defers refresh; once a title is available the
+    /// full-write path still force-applies session + exploration labels.
+    #[test]
+    fn cold_handle_deferred_refresh_still_uses_full_write() {
+        let mut session = session_with(vec![user_msg("rename and retitle work")]);
+        session.title = Some("Stale".into());
+        assert!(title_refresh_target(&session).is_some());
+        // Cold: no handle — production sets pending_title_refresh; when Ready
+        // later delivers a summary, apply_title_labels is the write path.
+        let mut exp = Exploration {
+            id: "exploration-1".into(),
+            display_name: "Stale".into(),
+            idea_path: None,
+            session_count: 0,
+        };
+        assert!(apply_title_labels(
+            &mut session,
+            Some(&mut exp),
+            "Fresh title",
+            true
+        ));
+        assert_eq!(session.title.as_deref(), Some("Fresh title"));
+        assert_eq!(exp.display_name, "Fresh title");
     }
 
     // ── session count / delete project data ─────────────────────────────

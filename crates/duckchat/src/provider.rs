@@ -169,11 +169,25 @@ impl<'de> Deserialize<'de> for ModelRef {
     }
 }
 
+/// Ownership / routing class for a slash-command completion entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlashCommandKind {
+    /// Duckboard-local; bare submit does not start an agent turn.
+    System,
+    /// Duckspec workflow templates (`ds-*`); agent-bound.
+    Workflow,
+    /// Harness / project / plugin skills; agent-bound as-is.
+    Agent,
+}
+
 /// A slash command exposed to the chat input (`/review`, `/plan`, ...).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlashCommand {
     pub name: String,
     pub description: String,
+    pub kind: SlashCommandKind,
+    /// Tenths from frontmatter `order` (`3.1` → 31). `None` → after ordered peers.
+    pub order_key: Option<u32>,
 }
 
 #[cfg(test)]

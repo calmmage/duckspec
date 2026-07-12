@@ -191,6 +191,7 @@ pub fn update(
     project: &ProjectData,
     highlighter: &SyntaxHighlighter,
     agent_input_hints: bool,
+    vcs_workflow: crate::config::VcsWorkflow,
 ) {
     match message {
         Message::AddIdea => {
@@ -288,6 +289,7 @@ pub fn update(
                 project,
                 highlighter,
                 agent_input_hints,
+                vcs_workflow,
             );
         }
         Message::ScrollList(offset) => {
@@ -437,6 +439,7 @@ fn handle_interaction(
     project: &ProjectData,
     highlighter: &SyntaxHighlighter,
     agent_input_hints: bool,
+    vcs_workflow: crate::config::VcsWorkflow,
 ) {
     let Some(path) = state.selected.clone() else {
         return;
@@ -504,6 +507,7 @@ fn handle_interaction(
                 project.project_root.as_deref(),
                 highlighter,
                 agent_input_hints,
+                vcs_workflow,
             );
         }
     }

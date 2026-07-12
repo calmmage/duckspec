@@ -212,4 +212,39 @@ Just text, no heading.
         }
         assert!(count > 0, "expected at least one template");
     }
+
+    #[test]
+    fn archive_handoff_requires_path_scoped_commit() {
+        let path = Path::new(TEMPLATE_DIR).join("archive.md");
+        let content = fs::read_to_string(&path).expect("archive template");
+        let handoff = content
+            .split("## Handoff")
+            .nth(1)
+            .expect("Handoff section")
+            .split("## After write")
+            .next()
+            .expect("After write after Handoff");
+        assert!(
+            handoff.contains("path-scoped") || handoff.contains("path-scoped include"),
+            "archive handoff must require a path-scoped include set"
+        );
+        assert!(
+            handoff.contains("include set") || handoff.contains("path set"),
+            "archive handoff must surface the include/path set"
+        );
+        assert!(
+            handoff.contains("do not invent") || handoff.contains("do not invent a"),
+            "archive handoff must forbid inventing a commit when empty"
+        );
+        assert!(
+            handoff.contains("whole-tree")
+                || handoff.contains("entire dirty")
+                || handoff.contains("whole dirty"),
+            "archive handoff must ban whole-tree commit defaults"
+        );
+        assert!(
+            handoff.contains("`commit`"),
+            "archive handoff must still use the commit confirm token"
+        );
+    }
 }

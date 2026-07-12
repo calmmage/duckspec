@@ -56,6 +56,7 @@ pub fn update(
     project: &ProjectData,
     highlighter: &crate::highlight::SyntaxHighlighter,
     agent_input_hints: bool,
+    vcs_workflow: crate::config::VcsWorkflow,
 ) {
     match message {
         Message::ToggleSection => {
@@ -93,6 +94,7 @@ pub fn update(
                     project.project_root.as_deref(),
                     highlighter,
                     agent_input_hints,
+                    vcs_workflow,
                 );
             }
         },

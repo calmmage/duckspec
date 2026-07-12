@@ -22,6 +22,7 @@ use duckchat::{ModelInfo, ModelRef};
 use crate::agent::SlashCommand;
 use crate::area::interaction::{self, SelectionContext};
 use crate::chat_store::{ChatSession, ContentBlock, Role};
+use crate::slash_commands::{slash_kind_rank, slash_kind_row_tag};
 use crate::theme;
 use crate::widget::collapsible;
 use crate::widget::streaming_indicator;
@@ -290,6 +291,9 @@ pub struct CompletionState {
 pub enum TranscriptSeg {
     User {
         lines: Vec<String>,
+        /// Synthetic first-turn AGENTS.md / orientation inject. Starts
+        /// collapsed so scroll-to-top lands on the real first user message.
+        is_priming: bool,
     },
     System {
         lines: Vec<String>,
@@ -349,6 +353,7 @@ pub fn build_transcript_segments(session: &ChatSession) -> Vec<TranscriptSeg> {
                     activity_index.clear();
                     segs.push(TranscriptSeg::User {
                         lines: text_lines(t),
+                        is_priming: msg.is_priming,
                     });
                 }
                 (Role::System, ContentBlock::Text(t)) => {
@@ -533,12 +538,17 @@ pub struct CollapseState {
     pub user_set: bool,
 }
 
+/// Seconds after a manual expand of the priming Setup block before it
+/// auto-hides again. Mid of the 10–20s product range.
+pub const PRIMING_RECOLLAPSE_SECS: u64 = 15;
+
 /// First-sight default: live Thinking/Activity expanded; settled collapsed.
-/// Non-collapsible kinds (Answer, User, System) are never collapsed.
+/// Priming User starts collapsed. Other User / Answer / System stay open.
 fn first_sight_collapsed(seg: &TranscriptSeg) -> bool {
     match seg {
         TranscriptSeg::Thinking { live, .. } | TranscriptSeg::Activity { live, .. } => !live,
-        TranscriptSeg::User { .. }
+        TranscriptSeg::User { is_priming: true, .. } => true,
+        TranscriptSeg::User { is_priming: false, .. }
         | TranscriptSeg::System { .. }
         | TranscriptSeg::Answer { .. } => false,
     }
@@ -558,7 +568,9 @@ fn has_following_answer(segs: &[TranscriptSeg], idx: usize) -> bool {
 ///   [`build_transcript_segments`]).
 /// - Auto-collapses untoggled Activity when a following Answer appears or the
 ///   turn settles (`live == false`).
-/// - Leaves `user_set` segments alone for auto-collapse.
+/// - Keeps untoggled priming User collapsed (first-sight and on rebuild).
+/// - Leaves `user_set` segments alone for auto-collapse (priming re-hide after
+///   expand is a separate timer, not this sync path).
 ///
 /// Thinking `live` means open-in-turn (streaming, no following Answer), not
 /// "still receiving ReasoningDelta", so tool phases keep Thinking expanded.
@@ -587,7 +599,11 @@ pub fn sync_collapse_states(states: &mut Vec<CollapseState>, segs: &[TranscriptS
                     states[i].collapsed = true;
                 }
             }
-            TranscriptSeg::User { .. }
+            TranscriptSeg::User { is_priming: true, .. } => {
+                // Stay folded until the user clicks to inspect.
+                states[i].collapsed = true;
+            }
+            TranscriptSeg::User { is_priming: false, .. }
             | TranscriptSeg::System { .. }
             | TranscriptSeg::Answer { .. } => {
                 states[i].collapsed = false;
@@ -602,6 +618,26 @@ pub fn toggle_collapse(states: &mut [CollapseState], idx: usize) {
     if let Some(state) = states.get_mut(idx) {
         state.collapsed = !state.collapsed;
         state.user_set = true;
+    }
+}
+
+/// Collapsed label for the synthetic priming user message.
+pub fn priming_collapsed_label(lines: &[String]) -> String {
+    let n = lines.len();
+    if n == 1 {
+        "Setup · 1 line".to_string()
+    } else {
+        format!("Setup · {n} lines")
+    }
+}
+
+/// Force-collapse a priming segment after the expand timer. Callers gate on
+/// expand generation so stale timers no-op.
+pub fn recollapse_priming(states: &mut [CollapseState], idx: usize) {
+    if let Some(state) = states.get_mut(idx) {
+        state.collapsed = true;
+        // Keep `user_set` so sync does not fight a later re-expand path that
+        // also marks user_set; the timed re-hide is intentional UX.
     }
 }
 
@@ -690,15 +726,24 @@ pub fn tool_status_glyph(status: ToolRowStatus) -> &'static str {
 pub fn blocks_from_segments(segs: &[TranscriptSeg]) -> Vec<Block> {
     segs.iter()
         .map(|seg| match seg {
-            TranscriptSeg::User { lines } => Block {
+            TranscriptSeg::User {
+                lines,
+                is_priming,
+            } => Block {
                 kind: BlockKind::User,
-                label: "User".to_string(),
+                label: if *is_priming {
+                    "Setup".to_string()
+                } else {
+                    "User".to_string()
+                },
                 lines: lines.clone(),
+                is_priming: *is_priming,
             },
             TranscriptSeg::System { lines } => Block {
                 kind: BlockKind::System,
                 label: "System".to_string(),
                 lines: lines.clone(),
+                is_priming: false,
             },
             TranscriptSeg::Thinking { lines, live } => Block {
                 kind: BlockKind::Reasoning,
@@ -708,6 +753,7 @@ pub fn blocks_from_segments(segs: &[TranscriptSeg]) -> Vec<Block> {
                     "Thinking".to_string()
                 },
                 lines: lines.clone(),
+                is_priming: false,
             },
             TranscriptSeg::Answer { lines, live } => Block {
                 kind: BlockKind::Assistant,
@@ -717,11 +763,13 @@ pub fn blocks_from_segments(segs: &[TranscriptSeg]) -> Vec<Block> {
                     "Assistant".to_string()
                 },
                 lines: lines.clone(),
+                is_priming: false,
             },
             TranscriptSeg::Activity { tools, .. } => Block {
                 kind: BlockKind::Activity,
                 label: activity_collapsed_label(tools),
                 lines: activity_body_lines(tools),
+                is_priming: false,
             },
         })
         .collect()
@@ -1459,7 +1507,8 @@ pub fn measure_scroll_bounds() -> iced::Task<(f32, f32)> {
 
 /// Render a single chat block, Zed-style calm transcript:
 ///
-/// - **User**: bordered card on the "paper" surface (no label, no chevron).
+/// - **User** (normal): bordered card on the "paper" surface (no label, no chevron).
+/// - **User** (priming Setup): collapsible muted header; user-card body when open.
 /// - **Answer / System**: plain text flowing on the chat background.
 /// - **Thinking**: muted collapsible header; body when expanded.
 /// - **Activity**: framed group card with quiet tool rows when expanded.
@@ -1477,6 +1526,9 @@ fn view_block<'a>(
         }
         BlockKind::Activity | BlockKind::ToolUse | BlockKind::ToolResult => {
             view_activity_block(idx, block, editor, collapsed, hl_ranges, hl_current)
+        }
+        BlockKind::User if block.is_priming => {
+            view_priming_user_block(idx, block, editor, collapsed, hl_ranges, hl_current)
         }
         BlockKind::User | BlockKind::Assistant | BlockKind::System => {
             view_prose_block(idx, block, editor, hl_ranges, hl_current)
@@ -1520,6 +1572,70 @@ fn view_prose_block<'a>(
             .into(),
         _ => padded.into(),
     }
+}
+
+/// Priming Setup user message: collapsible so scroll-to-top skips the
+/// AGENTS.md / orientation inject. Starts collapsed; expand on click;
+/// auto-hides again after [`PRIMING_RECOLLAPSE_SECS`].
+fn view_priming_user_block<'a>(
+    idx: usize,
+    block: &'a Block,
+    editor: Option<&'a EditorState>,
+    collapsed: bool,
+    hl_ranges: Vec<text_edit::HighlightRange>,
+    hl_current: Option<text_edit::HighlightRange>,
+) -> Element<'a, Msg> {
+    let has_content = !block.lines.is_empty();
+    let body_shown = has_content && !collapsed && editor.is_some();
+    let header_label = if collapsed {
+        priming_collapsed_label(&block.lines)
+    } else {
+        block.label.clone()
+    };
+    let label = text(header_label)
+        .size(theme::content_size())
+        .font(theme::content_font())
+        .color(theme::text_muted());
+    let header_row = row![collapsible::chevron(!collapsed), label]
+        .spacing(theme::SPACING_XS)
+        .align_y(iced::Alignment::Center);
+    let header_content: Element<'a, Msg> = button(header_row)
+        .on_press(Msg::ToggleCollapse(idx))
+        .padding(0.0)
+        .style(|_theme, _status| iced::widget::button::Style {
+            background: None,
+            ..Default::default()
+        })
+        .into();
+    let header = container(header_content)
+        .padding([theme::SPACING_XS, theme::SPACING_MD])
+        .width(Length::Fill);
+
+    let mut col = column![header].width(Length::Fill);
+    if body_shown && let Some(ed) = editor {
+        let content = text_edit::TextEdit::new(ed, move |action| Msg::ChatAction(idx, action))
+            .show_gutter(false)
+            .word_wrap(true)
+            .md_tables(true)
+            .read_only(true)
+            .fit_content(true)
+            .transparent_bg(true)
+            .highlights(hl_ranges, hl_current);
+        let padded = container(content)
+            .padding([theme::SPACING_SM, theme::SPACING_MD])
+            .width(Length::Fill)
+            .style(theme::chat_user_card);
+        col = col.push(
+            container(padded)
+                .padding([0.0, theme::SPACING_SM])
+                .width(Length::Fill),
+        );
+    }
+
+    container(col)
+        .padding([0.0, theme::SPACING_SM])
+        .width(Length::Fill)
+        .into()
 }
 
 /// Thinking: collapsible muted header; expanded body is the thought text.
@@ -1857,16 +1973,27 @@ fn view_completion_col<'a>(
     for (i, &(cmd_idx, _score)) in filtered.iter().enumerate() {
         let cmd = &commands[cmd_idx];
         let is_selected = i == selected;
-        let label = row![
+        let name_color = theme::slash_command_name_color(cmd.kind);
+        let mut label = row![
             text(format!("/{}", cmd.name))
                 .size(theme::font_sm())
-                .color(theme::text_primary()),
-            Space::new().width(theme::SPACING_SM),
-            text(&cmd.description)
-                .size(theme::font_sm())
-                .color(theme::text_muted()),
-        ]
-        .align_y(iced::Alignment::Center);
+                .color(name_color),
+        ];
+        if let Some(tag) = slash_kind_row_tag(cmd.kind) {
+            label = label.push(Space::new().width(theme::SPACING_SM)).push(
+                text(tag)
+                    .size(theme::font_sm())
+                    .color(theme::text_muted()),
+            );
+        }
+        label = label
+            .push(Space::new().width(theme::SPACING_SM))
+            .push(
+                text(&cmd.description)
+                    .size(theme::font_sm())
+                    .color(theme::text_muted()),
+            )
+            .align_y(iced::Alignment::Center);
         items = items.push(
             container(label)
                 .width(Length::Fill)
@@ -1902,14 +2029,25 @@ fn completion_divider<'a>() -> Element<'a, Msg> {
 // ── Fuzzy matching ──────────────────────────────────────────────────────────
 
 /// Filter and score commands by fuzzy-matching `query` against command names.
-/// Returns `(index_into_commands, score)` sorted by descending score.
+/// Returns `(index_into_commands, score)` sorted by descending score, then
+/// System → Workflow → Agent, then Workflow order_key (None last), then name.
 pub fn filter_commands(commands: &[SlashCommand], query: &str) -> Vec<(usize, i32)> {
     let mut matches: Vec<(usize, i32)> = commands
         .iter()
         .enumerate()
         .filter_map(|(i, cmd)| fuzzy_score(query, &cmd.name).map(|s| (i, s)))
         .collect();
-    matches.sort_by(|a, b| b.1.cmp(&a.1));
+    matches.sort_by(|a, b| {
+        let ca = &commands[a.0];
+        let cb = &commands[b.0];
+        b.1.cmp(&a.1)
+            .then_with(|| slash_kind_rank(ca.kind).cmp(&slash_kind_rank(cb.kind)))
+            .then_with(|| {
+                crate::slash_commands::slash_order_rank(ca.order_key)
+                    .cmp(&crate::slash_commands::slash_order_rank(cb.order_key))
+            })
+            .then_with(|| ca.name.cmp(&cb.name))
+    });
     matches
 }
 
@@ -1951,6 +2089,7 @@ fn fuzzy_score(query: &str, target: &str) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use duckchat::SlashCommandKind;
 
     fn model(harness: &str, id: &str, window: Option<usize>) -> ModelInfo {
         ModelInfo {
@@ -1959,6 +2098,105 @@ mod tests {
             display: id.to_string(),
             context_window: window,
         }
+    }
+
+    fn cmd(name: &str, kind: SlashCommandKind) -> SlashCommand {
+        SlashCommand {
+            name: name.into(),
+            description: name.into(),
+            kind,
+            order_key: None,
+        }
+    }
+
+    /// @spec chat/slash-commands Kind cues in completion: Name token color maps by kind
+    #[test]
+    fn name_token_color_maps_by_kind() {
+        // GIVEN completion rows for System, Workflow, and Agent entries
+        // WHEN name-token colors are resolved
+        let sys = theme::slash_command_name_color(SlashCommandKind::System);
+        let wf = theme::slash_command_name_color(SlashCommandKind::Workflow);
+        let agent = theme::slash_command_name_color(SlashCommandKind::Agent);
+        // THEN the three kinds resolve to three different colors
+        assert_ne!(sys, wf);
+        assert_ne!(sys, agent);
+        assert_ne!(wf, agent);
+    }
+
+    /// @spec chat/slash-commands Kind cues in completion: System rows include a sys tag
+    #[test]
+    fn system_rows_include_a_sys_tag() {
+        // GIVEN a System completion entry
+        // WHEN the completion row tag is resolved
+        // THEN the row includes a `sys` tag
+        assert_eq!(
+            slash_kind_row_tag(SlashCommandKind::System),
+            Some("sys")
+        );
+        assert_eq!(slash_kind_row_tag(SlashCommandKind::Workflow), None);
+        assert_eq!(slash_kind_row_tag(SlashCommandKind::Agent), None);
+    }
+
+    /// @spec chat/slash-commands Kind cues in completion: Equal fuzzy scores order System, Workflow, Agent
+    #[test]
+    fn equal_fuzzy_scores_order_system_workflow_agent() {
+        // GIVEN three catalog entries of kinds System, Workflow, Agent that all score equally
+        // (empty query scores every name 0)
+        let commands = vec![
+            cmd("agent-cmd", SlashCommandKind::Agent),
+            cmd("sys-cmd", SlashCommandKind::System),
+            cmd("ds-cmd", SlashCommandKind::Workflow),
+        ];
+        // WHEN the filtered completion list is built
+        let filtered = filter_commands(&commands, "");
+        // THEN those three appear in order System, then Workflow, then Agent
+        assert_eq!(filtered.len(), 3);
+        assert_eq!(commands[filtered[0].0].kind, SlashCommandKind::System);
+        assert_eq!(commands[filtered[1].0].kind, SlashCommandKind::Workflow);
+        assert_eq!(commands[filtered[2].0].kind, SlashCommandKind::Agent);
+    }
+
+    fn workflow(name: &str, order_key: Option<u32>) -> SlashCommand {
+        SlashCommand {
+            name: name.into(),
+            description: name.into(),
+            kind: SlashCommandKind::Workflow,
+            order_key,
+        }
+    }
+
+    // @spec chat/slash-commands Kind cues in completion: Equal scores order Workflow by order key then name
+    #[test]
+    fn equal_scores_order_workflow_by_order_key_then_name() {
+        // GIVEN two Workflow catalog entries with equal fuzzy scores for the current query
+        // AND the first has a higher order key than the second
+        let commands = vec![
+            workflow("ds-spec", Some(40)),
+            workflow("ds-explore", Some(10)),
+        ];
+        // WHEN the filtered completion list is built
+        let filtered = filter_commands(&commands, "");
+        // THEN the entry with the lower order key appears before the entry with the higher order key
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(commands[filtered[0].0].name, "ds-explore");
+        assert_eq!(commands[filtered[1].0].name, "ds-spec");
+    }
+
+    // @spec chat/slash-commands Kind cues in completion: Workflow without order key sorts after ordered Workflow
+    #[test]
+    fn workflow_without_order_key_sorts_after_ordered_workflow() {
+        // GIVEN two Workflow catalog entries with equal fuzzy scores for the current query
+        // AND one entry has an order key and the other has no order key
+        let commands = vec![
+            workflow("ds-custom", None),
+            workflow("ds-explore", Some(10)),
+        ];
+        // WHEN the filtered completion list is built
+        let filtered = filter_commands(&commands, "");
+        // THEN the entry with an order key appears before the entry without an order key
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(commands[filtered[0].0].name, "ds-explore");
+        assert_eq!(commands[filtered[1].0].name, "ds-custom");
     }
 
     /// @spec harness/model-picker Harness-grouped choices: Choices present each model under its harness
@@ -2865,5 +3103,152 @@ mod tests {
             "settled Activity should be collapsed"
         );
         assert!(!states[0].user_set);
+    }
+
+    /// @spec chat/transcript Collapse defaults: Priming Setup starts collapsed
+    #[test]
+    fn priming_setup_starts_collapsed() {
+        // GIVEN a session whose first user message is the synthetic priming inject.
+        let mut session = ChatSession::new("test".into());
+        session.messages.push(crate::chat_store::ChatMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text(
+                "Project conventions from AGENTS.md…\n\nDo not respond — reply with a single dot (.)"
+                    .into(),
+            )],
+            timestamp: String::new(),
+            is_priming: true,
+        });
+        session.messages.push(crate::chat_store::ChatMessage {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text(".".into())],
+            timestamp: String::new(),
+            is_priming: false,
+        });
+        session.messages.push(crate::chat_store::ChatMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text("real first message".into())],
+            timestamp: String::new(),
+            is_priming: false,
+        });
+
+        let segs = build_transcript_segments(&session);
+        assert!(
+            matches!(
+                &segs[0],
+                TranscriptSeg::User {
+                    is_priming: true,
+                    ..
+                }
+            ),
+            "first segment should be priming user: {segs:?}"
+        );
+        assert!(
+            matches!(
+                &segs[2],
+                TranscriptSeg::User {
+                    is_priming: false,
+                    ..
+                }
+            ),
+            "real user message is not priming: {segs:?}"
+        );
+
+        // WHEN collapse state is synced for that transcript.
+        let mut states = Vec::new();
+        sync_collapse_states(&mut states, &segs);
+
+        // THEN the priming Setup block is collapsed and the real user is not.
+        assert!(
+            states[0].collapsed,
+            "priming Setup should start collapsed"
+        );
+        assert!(!states[0].user_set);
+        assert!(
+            !states[2].collapsed,
+            "real user message must stay expanded"
+        );
+
+        let blocks = blocks_from_segments(&segs);
+        assert!(blocks[0].is_priming);
+        assert_eq!(blocks[0].label, "Setup");
+        assert!(!blocks[2].is_priming);
+    }
+
+    /// @spec chat/transcript Collapse defaults: User-expanded priming is not force-collapsed by sync
+    #[test]
+    fn user_expanded_priming_is_not_force_collapsed_by_sync() {
+        // GIVEN a priming User segment the user has expanded.
+        let mut session = ChatSession::new("test".into());
+        session.messages.push(crate::chat_store::ChatMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text("priming body".into())],
+            timestamp: String::new(),
+            is_priming: true,
+        });
+        let segs = build_transcript_segments(&session);
+        let mut states = Vec::new();
+        sync_collapse_states(&mut states, &segs);
+        assert!(states[0].collapsed);
+        toggle_collapse(&mut states, 0);
+        assert!(!states[0].collapsed);
+        assert!(states[0].user_set);
+
+        // WHEN collapse state is synced again without a timed re-collapse.
+        sync_collapse_states(&mut states, &segs);
+
+        // THEN the priming User segment remains expanded.
+        assert!(
+            !states[0].collapsed,
+            "user-expanded priming must not be force-collapsed by sync"
+        );
+    }
+
+    /// @spec chat/transcript Collapse defaults: Timed re-collapse forces priming collapsed
+    #[test]
+    fn timed_recollapse_forces_priming_collapsed() {
+        // GIVEN a priming User segment that is currently expanded.
+        let mut session = ChatSession::new("test".into());
+        session.messages.push(crate::chat_store::ChatMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text("priming body".into())],
+            timestamp: String::new(),
+            is_priming: true,
+        });
+        let segs = build_transcript_segments(&session);
+        let mut states = Vec::new();
+        sync_collapse_states(&mut states, &segs);
+        toggle_collapse(&mut states, 0);
+        assert!(!states[0].collapsed);
+
+        // WHEN the priming re-collapse path runs for that segment.
+        recollapse_priming(&mut states, 0);
+
+        // THEN the priming User segment is collapsed.
+        assert!(states[0].collapsed);
+    }
+
+    /// @spec chat/transcript Segment presentation: Priming collapsed label uses Setup and line count
+    #[test]
+    fn priming_collapsed_label_uses_setup_and_line_count() {
+        // GIVEN a priming User segment whose body has a known number of lines.
+        let lines = vec![
+            "Project conventions…".to_string(),
+            String::new(),
+            "reply with a single dot (.)".to_string(),
+        ];
+
+        // WHEN the collapsed label for that segment is produced.
+        let label = priming_collapsed_label(&lines);
+
+        // THEN the label includes Setup and that line count.
+        assert!(
+            label.contains("Setup"),
+            "collapsed priming label should name Setup: {label}"
+        );
+        assert!(
+            label.contains("3 lines"),
+            "collapsed priming label should include line count: {label}"
+        );
     }
 }
