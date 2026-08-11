@@ -1,4 +1,4 @@
-//! Settings area — font, chat affordances, and per-project model configuration UI.
+//! Settings area — fonts, global default model, chat affordances, and per-project override.
 
 use std::path::Path;
 
@@ -7,9 +7,11 @@ use iced::widget::{
 };
 use iced::{Center, Element, Length};
 
-use crate::config::{self, Config, VcsWorkflow};
+use crate::agent;
+use crate::config::{self, Config, VcsWorkflow, ViewerStyle};
 use crate::theme;
 use crate::widget::agent_chat::{self, ModelChoice};
+use duckchat::{ModelInfo, ModelRef};
 
 // ── State ────────────────────────────────────────────────────────────────────
 
@@ -27,11 +29,105 @@ pub enum Message {
     UiFontSizeChanged(f32),
     ContentFontSelected(String),
     ContentFontSizeChanged(f32),
-    /// Project-level default model picked (`id == None` → no default).
+    /// Global main-chat default (concrete choice only).
+    GlobalModelSelected(ModelChoice),
+    /// Project override (`id == None` → use global default).
     ModelDefaultSelected(ModelChoice),
     AgentInputHintsToggled(bool),
+    PilotReactivateOnErrorToggled(bool),
+    PhasePillListToggled(bool),
+    PhasePillChatToggled(bool),
+    /// Global oneshot model for a harness (`choice.id` is the model id).
+    OneshotModelSelected {
+        harness: String,
+        choice: ModelChoice,
+    },
     VcsWorkflowSelected(VcsWorkflow),
+    /// Global Answer viewer style (Classic / Focus when implemented).
+    ViewerStyleSelected(ViewerStyle),
     ResetDefaults,
+}
+
+/// Styles offered by the Settings viewer-style picker (implemented only).
+pub fn settings_viewer_style_choices() -> Vec<ViewerStyle> {
+    config::implemented_viewer_styles().to_vec()
+}
+
+/// Selected picker value: stored style when implemented, else Classic.
+pub fn selected_viewer_style_for_picker(stored: ViewerStyle) -> ViewerStyle {
+    let choices = settings_viewer_style_choices();
+    if choices.contains(&stored) {
+        stored
+    } else {
+        ViewerStyle::Classic
+    }
+}
+
+/// Which harnesses should offer an oneshot model picker.
+///
+/// Empty when agent input hints are off, or when a harness has no catalog models.
+/// Order follows the catalog harness order of the provided slices.
+#[cfg(test)]
+pub fn oneshot_picker_harnesses(
+    agent_input_hints: bool,
+    catalog: &[(impl AsRef<str>, &[ModelInfo])],
+) -> Vec<String> {
+    if !agent_input_hints {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (harness, models) in catalog {
+        if !models.is_empty() {
+            out.push(harness.as_ref().to_string());
+        }
+    }
+    out
+}
+
+/// Harness ids with non-empty process-catalog slices, in catalog order.
+fn oneshot_harnesses_from_process_catalog() -> Vec<String> {
+    let models = agent::available_models();
+    let mut out = Vec::new();
+    for m in &models {
+        if !out.iter().any(|h| h == &m.harness) {
+            out.push(m.harness.clone());
+        }
+    }
+    out
+}
+
+fn harness_label(harness: &str) -> &str {
+    match harness {
+        "claude-code" => "Claude Code",
+        "grok" => "Grok",
+        "openai-codex" => "OpenAI Codex",
+        other => other,
+    }
+}
+
+fn oneshot_choices_for(models: &[ModelInfo]) -> Vec<ModelChoice> {
+    models
+        .iter()
+        .map(|m| ModelChoice {
+            harness: Some(m.harness.clone()),
+            id: Some(m.id.clone()),
+            label: m.display.clone(),
+            closed_label: m.display.clone(),
+        })
+        .collect()
+}
+
+/// Selected oneshot picker choice for a harness: same ladder as the worker
+/// (`resolve_oneshot_model`), not the first catalog entry when config is unset.
+pub fn selected_oneshot_choice(
+    harness: &str,
+    configured: Option<&str>,
+    models: &[ModelInfo],
+) -> ModelChoice {
+    let choices = oneshot_choices_for(models);
+    let resolved = agent::resolve_oneshot_model(harness, configured, models);
+    let selected_ref = resolved.map(|id| ModelRef::new(harness, id));
+    agent_chat::selected_model_choice(&choices, selected_ref.as_ref())
 }
 
 // ── Update ───────────────────────────────────────────────────────────────────
@@ -64,10 +160,16 @@ pub fn update(
             config.content.font_size = size;
             let _ = config::save(config);
         }
+        Message::GlobalModelSelected(choice) => {
+            if let Some(model) = choice.to_ref() {
+                config.set_global_model_default(Some(model));
+                let _ = config::save(config);
+            }
+        }
         Message::ModelDefaultSelected(choice) => {
             if let Some(root) = project_root {
-                // A real choice carries its own harness, so a grok default
-                // persists under the grok harness; the sentinel maps to `None`.
+                // A real choice carries its own harness; the sentinel maps to `None`
+                // (use global default).
                 let model = choice.to_ref();
                 config.set_project_model_default(root, model);
                 let _ = config::save(config);
@@ -77,14 +179,56 @@ pub fn update(
             config.chat.agent_input_hints = on;
             let _ = config::save(config);
         }
+        Message::PilotReactivateOnErrorToggled(on) => {
+            config.chat.pilot_reactivate_on_error = on;
+            let _ = config::save(config);
+        }
+        Message::PhasePillListToggled(on) => {
+            config.ui.phase_pill_list = on;
+            let _ = config::save(config);
+        }
+        Message::PhasePillChatToggled(on) => {
+            config.ui.phase_pill_chat = on;
+            let _ = config::save(config);
+        }
+        Message::OneshotModelSelected { harness, choice } => {
+            let model = choice.id;
+            config.chat.set_oneshot_model(&harness, model);
+            let _ = config::save(config);
+        }
         Message::VcsWorkflowSelected(workflow) => {
             config.vcs.workflow = workflow;
             let _ = config::save(config);
         }
-        Message::ResetDefaults => {
-            *config = Config::default();
+        Message::ViewerStyleSelected(style) => {
+            config.chat.viewer_style = style;
             let _ = config::save(config);
         }
+        Message::ResetDefaults => {
+            *config = Config::default();
+            // Re-seed a concrete global default when the process catalog has
+            // models — ModelCatalogReady is one-shot and will not re-seed.
+            let catalog = agent::available_models();
+            let _ = agent::seed_global_default_if_unset(config, &catalog);
+            let _ = config::save(config);
+        }
+    }
+}
+
+/// Closed selection for the global default picker: a real catalog choice when
+/// set and available; **Missing** when unset or absent from the catalog.
+fn global_default_picker_selected(config: &Config, choices: &[ModelChoice]) -> ModelChoice {
+    match config.global_model_default() {
+        Some(m)
+            if choices.iter().any(|c| {
+                c.harness.as_deref() == Some(m.harness.as_str())
+                    && c.id.as_deref() == Some(m.model.as_str())
+            }) =>
+        {
+            agent_chat::selected_model_choice(choices, Some(m))
+        }
+        Some(m) => agent_chat::missing_closed_model_choice(Some(m)),
+        None => agent_chat::missing_closed_model_choice(None),
     }
 }
 
@@ -96,6 +240,10 @@ pub fn view<'a>(
     project_root: Option<&Path>,
 ) -> Element<'a, Message> {
     let heading = text("Settings").size(22.0).color(theme::text_primary());
+
+    let global_heading = text("Global")
+        .size(theme::font_lg())
+        .color(theme::text_primary());
 
     let ui_section = font_section(
         "UI Font",
@@ -117,6 +265,42 @@ pub fn view<'a>(
         Message::ContentFontSizeChanged,
     );
 
+    let global_model = global_model_section(config);
+    let phase_pills = phase_pills_section(config);
+    let chat_section = chat_section(config);
+    let vcs_section = vcs_section(config);
+
+    let mut body = column![
+        heading,
+        Space::new().height(theme::SPACING_XL),
+        global_heading,
+        Space::new().height(theme::SPACING_MD),
+        ui_section,
+        Space::new().height(theme::SPACING_XL),
+        content_section,
+        Space::new().height(theme::SPACING_XL),
+        global_model,
+        Space::new().height(theme::SPACING_XL),
+        phase_pills,
+        Space::new().height(theme::SPACING_XL),
+        chat_section,
+        Space::new().height(theme::SPACING_XL),
+        vcs_section,
+    ];
+
+    if let Some(root) = project_root {
+        let project_heading = text("This project")
+            .size(theme::font_lg())
+            .color(theme::text_primary());
+        // Extra gap so Global and This project read as peer top-level sections.
+        body = body
+            .push(Space::new().height(theme::SPACING_XL))
+            .push(Space::new().height(theme::SPACING_LG))
+            .push(project_heading)
+            .push(Space::new().height(theme::SPACING_MD))
+            .push(project_model_section(config, root));
+    }
+
     let reset = button(
         text("Reset to defaults")
             .size(theme::font_sm())
@@ -125,26 +309,6 @@ pub fn view<'a>(
     .on_press(Message::ResetDefaults)
     .style(theme::dashboard_action);
 
-    let chat_section = chat_section(config);
-    let vcs_section = vcs_section(config);
-
-    let mut body = column![
-        heading,
-        Space::new().height(theme::SPACING_XL),
-        ui_section,
-        Space::new().height(theme::SPACING_XL),
-        content_section,
-        Space::new().height(theme::SPACING_XL),
-        chat_section,
-        Space::new().height(theme::SPACING_XL),
-        vcs_section,
-    ];
-    // Per-project model default — only meaningful with a project open.
-    if let Some(root) = project_root {
-        body = body
-            .push(Space::new().height(theme::SPACING_XL))
-            .push(model_section(config, root));
-    }
     let body = body
         .push(Space::new().height(theme::SPACING_XL))
         .push(reset)
@@ -162,12 +326,75 @@ pub fn view<'a>(
     .into()
 }
 
+fn global_model_section<'a>(config: &Config) -> Element<'a, Message> {
+    let label = text("Default Model")
+        .size(theme::font_md())
+        .color(theme::text_primary());
+    let desc = text(
+        "Model new chats use by default in every project. A project override or \
+         per-chat selection can narrow it.",
+    )
+    .size(theme::font_sm())
+    .color(theme::text_muted());
+
+    let choices = agent_chat::global_model_choices();
+    let selected = global_default_picker_selected(config, &choices);
+    let picker = pick_list(choices, Some(selected), Message::GlobalModelSelected)
+        .width(280)
+        .style(theme::pick_list_style)
+        .menu_style(theme::pick_list_menu);
+
+    column![label, desc, Space::new().height(theme::SPACING_SM), picker]
+        .spacing(theme::SPACING_XS)
+        .into()
+}
+
+fn phase_pills_section<'a>(config: &Config) -> Element<'a, Message> {
+    let label = text("Phase pills")
+        .size(theme::font_md())
+        .color(theme::text_primary());
+    let desc = text(
+        "Short lifecycle stage labels on the change list and above the chat \
+         composer. Each surface can be turned off independently. Applies to all \
+         projects.",
+    )
+    .size(theme::font_sm())
+    .color(theme::text_muted());
+
+    let list_row = toggler(config.ui.phase_pill_list)
+        .label("Change list")
+        .on_toggle(Message::PhasePillListToggled);
+    let list_help = text("Show a stage pill on exploration, active, and archived change rows.")
+        .size(theme::font_sm())
+        .color(theme::text_muted());
+
+    let chat_row = toggler(config.ui.phase_pill_chat)
+        .label("Chat composer")
+        .on_toggle(Message::PhasePillChatToggled);
+    let chat_help = text("Show stage pills above the composer for change and exploration chats.")
+        .size(theme::font_sm())
+        .color(theme::text_muted());
+
+    column![
+        label,
+        desc,
+        Space::new().height(theme::SPACING_SM),
+        list_row,
+        list_help,
+        Space::new().height(theme::SPACING_SM),
+        chat_row,
+        chat_help,
+    ]
+    .spacing(theme::SPACING_XS)
+    .into()
+}
+
 fn chat_section<'a>(config: &Config) -> Element<'a, Message> {
     let label = text("Chat")
         .size(theme::font_md())
         .color(theme::text_primary());
     let desc = text(
-        "Under-input agent reply suggestions (Cmd-Enter when armed). \
+        "Optional freeform reply chips after a turn (⌘-number when shown). \
          Applies to all projects.",
     )
     .size(theme::font_sm())
@@ -177,20 +404,104 @@ fn chat_section<'a>(config: &Config) -> Element<'a, Message> {
         .label("Agent input hints")
         .on_toggle(Message::AgentInputHintsToggled);
     let agent_help = text(
-        "After a turn, suggest one freeform reply under the empty composer (Cmd-Enter).",
+        "When enabled (default off), a settled oneshot may offer up to three freeform \
+         replies as fast-response chips — only while idle, with no next-action ghost, \
+         and not while a question tool is active. Click or ⌘n to send.",
     )
     .size(theme::font_sm())
     .color(theme::text_muted());
 
-    column![
+    let pilot_row = toggler(config.chat.pilot_reactivate_on_error)
+        .label("Reactivate build pilot after crash/restart")
+        .on_toggle(Message::PilotReactivateOnErrorToggled);
+    let pilot_help = text(
+        "When enabled (default off), a future cut may re-arm build pilot after crash, \
+         restart, or error. Not active yet — pilot arm stays process-local either way.",
+    )
+    .size(theme::font_sm())
+    .color(theme::text_muted());
+
+    let viewer_label = text("Answer viewer style")
+        .size(theme::font_sm())
+        .color(theme::text_secondary());
+    let viewer_picker = pick_list(
+        settings_viewer_style_choices(),
+        Some(selected_viewer_style_for_picker(config.chat.viewer_style)),
+        Message::ViewerStyleSelected,
+    )
+    .width(280)
+    .style(theme::pick_list_style)
+    .menu_style(theme::pick_list_menu);
+    let viewer_help = text(
+        "How assistant Answers are presented. Classic is the full source-faithful \
+         viewer. Focus folds long replies around the trailing meta gate. Applies to \
+         all projects; changes take effect immediately.",
+    )
+    .size(theme::font_sm())
+    .color(theme::text_muted());
+
+    let mut col = column![
         label,
         desc,
         Space::new().height(theme::SPACING_SM),
         agent_row,
         agent_help,
+        Space::new().height(theme::SPACING_SM),
+        pilot_row,
+        pilot_help,
+        Space::new().height(theme::SPACING_SM),
+        viewer_label,
+        viewer_picker,
+        viewer_help,
     ]
-    .spacing(theme::SPACING_XS)
-    .into()
+    .spacing(theme::SPACING_XS);
+
+    if config.chat.agent_input_hints {
+        let oneshot_intro = text(
+            "Oneshot model (titles and reply chips) per agent backend. Global — not \
+             per project. Only backends with models available on this machine.",
+        )
+        .size(theme::font_sm())
+        .color(theme::text_muted());
+        col = col
+            .push(Space::new().height(theme::SPACING_SM))
+            .push(oneshot_intro);
+
+        for harness in oneshot_harnesses_from_process_catalog() {
+            let models = agent::models_for_harness(&harness);
+            if models.is_empty() {
+                continue;
+            }
+            let choices = oneshot_choices_for(&models);
+            let selected =
+                selected_oneshot_choice(&harness, config.chat.oneshot_model(&harness), &models);
+            let harness_owned = harness.clone();
+            let picker = pick_list(choices, Some(selected), move |choice| {
+                Message::OneshotModelSelected {
+                    harness: harness_owned.clone(),
+                    choice,
+                }
+            })
+            .width(280)
+            .style(theme::pick_list_style)
+            .menu_style(theme::pick_list_menu);
+
+            let row_label = text(format!("Oneshot · {}", harness_label(&harness)))
+                .size(theme::font_sm())
+                .color(theme::text_secondary());
+            col = col
+                .push(Space::new().height(theme::SPACING_SM))
+                .push(row_label)
+                .push(picker);
+        }
+    }
+
+    col.into()
+}
+
+/// Ordered workflows offered by the Settings version-control picker.
+fn vcs_workflow_settings_choices() -> [VcsWorkflow; 3] {
+    VcsWorkflow::ALL
 }
 
 fn vcs_section<'a>(config: &Config) -> Element<'a, Message> {
@@ -205,7 +516,7 @@ fn vcs_section<'a>(config: &Config) -> Element<'a, Message> {
     .color(theme::text_muted());
 
     let picker = pick_list(
-        VcsWorkflow::ALL.to_vec(),
+        vcs_workflow_settings_choices().to_vec(),
         Some(config.vcs.workflow),
         Message::VcsWorkflowSelected,
     )
@@ -234,18 +545,18 @@ fn vcs_section<'a>(config: &Config) -> Element<'a, Message> {
     .into()
 }
 
-fn model_section<'a>(config: &Config, root: &Path) -> Element<'a, Message> {
+fn project_model_section<'a>(config: &Config, root: &Path) -> Element<'a, Message> {
     let label = text("Default Model")
         .size(theme::font_md())
         .color(theme::text_primary());
     let desc = text(
-        "Model new chats in this project use by default. A per-chat selection \
-         overrides it.",
+        "Override the global default for new chats in this project. A per-chat \
+         selection still wins. “Use global default” clears the override.",
     )
     .size(theme::font_sm())
     .color(theme::text_muted());
 
-    let choices = agent_chat::project_model_choices();
+    let choices = agent_chat::project_override_model_choices();
     let current = config.project_model_default(root);
     let selected = agent_chat::selected_model_choice(&choices, current.as_ref());
     let picker = pick_list(choices, Some(selected), Message::ModelDefaultSelected)
@@ -253,7 +564,7 @@ fn model_section<'a>(config: &Config, root: &Path) -> Element<'a, Message> {
         .style(theme::pick_list_style)
         .menu_style(theme::pick_list_menu);
 
-    column![label, desc, Space::new().height(theme::SPACING_SM), picker,]
+    column![label, desc, Space::new().height(theme::SPACING_SM), picker]
         .spacing(theme::SPACING_XS)
         .into()
 }
@@ -292,8 +603,8 @@ fn font_section<'a>(
         .width(40)
         .align_x(Center);
 
-    let size_slider = slider(8.0..=32.0, current_size, on_size)
-        .step(1.0)
+    let size_slider = slider(8.0_f32..=32.0_f32, current_size, on_size)
+        .step(1.0_f32)
         .width(200);
 
     let size_row = row![
@@ -322,4 +633,202 @@ fn font_section<'a>(
 
 pub fn breadcrumbs() -> Vec<String> {
     vec!["Settings".into()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mi(harness: &str, id: &str) -> ModelInfo {
+        ModelInfo {
+            harness: harness.into(),
+            id: id.into(),
+            display: id.into(),
+            context_window: None,
+        }
+    }
+
+    // @spec shell/vcs-workflow Global workflow choice: Settings exposes the three workflows for selection
+    #[test]
+    fn settings_exposes_the_three_workflows_for_selection() {
+        // GIVEN the global Settings surface
+        // WHEN the version-control workflow choices are presented
+        let choices = vcs_workflow_settings_choices();
+        // THEN plain git, jujutsu, and git worktrees are all offered for selection
+        assert_eq!(
+            choices,
+            [
+                VcsWorkflow::Git,
+                VcsWorkflow::Jj,
+                VcsWorkflow::Worktrees
+            ]
+        );
+        assert_eq!(choices, VcsWorkflow::ALL);
+    }
+
+    /// @spec chat/oneshot-models Settings pickers when hints enabled: With agent input hints on, each harness with catalog models offers an oneshot model picker
+    #[test]
+    fn with_agent_input_hints_on_each_harness_with_catalog_models_offers_picker() {
+        // GIVEN agent input hints enabled
+        // AND at least one harness with a non-empty catalog slice
+        let claude = vec![mi("claude-code", "haiku")];
+        let grok = vec![mi("grok", "grok-4.5")];
+        let catalog: [(&str, &[ModelInfo]); 2] = [("claude-code", &claude), ("grok", &grok)];
+
+        // WHEN the Chat settings section is shown
+        let harnesses = oneshot_picker_harnesses(true, &catalog);
+
+        // THEN an oneshot model picker is offered for each harness that has catalog models
+        assert_eq!(harnesses, vec!["claude-code", "grok"]);
+    }
+
+    /// @spec chat/oneshot-models Settings pickers when hints enabled: With agent input hints off, oneshot model pickers are not shown
+    #[test]
+    fn with_agent_input_hints_off_oneshot_model_pickers_are_not_shown() {
+        // GIVEN agent input hints disabled
+        // AND at least one harness with a non-empty catalog slice
+        let claude = vec![mi("claude-code", "haiku")];
+        let catalog: [(&str, &[ModelInfo]); 1] = [("claude-code", &claude)];
+
+        // WHEN the Chat settings section is shown
+        let harnesses = oneshot_picker_harnesses(false, &catalog);
+
+        // THEN no oneshot model picker is shown
+        assert!(harnesses.is_empty());
+    }
+
+    /// @spec chat/viewer-style Settings choices: Settings lists classic and focus when Focus is implemented
+    #[test]
+    fn settings_lists_classic_and_focus_when_focus_is_implemented() {
+        // GIVEN Focus Answer presentation is implemented
+        assert!(config::FOCUS_ANSWER_IMPLEMENTED);
+        // WHEN the Settings viewer-style choices are built
+        let choices = settings_viewer_style_choices();
+        // THEN the choices are classic and focus
+        assert_eq!(
+            choices,
+            vec![ViewerStyle::Classic, ViewerStyle::Focus],
+            "implemented styles should be Classic then Focus"
+        );
+    }
+
+    /// @spec chat/viewer-style Settings choices: Document is not offered while unimplemented
+    #[test]
+    fn document_is_not_offered_while_unimplemented() {
+        // GIVEN Document Answer presentation is not implemented
+        // WHEN the Settings viewer-style choices are built
+        let choices = settings_viewer_style_choices();
+        // THEN document is not among the choices
+        assert!(
+            !choices.contains(&ViewerStyle::Document),
+            "Document must stay off the picker until implemented: {choices:?}"
+        );
+        // Stored document still maps to Classic for the selected display value.
+        assert_eq!(
+            selected_viewer_style_for_picker(ViewerStyle::Document),
+            ViewerStyle::Classic
+        );
+    }
+
+    #[test]
+    fn unset_config_selects_string_match_default_not_first_catalog_entry() {
+        // Claude: first catalog is sonnet; string-match default is haiku.
+        let claude = vec![
+            mi("claude-code", "claude-sonnet-5"),
+            mi("claude-code", "claude-haiku-4-5"),
+            mi("claude-code", "claude-opus-4-8"),
+        ];
+        let selected = selected_oneshot_choice("claude-code", None, &claude);
+        assert_eq!(
+            selected.id.as_deref(),
+            Some("claude-haiku-4-5"),
+            "unset Claude oneshot must prefer haiku match, not first catalog entry"
+        );
+
+        // Grok: first is grok-4.5; string-match default is composer-fast.
+        let grok = vec![mi("grok", "grok-4.5"), mi("grok", "grok-composer-2.5-fast")];
+        let selected = selected_oneshot_choice("grok", None, &grok);
+        assert_eq!(
+            selected.id.as_deref(),
+            Some("grok-composer-2.5-fast"),
+            "unset Grok oneshot must prefer composer-fast, not first catalog entry"
+        );
+    }
+
+    #[test]
+    fn configured_oneshot_id_in_catalog_is_selected() {
+        let claude = vec![
+            mi("claude-code", "claude-sonnet-5"),
+            mi("claude-code", "claude-haiku-4-5"),
+        ];
+        let selected = selected_oneshot_choice("claude-code", Some("claude-sonnet-5"), &claude);
+        assert_eq!(selected.id.as_deref(), Some("claude-sonnet-5"));
+    }
+
+    #[test]
+    fn empty_catalog_harness_is_skipped_by_oneshot_picker_helper() {
+        let claude = vec![mi("claude-code", "haiku")];
+        let empty: Vec<ModelInfo> = Vec::new();
+        let catalog: [(&str, &[ModelInfo]); 2] = [("claude-code", &claude), ("grok", &empty)];
+        let harnesses = oneshot_picker_harnesses(true, &catalog);
+        assert_eq!(harnesses, vec!["claude-code"]);
+    }
+
+    #[test]
+    fn global_picker_shows_missing_when_unset() {
+        let cfg = Config::default();
+        let choices = vec![ModelChoice {
+            harness: Some("grok".into()),
+            id: Some("grok-4.5".into()),
+            label: "Grok · Grok 4.5".into(),
+            closed_label: "Grok 4.5".into(),
+        }];
+        let selected = global_default_picker_selected(&cfg, &choices);
+        assert_eq!(selected.closed_label, "Missing");
+        assert_eq!(selected.label, "Missing");
+    }
+
+    #[test]
+    fn global_picker_shows_missing_when_configured_model_not_in_choices() {
+        let mut cfg = Config::default();
+        cfg.set_global_model_default(Some(ModelRef::new("grok", "gone")));
+        let choices = vec![ModelChoice {
+            harness: Some("claude-code".into()),
+            id: Some("sonnet".into()),
+            label: "Claude Code · Sonnet".into(),
+            closed_label: "Sonnet".into(),
+        }];
+        let selected = global_default_picker_selected(&cfg, &choices);
+        assert_eq!(selected.closed_label, "Missing");
+        assert_eq!(selected.id.as_deref(), Some("gone"));
+    }
+
+    #[test]
+    fn global_picker_shows_catalog_choice_when_set_and_available() {
+        let mut cfg = Config::default();
+        cfg.set_global_model_default(Some(ModelRef::new("grok", "grok-4.5")));
+        let choices = vec![ModelChoice {
+            harness: Some("grok".into()),
+            id: Some("grok-4.5".into()),
+            label: "Grok · Grok 4.5".into(),
+            closed_label: "Grok 4.5".into(),
+        }];
+        let selected = global_default_picker_selected(&cfg, &choices);
+        assert_eq!(selected.closed_label, "Grok 4.5");
+        assert_eq!(selected.id.as_deref(), Some("grok-4.5"));
+    }
+
+    #[test]
+    fn reset_reseeds_global_default_from_catalog() {
+        let mut cfg = Config::default();
+        cfg.set_global_model_default(Some(ModelRef::new("claude-code", "opus")));
+        // Simulate ResetDefaults body without process catalog dependency:
+        cfg = Config::default();
+        let catalog = vec![mi("claude-code", "sonnet"), mi("grok", "grok-4.5")];
+        assert!(agent::seed_global_default_if_unset(&mut cfg, &catalog));
+        assert_eq!(
+            cfg.global_model_default(),
+            Some(&ModelRef::new("grok", "grok-4.5"))
+        );
+    }
 }

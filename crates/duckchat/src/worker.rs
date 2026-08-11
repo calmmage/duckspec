@@ -12,7 +12,7 @@ use tokio::time::timeout;
 
 use crate::cancel::CancelToken;
 use crate::error::Error;
-use crate::event::AgentEvent;
+use crate::event::{AgentEvent, PendingUserChoices, UserChoiceAnswer};
 use crate::provider::Provider;
 use crate::reply_suggest::{
     REPLY_SUGGEST_INSTRUCTION, build_reply_suggest_prompt, parse_replies, should_skip_model,
@@ -21,8 +21,9 @@ use crate::request::{ReplySuggestionRequest, TitleRequest, TurnRequest};
 use crate::runtime::OneshotKind;
 use crate::title::{build_title_prompt, clean_title};
 
-/// Wall-clock budget for one oneshot Work item (`ensure_hot` + `prompt`).
-pub const ONESHOT_CALL_BUDGET: Duration = Duration::from_secs(10);
+/// Wall-clock oneshot call budget for one Work item (`ensure_hot` + `prompt`).
+/// Matches the warm-runtime contract (thirty seconds of wall-clock time).
+pub const ONESHOT_CALL_BUDGET: Duration = Duration::from_secs(30);
 
 /// Commands the caller can queue on the main worker loop.
 #[derive(Debug)]
@@ -30,6 +31,13 @@ pub enum AgentCommand {
     /// Run a prompt turn. Convenience helpers on [`AgentHandle`] construct
     /// this.
     RunTurn(TurnRequest),
+    /// Answer a parked mid-turn user choice. Prefer
+    /// [`AgentHandle::answer_user_choice`] (side channel) while a turn is
+    /// in flight — the main command loop is blocked on `run_turn`.
+    AnswerUserChoice {
+        correlation_id: u64,
+        answer: UserChoiceAnswer,
+    },
     /// Seed the session id used by the next turn. Useful when resuming a
     /// previously-persisted conversation — the caller knows the id before the
     /// worker has seen a turn.
@@ -63,6 +71,8 @@ pub struct AgentHandle {
     tx: mpsc::UnboundedSender<AgentCommand>,
     oneshot_tx: mpsc::UnboundedSender<OneshotCommand>,
     working_dir: PathBuf,
+    /// Side channel for mid-turn choices (works while `run_turn` is blocked).
+    pending_choices: std::sync::Arc<PendingUserChoices>,
 }
 
 impl AgentHandle {
@@ -87,11 +97,20 @@ impl AgentHandle {
     }
 
     /// Cancel the in-flight main turn. Does not tear down the oneshot path.
+    /// Also completes any parked user choice as cancelled.
     pub fn cancel(&self) {
+        self.pending_choices.cancel_all();
         self.cancel.cancel();
     }
 
+    /// Answer a parked mid-turn [`AgentEvent::UserChoiceRequest`].
+    /// Uses a side channel so it works while the main turn is in flight.
+    pub fn answer_user_choice(&self, correlation_id: u64, answer: UserChoiceAnswer) {
+        self.pending_choices.answer(correlation_id, answer);
+    }
+
     pub fn shutdown(&self) {
+        self.pending_choices.cancel_all();
         self.cancel.cancel();
         let _ = self.tx.send(AgentCommand::Shutdown);
     }
@@ -157,30 +176,40 @@ pub fn spawn_worker<P: Provider + 'static>(
     provider: P,
     working_dir: PathBuf,
     events: mpsc::Sender<AgentEvent>,
+    oneshot_model: Option<String>,
 ) -> AgentHandle {
-    spawn_worker_with_oneshot_budget(provider, working_dir, events, ONESHOT_CALL_BUDGET)
+    spawn_worker_with_oneshot_budget(
+        provider,
+        working_dir,
+        events,
+        ONESHOT_CALL_BUDGET,
+        oneshot_model,
+    )
 }
 
 /// Like [`spawn_worker`], but with an explicit oneshot Work budget (tests inject
-/// a short budget so hang recovery does not wait the full production 10s).
+/// a short budget so hang recovery does not wait the full production budget).
 fn spawn_worker_with_oneshot_budget<P: Provider + 'static>(
     provider: P,
     working_dir: PathBuf,
     events: mpsc::Sender<AgentEvent>,
     oneshot_budget: Duration,
+    oneshot_model: Option<String>,
 ) -> AgentHandle {
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<AgentCommand>();
     let (oneshot_tx, mut oneshot_rx) = mpsc::unbounded_channel::<OneshotCommand>();
     let cancel = CancelToken::new();
+    let pending_choices = PendingUserChoices::shared();
     let handle = AgentHandle {
         cancel: cancel.clone(),
         tx: cmd_tx,
         oneshot_tx: oneshot_tx.clone(),
         working_dir: working_dir.clone(),
+        pending_choices: pending_choices.clone(),
     };
 
     let mut main = provider.open_main_runtime(&working_dir);
-    let mut oneshot = provider.open_oneshot_runtime(&working_dir);
+    let mut oneshot = provider.open_oneshot_runtime(&working_dir, oneshot_model);
 
     // Oneshot loop: serializes title + reply; concurrent with the main loop.
     tokio::spawn(async move {
@@ -197,9 +226,7 @@ fn spawn_worker_with_oneshot_budget<P: Provider + 'static>(
                     .await
                     {
                         Ok(inner) => inner,
-                        Err(_elapsed) => Err(Error::Timeout(
-                            "oneshot call exceeded budget".into(),
-                        )),
+                        Err(_elapsed) => Err(Error::Timeout("oneshot call exceeded budget".into())),
                     };
                     let ok = result.is_ok();
                     let _ = req.reply.send(result);
@@ -251,7 +278,9 @@ fn spawn_worker_with_oneshot_budget<P: Provider + 'static>(
                         continue;
                     }
 
-                    let outcome = main.run_turn(req, events.clone(), cancel.clone()).await;
+                    let outcome = main
+                        .run_turn(req, events.clone(), cancel.clone(), pending_choices.clone())
+                        .await;
                     let send_result = match outcome {
                         Ok(out) => {
                             let changed = session_id.as_deref() != Some(out.session_id.as_str());
@@ -266,17 +295,13 @@ fn spawn_worker_with_oneshot_budget<P: Provider + 'static>(
                                     .map_err(|_| ());
                             }
                             if r.is_ok() {
-                                r = events
-                                    .send(AgentEvent::TurnComplete)
-                                    .await
-                                    .map_err(|_| ());
+                                r = events.send(AgentEvent::TurnComplete).await.map_err(|_| ());
                             }
                             r
                         }
-                        Err(Error::Cancelled) => events
-                            .send(AgentEvent::TurnComplete)
-                            .await
-                            .map_err(|_| ()),
+                        Err(Error::Cancelled) => {
+                            events.send(AgentEvent::TurnComplete).await.map_err(|_| ())
+                        }
                         Err(e) if e.is_session_not_found() => {
                             // Dead resume id — forget it so a retry opens
                             // session/new instead of looping on session/load.
@@ -297,6 +322,12 @@ fn spawn_worker_with_oneshot_budget<P: Provider + 'static>(
                         break;
                     }
                 }
+                AgentCommand::AnswerUserChoice {
+                    correlation_id,
+                    answer,
+                } => {
+                    pending_choices.answer(correlation_id, answer);
+                }
                 AgentCommand::SetSessionId(sid) => {
                     session_id = Some(sid);
                 }
@@ -304,6 +335,7 @@ fn spawn_worker_with_oneshot_budget<P: Provider + 'static>(
                     session_id = None;
                 }
                 AgentCommand::Shutdown => {
+                    pending_choices.cancel_all();
                     main.shutdown().await;
                     let _ = oneshot_tx.send(OneshotCommand::Shutdown);
                     return;
@@ -345,6 +377,8 @@ mod tests {
         oneshot_sessions: Mutex<Vec<u64>>,
         oneshot_rotate: AtomicUsize,
         oneshot_shutdown: AtomicUsize,
+        /// Preferred model id passed into `open_oneshot_runtime`.
+        oneshot_preferred: Mutex<Option<String>>,
         /// True while a oneshot prompt body is executing.
         oneshot_in_flight: AtomicBool,
         /// Peak concurrent oneshot prompt executions (should stay ≤ 1).
@@ -453,6 +487,7 @@ mod tests {
             req: TurnRequest,
             _events: mpsc::Sender<AgentEvent>,
             cancel: CancelToken,
+            _pending_choices: std::sync::Arc<PendingUserChoices>,
         ) -> Result<TurnOutcome, Error> {
             self.turn_count += 1;
             // First turn may hang until cancelled (for cancel/re-warm tests).
@@ -529,15 +564,13 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((model_hint, text.clone(), sid));
-            self.log
-                .oneshot_sessions
-                .lock()
-                .unwrap()
-                .push(sid);
+            self.log.oneshot_sessions.lock().unwrap().push(sid);
 
             match model_hint {
                 OneshotKind::Title => Ok(format!("\"Title for session {sid}.\"")),
-                OneshotKind::ReplySuggest => Ok(format!("REPLY: /ds-spec\nREPLY: no thanks ({sid})")),
+                OneshotKind::ReplySuggest => {
+                    Ok(format!("REPLY: /ds-spec\nREPLY: no thanks ({sid})"))
+                }
             }
         }
 
@@ -587,7 +620,12 @@ mod tests {
             })
         }
 
-        fn open_oneshot_runtime(&self, _working_dir: &Path) -> Box<dyn OneshotRuntime> {
+        fn open_oneshot_runtime(
+            &self,
+            _working_dir: &Path,
+            preferred_model: Option<String>,
+        ) -> Box<dyn OneshotRuntime> {
+            *self.log.oneshot_preferred.lock().unwrap() = preferred_model;
             Box::new(FakeOneshotRuntime {
                 log: self.log.clone(),
                 hot: false,
@@ -632,7 +670,12 @@ mod tests {
     async fn title_summary_is_requested_through_the_chat_handle() {
         let log = Arc::new(FakeLog::default());
         let (tx, mut rx) = mpsc::channel(16);
-        let handle = spawn_worker(FakeProvider::new(log.clone()), std::env::temp_dir(), tx);
+        let handle = spawn_worker(
+            FakeProvider::new(log.clone()),
+            std::env::temp_dir(),
+            tx,
+            None,
+        );
 
         // First turn activates paths (not required for title, but realistic).
         handle.send_prompt("hello".into());
@@ -653,7 +696,12 @@ mod tests {
     async fn reply_suggestions_are_requested_through_the_chat_handle() {
         let log = Arc::new(FakeLog::default());
         let (tx, mut rx) = mpsc::channel(16);
-        let handle = spawn_worker(FakeProvider::new(log.clone()), std::env::temp_dir(), tx);
+        let handle = spawn_worker(
+            FakeProvider::new(log.clone()),
+            std::env::temp_dir(),
+            tx,
+            None,
+        );
 
         handle.send_prompt("hello".into());
         drain_until_turn_complete(&mut rx).await;
@@ -674,7 +722,12 @@ mod tests {
     async fn first_turn_succeeds_without_a_prior_pre_warm_call() {
         let log = Arc::new(FakeLog::default());
         let (tx, mut rx) = mpsc::channel(16);
-        let handle = spawn_worker(FakeProvider::new(log.clone()), std::env::temp_dir(), tx);
+        let handle = spawn_worker(
+            FakeProvider::new(log.clone()),
+            std::env::temp_dir(),
+            tx,
+            None,
+        );
 
         // No ensure_hot / pre-warm API call — just send.
         handle.send_prompt("first turn".into());
@@ -696,7 +749,12 @@ mod tests {
     async fn oneshot_after_first_send_needs_no_separate_pre_warm_api() {
         let log = Arc::new(FakeLog::default());
         let (tx, mut rx) = mpsc::channel(16);
-        let handle = spawn_worker(FakeProvider::new(log.clone()), std::env::temp_dir(), tx);
+        let handle = spawn_worker(
+            FakeProvider::new(log.clone()),
+            std::env::temp_dir(),
+            tx,
+            None,
+        );
 
         handle.send_prompt("first".into());
         drain_until_turn_complete(&mut rx).await;
@@ -715,7 +773,12 @@ mod tests {
     async fn title_and_reply_suggestions_run_one_at_a_time_on_the_oneshot_path() {
         let log = Arc::new(FakeLog::default());
         let (tx, mut rx) = mpsc::channel(16);
-        let handle = spawn_worker(FakeProvider::new(log.clone()), std::env::temp_dir(), tx);
+        let handle = spawn_worker(
+            FakeProvider::new(log.clone()),
+            std::env::temp_dir(),
+            tx,
+            None,
+        );
 
         handle.send_prompt("go".into());
         drain_until_turn_complete(&mut rx).await;
@@ -747,7 +810,12 @@ mod tests {
     async fn a_second_oneshot_call_does_not_resume_the_prior_oneshot_session() {
         let log = Arc::new(FakeLog::default());
         let (tx, mut rx) = mpsc::channel(16);
-        let handle = spawn_worker(FakeProvider::new(log.clone()), std::env::temp_dir(), tx);
+        let handle = spawn_worker(
+            FakeProvider::new(log.clone()),
+            std::env::temp_dir(),
+            tx,
+            None,
+        );
 
         handle.send_prompt("go".into());
         drain_until_turn_complete(&mut rx).await;
@@ -784,6 +852,7 @@ mod tests {
             FakeProvider::with_hang(log.clone(), hang.clone()),
             std::env::temp_dir(),
             tx,
+            None,
         );
 
         handle.send_prompt("long turn".into());
@@ -821,7 +890,12 @@ mod tests {
         // Fake provider is cold-capable: no process reuse beyond ensure_hot bookkeeping.
         let log = Arc::new(FakeLog::default());
         let (tx, _rx) = mpsc::channel(16);
-        let handle = spawn_worker(FakeProvider::new(log.clone()), std::env::temp_dir(), tx);
+        let handle = spawn_worker(
+            FakeProvider::new(log.clone()),
+            std::env::temp_dir(),
+            tx,
+            None,
+        );
 
         let title = handle
             .title_summary(TitleRequest::new("cold path title"))
@@ -835,7 +909,7 @@ mod tests {
         handle.shutdown();
     }
 
-    /// Short budget for hang-recovery tests (production is 10s).
+    /// Short budget for hang-recovery tests (production uses [`ONESHOT_CALL_BUDGET`]).
     const TEST_ONESHOT_BUDGET: Duration = Duration::from_millis(80);
 
     // @spec harness/warm-runtime Oneshot call budget and recovery: Over-budget oneshot returns an error
@@ -848,6 +922,7 @@ mod tests {
             std::env::temp_dir(),
             tx,
             TEST_ONESHOT_BUDGET,
+            None,
         );
 
         let started = std::time::Instant::now();
@@ -871,6 +946,29 @@ mod tests {
         handle.shutdown();
     }
 
+    /// Host-resolved oneshot preference is passed into `open_oneshot_runtime`.
+    #[tokio::test]
+    async fn spawn_worker_opens_oneshot_with_preferred_model() {
+        let log = Arc::new(FakeLog::default());
+        let (tx, _rx) = mpsc::channel(16);
+        let handle = spawn_worker(
+            FakeProvider::new(log.clone()),
+            std::env::temp_dir(),
+            tx,
+            Some("haiku".into()),
+        );
+        // Allow the worker task to open runtimes.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let preferred = log.oneshot_preferred.lock().unwrap().clone();
+        assert_eq!(
+            preferred.as_deref(),
+            Some("haiku"),
+            "expected preferred oneshot model passed to open_oneshot_runtime"
+        );
+        handle.shutdown();
+    }
+
     // @spec harness/warm-runtime Oneshot call budget and recovery: Later oneshot succeeds after prior oneshot failure
     #[tokio::test]
     async fn later_oneshot_succeeds_after_prior_oneshot_failure() {
@@ -881,11 +979,10 @@ mod tests {
             std::env::temp_dir(),
             tx,
             TEST_ONESHOT_BUDGET,
+            None,
         );
 
-        let first = handle
-            .title_summary(TitleRequest::new("first hangs"))
-            .await;
+        let first = handle.title_summary(TitleRequest::new("first hangs")).await;
         assert!(
             matches!(first, Err(Error::Timeout(_))),
             "first oneshot should time out: {first:?}"

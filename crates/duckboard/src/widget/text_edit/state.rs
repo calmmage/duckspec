@@ -28,6 +28,10 @@ pub enum BlockKind {
     /// Legacy tool-result card; no longer emitted by the segment builder.
     ToolResult,
     System,
+    /// Settled mid-turn question chip (host display).
+    UserChoiceQuestion,
+    /// Settled mid-turn answer chip (host display).
+    UserChoiceAnswer,
 }
 
 /// A content block within a block-aware editor.
@@ -40,6 +44,9 @@ pub struct Block {
     /// user message. Drives collapsible presentation in the chat transcript;
     /// ignored by non-chat block-aware editors.
     pub is_priming: bool,
+    /// True while this segment is still streaming (live draft). Used by Focus
+    /// Answer presentation to stay on Classic until the Answer settles.
+    pub is_live: bool,
 }
 
 /// Identifies what a visible line maps to within the block structure.
@@ -60,6 +67,8 @@ pub fn block_kind_bg(kind: BlockKind) -> Color {
         BlockKind::Activity | BlockKind::ToolUse => theme::chat_bg_tool_use(),
         BlockKind::ToolResult => theme::chat_bg_tool_result(),
         BlockKind::System => theme::chat_bg_system(),
+        BlockKind::UserChoiceQuestion => theme::bg_chat_area(),
+        BlockKind::UserChoiceAnswer => theme::chat_bg_assistant(),
     }
 }
 
@@ -100,10 +109,11 @@ pub(crate) fn block_header_color(kind: BlockKind) -> Color {
     match kind {
         BlockKind::User => theme::accent(),
         BlockKind::Assistant => theme::text_secondary(),
-        BlockKind::Reasoning => theme::text_muted(),
-        BlockKind::Activity | BlockKind::ToolUse => theme::accent_dim(),
-        BlockKind::ToolResult => theme::success(),
+        // Thinking and Activity share muted secondary-header ink.
+        BlockKind::Reasoning | BlockKind::Activity | BlockKind::ToolUse => theme::text_muted(),
+        BlockKind::ToolResult => theme::text_secondary(),
         BlockKind::System => theme::text_muted(),
+        BlockKind::UserChoiceQuestion | BlockKind::UserChoiceAnswer => theme::text_secondary(),
     }
 }
 
@@ -983,7 +993,9 @@ pub enum EditorAction {
     /// Drag ran past an edge of an editor that fits its content inside an
     /// *outer* scrollable (a chat message body). `dy` is logical px to move
     /// that outer container; positive scrolls toward the end.
-    AutoScroll { dy: f32 },
+    AutoScroll {
+        dy: f32,
+    },
 }
 
 impl EditorAction {

@@ -4,20 +4,27 @@ The meta strip under the chat prompt: session and attachment hints, a short mode
 and a progressive context-usage readout. Visual chrome (paper blend, lightweight controls)
 is presentation detail; this capability owns the honest behavioral rules.
 
+The meta strip under the chat prompt: session and attachment hints, a short model control,
+and a progressive context-usage readout. Visual chrome (paper blend, lightweight controls)
+is presentation detail; this capability owns the honest behavioral rules.
+
 ## Resend-history hint
 
-When the next send cannot resume the agent session, duckboard may re-send prior turns as a
-history preamble. The footer calls that case out only when it would actually happen:
+When a stored agent session id cannot resume on the effective harness (for example after a
+harness switch), the next send may re-feed prior turns as a history preamble. The footer
+calls that case out only when it is durable and user-relevant:
 
 ```
-| Next send resumes? | Transcript | Hint        |
-|--------------------|------------|-------------|
-| yes                | any        | hidden      |
-| no                 | empty      | hidden      |
-| no                 | non-empty  | shown       |
+| Transcript | Stored agent session id | Resumable for harness? | Hint   |
+|------------|-------------------------|------------------------|--------|
+| empty      | any                     | any                    | hidden |
+| non-empty  | none                    | —                      | hidden |
+| non-empty  | present                 | yes                    | hidden |
+| non-empty  | present                 | no                     | shown  |
 ```
 
-Empty chats that start fresh show no resend warning — there is nothing to resend.
+No stored id covers first bind and post-recovery clear — the footer stays silent even if a
+later send still re-feeds history.
 
 ## Progressive usage readout
 
@@ -36,6 +43,10 @@ unknown window still yields no fill (owned by the model-picker meter rules).
 
 ## Closed model label
 
-The closed control shows the model's short display name only (for example `Grok 4.5`).
-Harness grouping remains how the open menu lists choices so backends stay distinguishable;
-it is not repeated in the closed label.
+When the effective model is available, the closed control shows that model's short display
+name only (for example `Grok 4.5`). Harness grouping remains how the open menu lists
+choices so backends stay distinguishable; it is not repeated in the closed label.
+
+When the effective model is not available (preferred choice missing from the process
+catalog, or no preferred model at any cascade level), the closed control shows **Missing**
+instead of inventing a display name.

@@ -1,0 +1,21 @@
+[package]
+name = "duckchat-agy-acp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Owned ACP agent that wraps headless agy print mode for duckchat"
+
+[[bin]]
+name = "duckchat-agy-acp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "process", "rt", "rt-multi-thread", "sync", "time"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

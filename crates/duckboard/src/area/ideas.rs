@@ -72,6 +72,10 @@ pub struct State {
     /// the next successful format of that idea. Surfaced in the dashboard
     /// using the same UI as `ProjectAudit::artifact_errors`.
     pub format_errors: HashMap<PathBuf, Vec<String>>,
+    /// Sort menu open (shared chrome; one open flag for Ideas headers).
+    pub sort_menu_open: bool,
+    /// Hovered idea path for mark outline / pillow overflow.
+    pub hovered_idea: Option<PathBuf>,
 }
 
 impl Default for State {
@@ -85,6 +89,8 @@ impl Default for State {
             tag_input: None,
             tag_input_editing: None,
             format_errors: HashMap::new(),
+            sort_menu_open: false,
+            hovered_idea: None,
         }
     }
 }
@@ -178,6 +184,13 @@ pub enum Message {
     /// Chip body was clicked. Main.rs reads the live modifier state and
     /// re-dispatches as either `PromoteTag` (shift held) or `EditTag`.
     ChipClick(usize),
+    CycleIdeaMark(PathBuf),
+    ToggleSortMenu,
+    SetListSortKey(crate::queue_list::SortKey),
+    ToggleListTypePillows,
+    ToggleListPhasePillows,
+    HoverIdea(PathBuf),
+    UnhoverIdea(PathBuf),
 }
 
 // ── Update ───────────────────────────────────────────────────────────────────
@@ -191,7 +204,9 @@ pub fn update(
     project: &ProjectData,
     highlighter: &SyntaxHighlighter,
     agent_input_hints: bool,
+    window_w: f32,
     vcs_workflow: crate::config::VcsWorkflow,
+    viewer_style: crate::config::ViewerStyle,
 ) {
     match message {
         Message::AddIdea => {
@@ -209,10 +224,28 @@ pub fn update(
             state
                 .ideas
                 .sort_by(|a, b| b.frontmatter.created.cmp(&a.frontmatter.created));
-            open_idea(state, tabs, interactions, &path, project, highlighter);
+            open_idea(
+                state,
+                tabs,
+                interactions,
+                &path,
+                project,
+                highlighter,
+                window_w,
+                viewer_style,
+            );
         }
         Message::SelectIdea(path) => {
-            open_idea(state, tabs, interactions, &path, project, highlighter);
+            open_idea(
+                state,
+                tabs,
+                interactions,
+                &path,
+                project,
+                highlighter,
+                window_w,
+                viewer_style,
+            );
         }
         Message::DeleteIdea(path) => {
             if let Some(idx) = state.ideas.iter().position(|i| i.abs_path == path) {
@@ -272,7 +305,10 @@ pub fn update(
             // switching, and the cross-area selection.
         }
         Message::ToggleSection(s) => {
-            let entry = state.section_expanded.entry(s).or_insert(true);
+            let entry = state
+                .section_expanded
+                .entry(s)
+                .or_insert_with(|| section_default_expanded(s));
             *entry = !*entry;
         }
         Message::ToggleTagNode(key) => {
@@ -289,7 +325,9 @@ pub fn update(
                 project,
                 highlighter,
                 agent_input_hints,
+                window_w,
                 vcs_workflow,
+                viewer_style,
             );
         }
         Message::ScrollList(offset) => {
@@ -387,6 +425,23 @@ pub fn update(
             // cell maintained by the global key event handler, and main.rs
             // re-dispatches as PromoteTag (shift held) or EditTag.
         }
+        Message::CycleIdeaMark(_)
+        | Message::SetListSortKey(_)
+        | Message::ToggleListTypePillows
+        | Message::ToggleListPhasePillows => {
+            // Intercepted by main.rs (config / save).
+        }
+        Message::ToggleSortMenu => {
+            state.sort_menu_open = !state.sort_menu_open;
+        }
+        Message::HoverIdea(path) => {
+            state.hovered_idea = Some(path);
+        }
+        Message::UnhoverIdea(path) => {
+            if state.hovered_idea.as_deref() == Some(path.as_path()) {
+                state.hovered_idea = None;
+            }
+        }
     }
 }
 
@@ -439,7 +494,9 @@ fn handle_interaction(
     project: &ProjectData,
     highlighter: &SyntaxHighlighter,
     agent_input_hints: bool,
+    window_w: f32,
     vcs_workflow: crate::config::VcsWorkflow,
+    viewer_style: crate::config::ViewerStyle,
 ) {
     let Some(path) = state.selected.clone() else {
         return;
@@ -470,12 +527,15 @@ fn handle_interaction(
                 scope_kind,
                 project.project_root.as_deref(),
                 highlighter,
+                viewer_style,
             );
-            let new_session = interaction::AgentSession::new(scope_key.clone(), scope_kind);
-            let _ = crate::chat_store::save_session(
-                &new_session.session,
-                project.project_root.as_deref(),
+            // Donor is still active — inherit next actions before insert.
+            let new_session = interaction::new_session_with_inherited_next_actions(
+                ix,
+                scope_key.clone(),
+                scope_kind,
             );
+            let _ = new_session.persist(project.project_root.as_deref());
             ix.sessions.insert(0, new_session);
             ix.active_session = 0;
             interaction::reconcile_display_names(&mut ix.sessions, &title);
@@ -507,18 +567,20 @@ fn handle_interaction(
                 project.project_root.as_deref(),
                 highlighter,
                 agent_input_hints,
+                window_w,
                 vcs_workflow,
+                viewer_style,
             );
         }
     }
-    // Mirror `area::change::update` — refresh obvious chrome after any
+    // Mirror `area::change::update` — refresh fast response after any
     // session-touching interaction so a freshly-created chat on an
     // idea-promoted Change picks up the right lifecycle options. Without
     // this, cmd+N on a promoted change lands on a session with empty chrome
     // (this update path doesn't go through change::update).
     // Dirty unknown here; main's refresh_changed_files / change update
     // re-applies with the real flag. Gate row still tracks session emptiness.
-    super::change::refresh_obvious_chrome(interactions, project, false);
+    super::change::refresh_fast_response(interactions, project, agent_input_hints, false);
     let _ = fm;
 }
 
@@ -529,6 +591,8 @@ pub fn open_idea(
     path: &Path,
     project: &ProjectData,
     highlighter: &SyntaxHighlighter,
+    window_w: f32,
+    viewer_style: crate::config::ViewerStyle,
 ) {
     let snapshot = state
         .ideas
@@ -558,7 +622,9 @@ pub fn open_idea(
     if let Some(scope) = maybe_scope {
         let scope_kind = scope.kind();
         let scope_key = scope.key().to_string();
-        let ix = interactions.entry(scope).or_default();
+        let ix = interactions
+            .entry(scope)
+            .or_insert_with(|| InteractionState::for_window(window_w));
         interaction::ensure_sessions_with_label(
             ix,
             &scope_key,
@@ -566,11 +632,12 @@ pub fn open_idea(
             scope_kind,
             project.project_root.as_deref(),
             highlighter,
+            viewer_style,
         );
         if let Some(ax) = ix.active_mut() {
             ax.idea_description = Some(body.clone());
         }
-        ix.visible = true;
+        interaction::show_panel(ix, window_w);
     }
     let _ = fm;
 }
@@ -683,19 +750,29 @@ pub fn view_list<'a>(
     state: &'a State,
     project: &'a ProjectData,
     _tabs: &'a tab_bar::TabState,
+    list_prefs: &'a crate::queue_list::ListConfig,
+    phase_pill_list: bool,
 ) -> Element<'a, Message> {
     let mut sections = column![].spacing(0.0);
     for s in IdeaState::ALL {
-        sections = sections.push(view_section(state, project, s));
+        sections = sections.push(view_section(state, project, s, list_prefs, phase_pill_list));
     }
 
     vertical_scroll::view(state.list_scroll, Message::ScrollList, sections)
+}
+
+/// Archive starts collapsed so the list column stays quiet; other sections
+/// default open so new ideas surface immediately.
+fn section_default_expanded(section: IdeaState) -> bool {
+    !matches!(section, IdeaState::Archive)
 }
 
 fn view_section<'a>(
     state: &'a State,
     project: &'a ProjectData,
     section: IdeaState,
+    list_prefs: &'a crate::queue_list::ListConfig,
+    phase_pill_list: bool,
 ) -> Element<'a, Message> {
     let label = match section {
         IdeaState::Inbox => "Inbox",
@@ -703,11 +780,7 @@ fn view_section<'a>(
         IdeaState::Change => "Change",
         IdeaState::Archive => "Archive",
     };
-    let expanded = state
-        .section_expanded
-        .get(&section)
-        .copied()
-        .unwrap_or(true);
+    let expanded = section_is_expanded(state, section);
 
     let count = state.ideas.iter().filter(|i| i.state == section).count();
     let header_label = format!("{label}  ({count})");
@@ -715,48 +788,174 @@ fn view_section<'a>(
     let body: Element<'a, Message> = if expanded {
         let mut rows: Vec<ListRow<'a, Message>> = Vec::new();
         let selected = state.selected.as_deref();
-        collect_section_rows(state, project, section, &[], 0, selected, &mut rows);
+        collect_section_rows(
+            state,
+            project,
+            section,
+            &[],
+            0,
+            selected,
+            list_prefs,
+            phase_pill_list,
+            &mut rows,
+        );
         list_view::view(rows, None)
     } else {
         Space::new().into()
     };
 
-    let add = if matches!(section, IdeaState::Inbox) {
-        Some(collapsible::add_button(Message::AddIdea))
-    } else {
-        None
-    };
+    let mut actions = row![].spacing(theme::SPACING_XS).align_y(iced::Center);
+    actions = actions.push(ideas_sort_menu(
+        state.sort_menu_open,
+        list_prefs,
+        phase_pill_list,
+    ));
+    if matches!(section, IdeaState::Inbox) {
+        actions = actions.push(collapsible::add_button(Message::AddIdea));
+    }
 
     collapsible::view_with_add_owned(
         header_label,
         expanded,
         Message::ToggleSection(section),
-        add,
+        Some(actions.into()),
         body,
     )
 }
 
-/// Build a flat sequence of `ListRow`s for one section's tag tree, matching
-/// the tree styling used by Change/Caps/Codex: chevron-leading rows for tag
-/// groups, indent-leading rows for ideas. Ideas at depth `N` and tag groups
-/// at depth `N` use the same indent so they sit at the same visual level.
-fn collect_section_rows<'a>(
+fn ideas_sort_menu<'a>(
+    open: bool,
+    prefs: &crate::queue_list::ListConfig,
+    phase_pill_list: bool,
+) -> Element<'a, Message> {
+    let sort_btn = button(text("Sort").size(theme::font_sm()))
+        .on_press(Message::ToggleSortMenu)
+        .padding([theme::SPACING_XS, theme::SPACING_SM])
+        .style(theme::icon_button);
+    if !open {
+        return sort_btn.into();
+    }
+    let mut menu = column![sort_btn].spacing(theme::SPACING_XS);
+    for key in crate::queue_list::SortKey::ALL {
+        let label = if prefs.sort_key == key {
+            format!("• {}", key.label())
+        } else {
+            format!("  {}", key.label())
+        };
+        menu = menu.push(
+            button(text(label).size(theme::font_sm()))
+                .on_press(Message::SetListSortKey(key))
+                .padding([theme::SPACING_XS, theme::SPACING_SM])
+                .style(theme::icon_button),
+        );
+    }
+    let type_label = if prefs.show_type_pillows {
+        "• Type tags"
+    } else {
+        "  Type tags"
+    };
+    menu = menu.push(
+        button(text(type_label).size(theme::font_sm()))
+            .on_press(Message::ToggleListTypePillows)
+            .padding([theme::SPACING_XS, theme::SPACING_SM])
+            .style(theme::icon_button),
+    );
+    if !phase_pill_list {
+        let phase_label = if prefs.show_phase_pillows {
+            "• Phase"
+        } else {
+            "  Phase"
+        };
+        menu = menu.push(
+            button(text(phase_label).size(theme::font_sm()))
+                .on_press(Message::ToggleListPhasePillows)
+                .padding([theme::SPACING_XS, theme::SPACING_SM])
+                .style(theme::icon_button),
+        );
+    }
+    menu.into()
+}
+
+// ── Shared Ideas paint-order (list view + digit index) ───────────────────────
+//
+// One pure path for idea ordering and tag expand. Digits index idea paths only
+// (no tag chrome). The list walk paints chevrons but must not re-implement
+// sort / child-tag / expand logic for digits alone.
+
+/// Whether a lifecycle section body is expanded (list paint + digit index).
+fn section_is_expanded(state: &State, section: IdeaState) -> bool {
+    state
+        .section_expanded
+        .get(&section)
+        .copied()
+        .unwrap_or_else(|| section_default_expanded(section))
+}
+
+/// Collapse key for a tag folder under a section (`"{segment}/{tag/path}"`).
+fn tag_node_key(section: IdeaState, tag_path: &[String]) -> String {
+    format!("{}/{}", section.segment(), tag_path.join("/"))
+}
+
+fn tag_node_expanded(state: &State, section: IdeaState, tag_path: &[String]) -> bool {
+    !state.tag_collapsed.contains(&tag_node_key(section, tag_path))
+}
+
+/// Sorted idea rows at one tag prefix (queue sort + fav pins). Shared by the
+/// list body and digit paint-order walk.
+fn sorted_direct_ideas_at<'a>(
     state: &'a State,
-    project: &'a ProjectData,
+    project: &ProjectData,
     section: IdeaState,
     prefix: &[String],
-    depth: usize,
-    selected: Option<&Path>,
-    out: &mut Vec<ListRow<'a, Message>>,
-) {
-    let mut direct: Vec<&'a Idea> = state
+    list_prefs: &crate::queue_list::ListConfig,
+) -> Vec<&'a Idea> {
+    let direct: Vec<&'a Idea> = state
         .ideas
         .iter()
         .filter(|i| i.state == section && i.primary_tag_path == prefix)
         .collect();
-    direct.sort_by(|a, b| b.frontmatter.created.cmp(&a.frontmatter.created));
+    let mut metas: Vec<crate::queue_list::QueueRowMeta> = direct
+        .iter()
+        .map(|idea| {
+            // Always compute phase for SortKey::Phase ranking; display pillows
+            // are suppressed separately when short phase pills own chrome.
+            let phase = idea
+                .frontmatter
+                .change
+                .as_deref()
+                .and_then(|n| super::change::change_scope_facts(n, project))
+                .map(|f| f.phase.to_string());
+            crate::queue_list::QueueRowMeta {
+                key: crate::queue_list::QueueKey::Idea(idea.abs_path.clone()),
+                title: idea.display_title(),
+                mark: idea.frontmatter.mark,
+                favored_at: idea.frontmatter.favored_at.clone(),
+                type_tags: crate::queue_list::type_tags_from_idea_tags(&idea.frontmatter.tags),
+                phase,
+                last_message_at: idea.scope_key().and_then(|scope| {
+                    let sessions =
+                        crate::chat_store::load_sessions_for(scope, project.project_root.as_deref());
+                    crate::queue_list::last_message_activity_nanos(&sessions)
+                }),
+                created_at: Some(idea.frontmatter.created.clone()),
+            }
+        })
+        .collect();
+    crate::queue_list::sort_queue(&mut metas, list_prefs.sort_key);
+    metas
+        .iter()
+        .filter_map(|m| match &m.key {
+            crate::queue_list::QueueKey::Idea(p) => {
+                direct.iter().copied().find(|i| i.abs_path == *p)
+            }
+            _ => None,
+        })
+        .collect()
+}
 
-    let mut children: Vec<&'a str> = state
+/// Immediate child tag segment names under `prefix` (sorted, unique).
+fn child_tag_names_at(state: &State, section: IdeaState, prefix: &[String]) -> Vec<String> {
+    let mut children: Vec<&str> = state
         .ideas
         .iter()
         .filter(|i| i.state == section && i.primary_tag_path.starts_with(prefix))
@@ -764,28 +963,50 @@ fn collect_section_rows<'a>(
         .collect();
     children.sort();
     children.dedup();
+    children.into_iter().map(str::to_string).collect()
+}
 
-    // Reserve a chevron-width gutter on idea rows only when sibling tag groups
-    // render at the same depth — otherwise the gutter is phantom indent.
+/// Build a flat sequence of `ListRow`s for one section's tag tree, matching
+/// the tree styling used by Change/Caps/Codex: chevron-leading rows for tag
+/// groups, indent-leading rows for ideas. Ideas at depth `N` and tag groups
+/// at depth `N` use the same indent so they sit at the same visual level.
+/// Idea order and tag expand come from the shared paint-order helpers above.
+fn collect_section_rows<'a>(
+    state: &'a State,
+    project: &'a ProjectData,
+    section: IdeaState,
+    prefix: &[String],
+    depth: usize,
+    selected: Option<&Path>,
+    list_prefs: &crate::queue_list::ListConfig,
+    phase_pill_list: bool,
+    out: &mut Vec<ListRow<'a, Message>>,
+) {
+    let ordered = sorted_direct_ideas_at(state, project, section, prefix, list_prefs);
+    let children = child_tag_names_at(state, section, prefix);
     let has_tag_siblings = !children.is_empty();
-    for idea in &direct {
+
+    for idea in &ordered {
         out.push(idea_list_row(
             idea,
             project,
             depth,
             selected,
             has_tag_siblings,
+            list_prefs,
+            phase_pill_list,
+            state.hovered_idea.as_deref() == Some(idea.abs_path.as_path()),
         ));
     }
 
     for child in children {
         let mut next_prefix = prefix.to_vec();
-        next_prefix.push(child.to_string());
-        let key = format!("{}/{}", section.segment(), next_prefix.join("/"));
-        let expanded = !state.tag_collapsed.contains(&key);
+        next_prefix.push(child.clone());
+        let key = tag_node_key(section, &next_prefix);
+        let expanded = tag_node_expanded(state, section, &next_prefix);
         let leading = collapsible::chevron(expanded);
         out.push(
-            ListRow::new(child.to_string())
+            ListRow::new(child)
                 .leading(leading)
                 .icon(ICON_TAG)
                 .indent(depth)
@@ -799,6 +1020,53 @@ fn collect_section_rows<'a>(
                 &next_prefix,
                 depth + 1,
                 selected,
+                list_prefs,
+                phase_pill_list,
+                out,
+            );
+        }
+    }
+}
+
+/// Selectable idea paths in paint order for expanded sections only. Same
+/// sort/expand walk as the Ideas list view for idea rows; tag-folder chrome is
+/// not indexed (only `SelectIdea` targets).
+pub(crate) fn painted_idea_paths(
+    state: &State,
+    project: &ProjectData,
+    list_prefs: &crate::queue_list::ListConfig,
+) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for section in IdeaState::ALL {
+        if !section_is_expanded(state, section) {
+            continue;
+        }
+        collect_section_idea_paths(state, project, section, &[], list_prefs, &mut out);
+    }
+    out
+}
+
+fn collect_section_idea_paths(
+    state: &State,
+    project: &ProjectData,
+    section: IdeaState,
+    prefix: &[String],
+    list_prefs: &crate::queue_list::ListConfig,
+    out: &mut Vec<PathBuf>,
+) {
+    for idea in sorted_direct_ideas_at(state, project, section, prefix, list_prefs) {
+        out.push(idea.abs_path.clone());
+    }
+    for child in child_tag_names_at(state, section, prefix) {
+        let mut next_prefix = prefix.to_vec();
+        next_prefix.push(child);
+        if tag_node_expanded(state, section, &next_prefix) {
+            collect_section_idea_paths(
+                state,
+                project,
+                section,
+                &next_prefix,
+                list_prefs,
                 out,
             );
         }
@@ -811,12 +1079,11 @@ fn idea_list_row<'a>(
     depth: usize,
     selected: Option<&Path>,
     has_tag_siblings: bool,
+    list_prefs: &crate::queue_list::ListConfig,
+    phase_pill_list: bool,
+    hovered: bool,
 ) -> ListRow<'a, Message> {
     let is_selected = selected == Some(idea.abs_path.as_path());
-    // Archive-kind icons take precedence over exploration/change leading
-    // icons so the row glyph reflects *why* the idea is archived. ViaChange
-    // falls through to ICON_BRANCH because the trailing change-link icon
-    // already encodes the archive reason.
     let icon_bytes: &'static [u8] = match idea.frontmatter.archived {
         Some(ArchiveKind::Orphaned) => ICON_ORPHAN,
         Some(ArchiveKind::Manual) => ICON_ARCHIVE,
@@ -830,23 +1097,100 @@ fn idea_list_row<'a>(
             }
         }
     };
-    let mut row = ListRow::new(idea.display_title())
+    // Title stays plain; mark lives only on the interactive after_icon control.
+    let title_base = idea.display_title();
+    let phase = if phase_pill_list {
+        None
+    } else {
+        idea.frontmatter
+            .change
+            .as_deref()
+            .and_then(|n| super::change::change_scope_facts(n, project))
+            .map(|f| f.phase)
+    };
+    let pillows =
+        crate::queue_list::project_row_pillows(&idea.frontmatter.tags, phase, list_prefs);
+    let mut row = ListRow::new(title_base.clone())
         .icon(icon_bytes)
         .indent(depth)
         .selected(is_selected)
-        .on_press(Message::SelectIdea(idea.abs_path.clone()));
-    if let Some(change_name) = idea.frontmatter.change.as_deref()
+        .on_press(Message::SelectIdea(idea.abs_path.clone()))
+        .on_hover(
+            Message::HoverIdea(idea.abs_path.clone()),
+            Message::UnhoverIdea(idea.abs_path.clone()),
+        );
+    if let Some(g) = crate::queue_list::mark_glyph(idea.frontmatter.mark, hovered) {
+        row = row.after_icon(
+            button(text(g).size(theme::font_sm()))
+                .on_press(Message::CycleIdeaMark(idea.abs_path.clone()))
+                .padding(0)
+                .style(theme::icon_button)
+                .into(),
+        );
+    } else if let Some(change_name) = idea.frontmatter.change.as_deref()
         && change_resolves(project, change_name)
     {
         row = row.after_icon(change_link_button(change_name));
     }
-    // Spacer-leading keeps the icon column aligned with chevron-leading rows
-    // at the same depth — only meaningful when tag groups render alongside.
+    if let Some(p) = crate::queue_list::steady_row_pillows(
+        &title_base,
+        &pillows,
+        crate::queue_list::DEFAULT_ROW_CHAR_BUDGET,
+        hovered,
+    ) {
+        row = row.trailing(idea_pillow_trail(p));
+    }
     if has_tag_siblings {
         let leading: Element<'a, Message> = row![Space::new().width(theme::font_sm())].into();
         row = row.leading(leading);
     }
     row
+}
+
+fn idea_pillow_trail<'a>(pillows: &crate::queue_list::RowPillows) -> Element<'a, Message> {
+    let mut r = row![].spacing(theme::SPACING_XS).align_y(iced::Center);
+    for tag in &pillows.type_tags {
+        let label = crate::queue_list::truncate_tag_display(
+            tag,
+            crate::queue_list::TYPE_TAG_DISPLAY_MAX,
+        );
+        r = r.push(
+            container(
+                text(format!("#{label}"))
+                    .size(theme::font_sm())
+                    .color(theme::text_muted()),
+            )
+            .padding([1.0, theme::SPACING_XS])
+            .style(|_t: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(theme::bg_elevated())),
+                border: iced::Border {
+                    radius: 8.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        );
+    }
+    if let Some(phase) = &pillows.phase {
+        let label = crate::queue_list::truncate_tag_display(phase, 20);
+        r = r.push(
+            container(
+                text(label)
+                    .size(theme::font_sm())
+                    .color(theme::text_secondary()),
+            )
+            .padding([1.0, theme::SPACING_XS])
+            .style(|_t: &iced::Theme| container::Style {
+                background: Some(iced::Background::Color(theme::bg_elevated())),
+                border: iced::Border {
+                    radius: 8.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        );
+    }
+    r.into()
 }
 
 fn change_resolves(project: &ProjectData, change_name: &str) -> bool {
@@ -1168,5 +1512,16 @@ mod tests {
         let preview = tabs.preview.expect("preview tab present");
         assert_eq!(preview.id, pinned_tab_id(&new_path));
         assert_eq!(preview.title, "New title");
+    }
+
+    /// @spec archive/browse Archived section visibility: Ideas Archive section starts collapsed
+    #[test]
+    fn ideas_archive_section_starts_collapsed() {
+        let state = State::default();
+        assert!(state.section_expanded.is_empty());
+        assert!(!section_default_expanded(IdeaState::Archive));
+        assert!(section_default_expanded(IdeaState::Inbox));
+        assert!(section_default_expanded(IdeaState::Exploration));
+        assert!(section_default_expanded(IdeaState::Change));
     }
 }

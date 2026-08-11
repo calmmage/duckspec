@@ -24,18 +24,16 @@ project state never makes the agent ask which change to act on.
 - **AND** it directs disambiguation to the case where the user names a different change
 
 > test: code
-> - crates/duckboard/src/scope.rs:226
+> - crates/duckcore/src/scope.rs:258
 
 ## Requirement: Lifecycle reflection
 
 For a change scope, the orientation SHALL report the change's step progress and a
 suggested next stage that matches the change's artifact state, step completion, and
-whether the change has any reviews — the same first lifecycle option used for obvious
-chrome (including arms that also list `/ds-review` and `/ds-followup`). When steps remain
+whether the change has any reviews — the first option of the review-aware lifecycle ladder
+(including arms that also list `/ds-review` and `/ds-followup`). When steps remain
 unfinished it SHALL report the incomplete progress; when every step is complete it SHALL
 report completion.
-
-> test: code
 
 ### Scenario: A change with unfinished steps reports remaining work and the apply next-stage
 
@@ -45,7 +43,7 @@ report completion.
 - **AND** it suggests the apply stage as the next step
 
 > test: code
-> - crates/duckboard/src/area/change.rs:2262
+> - crates/duckboard/src/area/change.rs:3754
 
 ### Scenario: A change with only a proposal reports the design next-stage
 
@@ -54,7 +52,7 @@ report completion.
 - **THEN** it suggests the design stage as the next step
 
 > test: code
-> - crates/duckboard/src/area/change.rs:2312
+> - crates/duckboard/src/area/change.rs:3804
 
 ### Scenario: A change with all steps complete reports completion and the archive next-stage
 
@@ -65,7 +63,7 @@ report completion.
 - **AND** it suggests the archive stage as the next step
 
 > test: code
-> - crates/duckboard/src/area/change.rs:2280
+> - crates/duckboard/src/area/change.rs:3772
 
 ### Scenario: All steps complete with a review suggests the step next-stage
 
@@ -75,7 +73,7 @@ report completion.
 - **THEN** it suggests the step stage as the next step
 
 > test: code
-> - crates/duckboard/src/area/change.rs:2297
+> - crates/duckboard/src/area/change.rs:3789
 
 ## Requirement: Non-change scope orientation
 
@@ -92,7 +90,7 @@ scope and SHALL NOT report change progress or a change next-stage.
 - **AND** it does not report change progress or a change next-stage
 
 > test: code
-> - crates/duckboard/src/scope.rs:285
+> - crates/duckcore/src/scope.rs:319
 
 ### Scenario: A capability-tree scope carries no change facts
 
@@ -103,7 +101,7 @@ scope and SHALL NOT report change progress or a change next-stage.
 - **AND** it does not report change progress or a change next-stage
 
 > test: code
-> - crates/duckboard/src/scope.rs:308
+> - crates/duckcore/src/scope.rs:343
 
 ### Scenario: A codex scope points at the codex tree
 
@@ -114,7 +112,7 @@ scope and SHALL NOT report change progress or a change next-stage.
 - **AND** it does not report change progress or a change next-stage
 
 > test: code
-> - crates/duckboard/src/scope.rs:335
+> - crates/duckcore/src/scope.rs:371
 
 ## Requirement: Reliable first-turn delivery
 
@@ -131,7 +129,8 @@ the same session.
 - **THEN** the orientation is part of the message body sent on that turn
 
 > test: code
-> - crates/duckboard/src/area/interaction.rs:950
+> - crates/duckboard/src/area/interaction.rs:1445
+> - crates/ducktui/src/runtime.rs:731
 
 ### Scenario: Orientation is present when the project has no AGENTS.md
 
@@ -140,7 +139,7 @@ the same session.
 - **THEN** the orientation is part of the message body sent on that turn
 
 > test: code
-> - crates/duckboard/src/area/interaction.rs:968
+> - crates/duckboard/src/area/interaction.rs:1463
 
 ### Scenario: A resumed session does not repeat the orientation
 
@@ -149,7 +148,8 @@ the same session.
 - **THEN** the orientation is not included again
 
 > test: code
-> - crates/duckboard/src/area/interaction.rs:1004
+> - crates/duckboard/src/area/interaction.rs:1504
+> - crates/ducktui/src/runtime.rs:766
 
 ## Requirement: Current review in orientation
 
@@ -159,11 +159,9 @@ review or followup, or a legacy unprefixed name) — as the project-root path
 `duckspec/changes/{name}/reviews/{filename}` when the change has at least one review, and
 SHALL omit any current-review report when the change has none. The presence of reviews
 SHALL NOT change reported step progress (done and total counts). The suggested next stage
-SHALL follow the review-aware lifecycle (same first option as obvious chrome), so a review
+SHALL follow the review-aware lifecycle (same first option of that ladder), so a review
 may change the suggested next stage relative to an otherwise identical change without
 reviews.
-
-> test: code
 
 ### Scenario: Orientation reports the highest-numbered review as the current review
 
@@ -175,7 +173,7 @@ reviews.
   `duckspec/changes/{name}/reviews/{filename}`
 
 > test: code
-> - crates/duckboard/src/area/change.rs:2336
+> - crates/duckboard/src/area/change.rs:3829
 
 ### Scenario: A change with no reviews reports no current review
 
@@ -184,7 +182,7 @@ reviews.
 - **THEN** it does not report a current review
 
 > test: code
-> - crates/duckboard/src/area/change.rs:2358
+> - crates/duckboard/src/area/change.rs:3854
 
 ### Scenario: Adding a review does not change reported step progress
 
@@ -194,4 +192,42 @@ reviews.
 - **THEN** both report the same step progress (done and total)
 
 > test: code
-> - crates/duckboard/src/area/change.rs:2373
+> - crates/duckboard/src/area/change.rs:3869
+
+## Requirement: Inputs ledger pointer
+
+For a change scope, when the project has a non-empty file at
+`duckspec/changes/{name}/inputs.md`, the orientation SHALL name that path and direct the
+agent to use those raw human inputs for re-grounding — prefer them over inventing
+motivation, and do not rewrite that file. When that file is absent or empty, the
+orientation SHALL NOT invent an inputs-ledger pointer.
+
+> test: code
+
+### Scenario: Present inputs.md is named in orientation
+
+- **GIVEN** a session scoped to a change
+
+- **AND** `duckspec/changes/{name}/inputs.md` exists and is non-empty
+
+- **WHEN** the orientation is produced
+
+- **THEN** it names the path `duckspec/changes/{name}/inputs.md`
+
+- **AND** it directs the agent to use those raw inputs for re-grounding rather than
+  inventing motivation
+
+- **AND** it directs the agent not to rewrite that file
+
+> test: code
+> - crates/duckcore/src/scope.rs:399
+
+### Scenario: Absent inputs.md yields no inputs pointer
+
+- **GIVEN** a session scoped to a change
+- **AND** `duckspec/changes/{name}/inputs.md` does not exist
+- **WHEN** the orientation is produced
+- **THEN** the orientation does not name an inputs ledger path
+
+> test: code
+> - crates/duckcore/src/scope.rs:430

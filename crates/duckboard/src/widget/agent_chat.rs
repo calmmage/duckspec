@@ -1,9 +1,9 @@
 //! Agent chat widget — per-message text editors in a scrollable column.
 
-use iced::widget::{
-    Space, button, column, container, pick_list, row, rule, scrollable, stack, text,
-};
-use iced::widget::text::Wrapping;
+use iced::Task;
+use iced::advanced::widget::{Id, Operation, operation};
+use iced::widget::{Space, button, column, container, pick_list, row, rule, scrollable, text};
+use iced::{Element, Length, Rectangle, Vector};
 
 pub const CHAT_SCROLLABLE_ID: &str = "agent-chat-scroll";
 pub const CHAT_INPUT_ID: &str = "agent-chat-input";
@@ -15,18 +15,115 @@ const CHAT_INPUT_MAX_ROWS: usize = 20;
 /// Small enough that one wheel notch unsticks the view, large enough to
 /// absorb sub-pixel layout rounding during streaming rebuilds.
 pub const STICK_TO_BOTTOM_THRESHOLD: f32 = 16.0;
-use iced::{Element, Length};
 
 use duckchat::{ModelInfo, ModelRef};
 
 use crate::agent::SlashCommand;
 use crate::area::interaction::{self, SelectionContext};
 use crate::chat_store::{ChatSession, ContentBlock, Role};
+use crate::config::ViewerStyle;
 use crate::slash_commands::{slash_kind_rank, slash_kind_row_tag};
 use crate::theme;
 use crate::widget::collapsible;
+use crate::widget::find;
 use crate::widget::streaming_indicator;
 use crate::widget::text_edit::{self, Block, BlockKind, EditorState};
+
+// ── Answer viewer presentation ───────────────────────────────────────────────
+
+/// How an Answer body is painted for the effective viewer style.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnswerBodyPresentation {
+    /// Full-body classic TextEdit path (today's Answer viewer).
+    ClassicFullBody,
+    /// Focus chrome: foldable sections + always-open trailing meta region.
+    FocusSectioned {
+        sections: Vec<crate::focus_answer::FoldableSection>,
+        open: crate::focus_answer::LineRange,
+    },
+}
+
+/// Resolve Answer body presentation for the effective viewer style.
+///
+/// Non-Answer segments never call this — they keep their own paths.
+/// Live Answers always Classic. Settled Focus without trailing `next` is Classic
+/// passthrough.
+pub fn answer_body_presentation(
+    effective_style: ViewerStyle,
+    answer_live: bool,
+    source: &str,
+) -> AnswerBodyPresentation {
+    if effective_style != ViewerStyle::Focus || answer_live {
+        return AnswerBodyPresentation::ClassicFullBody;
+    }
+    match crate::focus_answer::focus_layout(source) {
+        crate::focus_answer::FocusLayout::PassthroughClassic => {
+            AnswerBodyPresentation::ClassicFullBody
+        }
+        crate::focus_answer::FocusLayout::Sectioned { sections, open } => {
+            AnswerBodyPresentation::FocusSectioned { sections, open }
+        }
+    }
+}
+
+/// Which Focus Answer slice is being presented (Hybrid C paint + band policy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusSliceKind {
+    /// Trailing meta open region — Classic TextEdit body paint.
+    OpenRegion,
+    /// Expanded foldable section body — plain content-font source text.
+    ExpandedSection,
+}
+
+/// Hybrid C: only the open region uses classic Answer body paint.
+pub fn focus_slice_uses_classic_body_paint(slice: FocusSliceKind) -> bool {
+    matches!(slice, FocusSliceKind::OpenRegion)
+}
+
+/// Hybrid C: last-answer band applies only to the open-region widget.
+pub fn focus_slice_uses_last_answer_band(slice: FocusSliceKind, is_last_answer: bool) -> bool {
+    is_last_answer && matches!(slice, FocusSliceKind::OpenRegion)
+}
+
+/// Lines that the Answer's chat editor should hold for the effective style.
+///
+/// Classic / passthrough / live → full Answer body. Focus sectioned → open
+/// region only (sections render as plain text from [`Block::lines`]).
+pub fn answer_editor_desired_lines(
+    block: &Block,
+    effective_style: ViewerStyle,
+) -> Vec<String> {
+    if block.kind != BlockKind::Assistant {
+        return block.lines.clone();
+    }
+    let source = block.lines.join("\n");
+    match answer_body_presentation(effective_style, block.is_live, &source) {
+        AnswerBodyPresentation::ClassicFullBody => block.lines.clone(),
+        AnswerBodyPresentation::FocusSectioned { open, .. } => {
+            slice_line_vec(&block.lines, open)
+        }
+    }
+}
+
+fn slice_line_vec(lines: &[String], range: crate::focus_answer::LineRange) -> Vec<String> {
+    if lines.is_empty() {
+        return vec![String::new()];
+    }
+    let start = range.start.min(lines.len().saturating_sub(1));
+    let end = range.end.min(lines.len().saturating_sub(1));
+    if start > end {
+        return vec![String::new()];
+    }
+    lines[start..=end].to_vec()
+}
+
+/// Whether this block kind's presentation mode is selected by viewer style.
+///
+/// Only Answers branch on [`ViewerStyle`]; User / Thinking / Activity / System
+/// keep fixed paths regardless of the setting.
+pub fn block_presentation_uses_viewer_style(kind: BlockKind) -> bool {
+    matches!(kind, BlockKind::Assistant)
+}
 
 // ── Messages ────────────────────────────────────────────────────────────────
 
@@ -35,9 +132,9 @@ pub enum Msg {
     /// Action from the chat input editor.
     InputAction(text_edit::EditorAction),
     SendPressed,
-    /// Activate an obvious-chrome action (key or chip click). Payload is the
-    /// action send text only (not the hotkey label).
-    SendObviousAction(String),
+    /// Activate a fast-response chip (key or click). Payload is the pick id
+    /// only (not the hotkey label).
+    ActivateFastResponse(crate::fast_response::FastResponsePick),
     CancelPressed,
     CompletionAccept,
     CompletionNext,
@@ -47,6 +144,11 @@ pub enum Msg {
     ChatAction(usize, text_edit::EditorAction),
     /// Toggle collapse state of a block.
     ToggleCollapse(usize),
+    /// Toggle a Focus Answer section fold (`block_idx`, section key).
+    ToggleFocusSection {
+        block_idx: usize,
+        key: String,
+    },
     /// Action from the queued-message read-only editor.
     QueueAction(text_edit::EditorAction),
     /// Discard the queued message (from the pill's ✕ button).
@@ -59,12 +161,15 @@ pub enum Msg {
     ModelSelected(ModelChoice),
     /// Cycle empty-input next actions (`+1` Tab, `-1` Shift-Tab).
     CycleNextAction(i8),
-    /// Empty Cmd-Enter: send the armed oneshot suggestion when ready.
-    SendOneshotSuggestion,
     /// Layout measure of the chat scrollable (viewport + content heights).
     /// Used to recompute the bottom-pin pad even when content fits the
     /// viewport and iced suppresses `on_scroll` notifications.
-    ChromeLayout { viewport_h: f32, content_h: f32 },
+    ChromeLayout {
+        viewport_h: f32,
+        content_h: f32,
+    },
+    /// Phase-pill activation: empty-send next-stage text or `Commit`.
+    PhasePillSend(String),
 }
 
 // ── Model picker ─────────────────────────────────────────────────────────────
@@ -122,14 +227,20 @@ pub fn chat_model_choices() -> Vec<ModelChoice> {
     model_entries()
 }
 
-/// Picker options for the project-level default selector in settings. The
-/// first entry (`id: None`) means "no default — let the CLI pick".
-pub fn project_model_choices() -> Vec<ModelChoice> {
+/// Picker options for the global main-chat default in Settings. Catalog models
+/// only — no sentinel (the global default is always a concrete choice when set).
+pub fn global_model_choices() -> Vec<ModelChoice> {
+    model_entries()
+}
+
+/// Picker options for the project override in Settings. First entry clears the
+/// override (`id: None` → use global default).
+pub fn project_override_model_choices() -> Vec<ModelChoice> {
     let mut out = vec![ModelChoice {
         harness: None,
         id: None,
-        label: "No default".to_string(),
-        closed_label: "No default".to_string(),
+        label: "Use global default".to_string(),
+        closed_label: "Use global default".to_string(),
     }];
     out.extend(model_entries());
     out
@@ -170,7 +281,28 @@ fn harness_display(harness: &str) -> &str {
     match harness {
         "claude-code" => "Claude Code",
         "grok" => "Grok",
+        "openai-codex" => "OpenAI Codex",
         other => other,
+    }
+}
+
+/// Closed model control when the effective model is not available in the
+/// process catalog. Optional `preferred` keeps harness/id for equality when a
+/// cascade choice exists but is missing from the catalog.
+pub fn missing_closed_model_choice(preferred: Option<&ModelRef>) -> ModelChoice {
+    match preferred {
+        Some(m) => ModelChoice {
+            harness: Some(m.harness.clone()),
+            id: Some(m.model.clone()),
+            label: "Missing".to_string(),
+            closed_label: "Missing".to_string(),
+        },
+        None => ModelChoice {
+            harness: None,
+            id: None,
+            label: "Missing".to_string(),
+            closed_label: "Missing".to_string(),
+        },
     }
 }
 
@@ -207,13 +339,10 @@ pub fn selected_model_choice(choices: &[ModelChoice], selected: Option<&ModelRef
 }
 
 /// The context window of a specific model, looked up by harness + id from the
-/// aggregated model list. `None` when the model is unknown or its harness
+/// process model catalog. `None` when the model is unknown or its harness
 /// reports no window — the usage meter then shows no fill.
 pub fn model_context_window(model: &ModelRef) -> Option<usize> {
-    crate::agent::available_models()
-        .into_iter()
-        .find(|m| m.harness == model.harness && m.id == model.model)
-        .and_then(|m| m.context_window)
+    crate::agent::model_context_window(model)
 }
 
 /// Fraction of the selected model's context window consumed by `tokens`. A
@@ -230,10 +359,20 @@ pub fn context_fill(tokens: usize, window: Option<usize>) -> Option<f32> {
 /// full `used / max (%)`. Matches the existing warning color band.
 pub const USAGE_HOT_FILL: f32 = 0.75;
 
+/// Whether a stored agent session id is unresumable on the effective harness.
+///
+/// `has_stored_agent_id` / `will_resume` are pre-mapped booleans — the status
+/// builder owns reading `agent_session_id` and `resumable_session_id()`; this
+/// helper only combines them so the product rule stays unit-testable.
+pub fn unresumable_stored_session(has_stored_agent_id: bool, will_resume: bool) -> bool {
+    has_stored_agent_id && !will_resume
+}
+
 /// Whether the composer footer shows the resend-history hint. True only when
-/// the next send would open fresh *and* there is transcript to resend.
-pub fn show_resend_history_hint(will_resume: bool, has_messages: bool) -> bool {
-    !will_resume && has_messages
+/// the transcript is non-empty *and* a stored agent session is not resumable
+/// for the effective harness (typically after a harness switch).
+pub fn show_resend_history_hint(has_messages: bool, unresumable_stored_session: bool) -> bool {
+    has_messages && unresumable_stored_session
 }
 
 /// Progressive context-usage string for a **known** window. Cool fill (< 75%)
@@ -259,16 +398,19 @@ pub fn format_usage_readout(tokens: usize, window: usize) -> String {
 /// Data for the status bar below the chat input.
 pub struct StatusInfo {
     pub is_streaming: bool,
+    /// Mid-turn structured choice pending — chips stay visible while streaming.
+    pub is_awaiting_user: bool,
     /// 0 = no esc pressed, 1 = one esc pressed (waiting for second).
     pub esc_count: u8,
     /// Picker options — one per provider model, grouped by harness.
     pub model_choices: Vec<ModelChoice>,
     /// The currently-selected picker entry (matched by `(harness, id)`).
     pub selected_model: ModelChoice,
-    /// Whether the next turn resumes the agent-side session. Combined with
-    /// transcript emptiness via `show_resend_history_hint` for the meta-row
-    /// resend indicator.
-    pub will_resume: bool,
+    /// Stored agent session id exists but is not resumable for the effective
+    /// harness (typically after a harness switch). False when unbound or when
+    /// resume works. Combined with transcript emptiness via
+    /// `show_resend_history_hint` for the meta-row resend indicator.
+    pub unresumable_stored_session: bool,
     pub context_tokens: usize,
     /// The selected model's context window. `None` when the model reports no
     /// window — the meter then shows the token count with no fill.
@@ -287,433 +429,14 @@ pub struct CompletionState {
 
 /// One contiguous run of the calm transcript: user/system prose, thinking,
 /// answer, or a grouped activity of tools.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TranscriptSeg {
-    User {
-        lines: Vec<String>,
-        /// Synthetic first-turn AGENTS.md / orientation inject. Starts
-        /// collapsed so scroll-to-top lands on the real first user message.
-        is_priming: bool,
-    },
-    System {
-        lines: Vec<String>,
-    },
-    Thinking {
-        lines: Vec<String>,
-        /// True while this segment is still open in the turn (streaming and
-        /// no following Answer yet) — not merely "still receiving deltas".
-        live: bool,
-    },
-    Answer {
-        lines: Vec<String>,
-        live: bool,
-    },
-    Activity {
-        tools: Vec<ToolRow>,
-        /// True while the activity group is still open in the turn.
-        live: bool,
-    },
-}
-
-/// One tool call inside an [`TranscriptSeg::Activity`] group.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolRow {
-    pub id: String,
-    /// Human-readable tool summary (`format_tool_summary`), or the tool name
-    /// alone for orphan results.
-    pub summary: String,
-    /// Truncated result output; empty while still running.
-    pub output_lines: Vec<String>,
-    pub status: ToolRowStatus,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolRowStatus {
-    Running,
-    Done,
-    /// Reserved for later error-shaped output detection.
-    #[allow(dead_code)]
-    Error,
-}
-
-/// Build calm transcript segments from committed messages and live stream
-/// buffers. Contiguous same-kind assistant content coalesces; tools pair by
-/// call id within an activity run.
-pub fn build_transcript_segments(session: &ChatSession) -> Vec<TranscriptSeg> {
-    use std::collections::HashMap;
-
-    let mut segs: Vec<TranscriptSeg> = Vec::new();
-    // Within the open Activity: row order + id → index for pairing.
-    let mut activity_index: HashMap<String, usize> = HashMap::new();
-
-    for msg in &session.messages {
-        for cb in &msg.content {
-            match (msg.role, cb) {
-                (Role::User, ContentBlock::Text(t)) => {
-                    activity_index.clear();
-                    segs.push(TranscriptSeg::User {
-                        lines: text_lines(t),
-                        is_priming: msg.is_priming,
-                    });
-                }
-                (Role::System, ContentBlock::Text(t)) => {
-                    activity_index.clear();
-                    segs.push(TranscriptSeg::System {
-                        lines: text_lines(t),
-                    });
-                }
-                (Role::Assistant, ContentBlock::Reasoning(t)) => {
-                    activity_index.clear();
-                    append_thinking(&mut segs, t, false);
-                }
-                (Role::Assistant, ContentBlock::Text(t)) => {
-                    activity_index.clear();
-                    append_answer(&mut segs, t, false);
-                }
-                (
-                    Role::Assistant,
-                    ContentBlock::ToolUse { id, name, input },
-                ) => {
-                    ensure_activity(&mut segs, &mut activity_index);
-                    let tools = activity_tools_mut(&mut segs);
-                    if let Some(&idx) = activity_index.get(id) {
-                        // Duplicate id: refresh summary, leave status/output.
-                        tools[idx].summary = format_tool_summary(name, input);
-                    } else {
-                        let idx = tools.len();
-                        activity_index.insert(id.clone(), idx);
-                        tools.push(ToolRow {
-                            id: id.clone(),
-                            summary: format_tool_summary(name, input),
-                            output_lines: Vec::new(),
-                            status: ToolRowStatus::Running,
-                        });
-                    }
-                }
-                (
-                    Role::Assistant,
-                    ContentBlock::ToolResult { id, name, output },
-                ) => {
-                    ensure_activity(&mut segs, &mut activity_index);
-                    let tools = activity_tools_mut(&mut segs);
-                    if let Some(&idx) = activity_index.get(id) {
-                        tools[idx].output_lines = truncate_output(output);
-                        tools[idx].status = ToolRowStatus::Done;
-                    } else {
-                        // Orphan result: named done row from the tool name,
-                        // never a bare "✓ done" placeholder.
-                        let idx = tools.len();
-                        activity_index.insert(id.clone(), idx);
-                        tools.push(ToolRow {
-                            id: id.clone(),
-                            summary: name.clone(),
-                            output_lines: truncate_output(output),
-                            status: ToolRowStatus::Done,
-                        });
-                    }
-                }
-                // Non-text user/system content (e.g. tools) is not expected
-                // on those roles — skip rather than invent a segment.
-                (Role::User | Role::System, _) => {}
-            }
-        }
-    }
-
-    // Live stream buffers: append to or open Thinking / Answer segments.
-    if session.is_streaming {
-        if !session.pending_reasoning.is_empty() {
-            activity_index.clear();
-            append_thinking(&mut segs, &session.pending_reasoning, true);
-        }
-        if !session.pending_text.is_empty() {
-            activity_index.clear();
-            append_answer(&mut segs, &session.pending_text, true);
-        }
-    }
-
-    // Settle tool status and turn-open live flags.
-    //
-    // `live` means "still open in the turn" — not "still receiving deltas of
-    // this kind". Committed reasoning is built with live=false above; while
-    // streaming and no following Answer, Thinking stays open so collapse
-    // policy does not snap it shut when tools start.
-    let streaming = session.is_streaming;
-    let answer_after: Vec<bool> = (0..segs.len())
-        .map(|i| {
-            segs[i + 1..]
-                .iter()
-                .any(|s| matches!(s, TranscriptSeg::Answer { .. }))
-        })
-        .collect();
-    for (i, seg) in segs.iter_mut().enumerate() {
-        match seg {
-            TranscriptSeg::Activity { tools, live } => {
-                if !streaming {
-                    for row in tools.iter_mut() {
-                        if row.status == ToolRowStatus::Running {
-                            row.status = ToolRowStatus::Done;
-                        }
-                    }
-                    *live = false;
-                } else {
-                    *live = !answer_after[i]
-                        || tools.iter().any(|t| t.status == ToolRowStatus::Running);
-                }
-            }
-            TranscriptSeg::Thinking { live, .. } => {
-                if !streaming {
-                    *live = false;
-                } else {
-                    // Open until a following Answer appears or the turn ends.
-                    *live = !answer_after[i];
-                }
-            }
-            _ => {}
-        }
-    }
-
-    segs
-}
-
-fn text_lines(t: &str) -> Vec<String> {
-    t.lines().map(String::from).collect()
-}
-
-fn append_thinking(segs: &mut Vec<TranscriptSeg>, text: &str, live: bool) {
-    let mut lines = text_lines(text);
-    if let Some(TranscriptSeg::Thinking {
-        lines: existing,
-        live: existing_live,
-    }) = segs.last_mut()
-    {
-        existing.append(&mut lines);
-        *existing_live = *existing_live || live;
-    } else {
-        segs.push(TranscriptSeg::Thinking { lines, live });
-    }
-}
-
-fn append_answer(segs: &mut Vec<TranscriptSeg>, text: &str, live: bool) {
-    let mut lines = text_lines(text);
-    if let Some(TranscriptSeg::Answer {
-        lines: existing,
-        live: existing_live,
-    }) = segs.last_mut()
-    {
-        existing.append(&mut lines);
-        *existing_live = *existing_live || live;
-    } else {
-        segs.push(TranscriptSeg::Answer { lines, live });
-    }
-}
-
-fn ensure_activity(
-    segs: &mut Vec<TranscriptSeg>,
-    activity_index: &mut std::collections::HashMap<String, usize>,
-) {
-    if !matches!(segs.last(), Some(TranscriptSeg::Activity { .. })) {
-        activity_index.clear();
-        segs.push(TranscriptSeg::Activity {
-            tools: Vec::new(),
-            live: false,
-        });
-    }
-}
-
-fn activity_tools_mut(segs: &mut [TranscriptSeg]) -> &mut Vec<ToolRow> {
-    match segs.last_mut() {
-        Some(TranscriptSeg::Activity { tools, .. }) => tools,
-        _ => unreachable!("ensure_activity must open an Activity first"),
-    }
-}
-
-// ── Collapse policy ────────────────────────────────────────────────────────
-
-/// Per-segment collapse flag plus whether the user has manually toggled it.
-/// Index-aligned with the transcript segment list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct CollapseState {
-    pub collapsed: bool,
-    /// Once true, auto-collapse must not force this segment shut again.
-    pub user_set: bool,
-}
-
-/// Seconds after a manual expand of the priming Setup block before it
-/// auto-hides again. Mid of the 10–20s product range.
-pub const PRIMING_RECOLLAPSE_SECS: u64 = 15;
-
-/// First-sight default: live Thinking/Activity expanded; settled collapsed.
-/// Priming User starts collapsed. Other User / Answer / System stay open.
-fn first_sight_collapsed(seg: &TranscriptSeg) -> bool {
-    match seg {
-        TranscriptSeg::Thinking { live, .. } | TranscriptSeg::Activity { live, .. } => !live,
-        TranscriptSeg::User { is_priming: true, .. } => true,
-        TranscriptSeg::User { is_priming: false, .. }
-        | TranscriptSeg::System { .. }
-        | TranscriptSeg::Answer { .. } => false,
-    }
-}
-
-fn has_following_answer(segs: &[TranscriptSeg], idx: usize) -> bool {
-    segs[idx + 1..]
-        .iter()
-        .any(|s| matches!(s, TranscriptSeg::Answer { .. }))
-}
-
-/// Sync collapse state with the current segment list.
-///
-/// - Resizes to match `segs` (truncates if shorter; appends first-sight defaults).
-/// - Auto-collapses untoggled Thinking when a following Answer appears or the
-///   segment is no longer live (turn settled — see Thinking `live` fixup in
-///   [`build_transcript_segments`]).
-/// - Auto-collapses untoggled Activity when a following Answer appears or the
-///   turn settles (`live == false`).
-/// - Keeps untoggled priming User collapsed (first-sight and on rebuild).
-/// - Leaves `user_set` segments alone for auto-collapse (priming re-hide after
-///   expand is a separate timer, not this sync path).
-///
-/// Thinking `live` means open-in-turn (streaming, no following Answer), not
-/// "still receiving ReasoningDelta", so tool phases keep Thinking expanded.
-pub fn sync_collapse_states(states: &mut Vec<CollapseState>, segs: &[TranscriptSeg]) {
-    if states.len() > segs.len() {
-        states.truncate(segs.len());
-    }
-    while states.len() < segs.len() {
-        let i = states.len();
-        states.push(CollapseState {
-            collapsed: first_sight_collapsed(&segs[i]),
-            user_set: false,
-        });
-    }
-
-    for (i, seg) in segs.iter().enumerate() {
-        if states[i].user_set {
-            continue;
-        }
-        match seg {
-            TranscriptSeg::Thinking { live, .. } | TranscriptSeg::Activity { live, .. } => {
-                // Settle when Answer follows or the segment is no longer
-                // open-in-turn (`!live`). For Thinking, `live` is fixed up so
-                // committed reasoning during a tool phase stays open.
-                if has_following_answer(segs, i) || !*live {
-                    states[i].collapsed = true;
-                }
-            }
-            TranscriptSeg::User { is_priming: true, .. } => {
-                // Stay folded until the user clicks to inspect.
-                states[i].collapsed = true;
-            }
-            TranscriptSeg::User { is_priming: false, .. }
-            | TranscriptSeg::System { .. }
-            | TranscriptSeg::Answer { .. } => {
-                states[i].collapsed = false;
-            }
-        }
-    }
-}
-
-/// User toggle: flip collapsed and mark as manually set so auto-collapse
-/// will not override this segment again.
-pub fn toggle_collapse(states: &mut [CollapseState], idx: usize) {
-    if let Some(state) = states.get_mut(idx) {
-        state.collapsed = !state.collapsed;
-        state.user_set = true;
-    }
-}
-
-/// Collapsed label for the synthetic priming user message.
-pub fn priming_collapsed_label(lines: &[String]) -> String {
-    let n = lines.len();
-    if n == 1 {
-        "Setup · 1 line".to_string()
-    } else {
-        format!("Setup · {n} lines")
-    }
-}
-
-/// Force-collapse a priming segment after the expand timer. Callers gate on
-/// expand generation so stale timers no-op.
-pub fn recollapse_priming(states: &mut [CollapseState], idx: usize) {
-    if let Some(state) = states.get_mut(idx) {
-        state.collapsed = true;
-        // Keep `user_set` so sync does not fight a later re-expand path that
-        // also marks user_set; the timed re-hide is intentional UX.
-    }
-}
-
-// ── Segment presentation helpers ───────────────────────────────────────────
-
-/// Collapsed Thinking label: line count only (no duration).
-///
-/// Examples: `"Thinking · 1 line"`, `"Thinking · 12 lines"`.
-pub fn thinking_collapsed_label(lines: &[String]) -> String {
-    let n = lines.len();
-    if n == 1 {
-        "Thinking · 1 line".to_string()
-    } else {
-        format!("Thinking · {n} lines")
-    }
-}
-
-/// Collapsed Activity summary: tool count plus sample names from the rows.
-///
-/// Example: `"4 tools · Read, Shell, Grep"`.
-pub fn activity_collapsed_label(tools: &[ToolRow]) -> String {
-    let n = tools.len();
-    let count = if n == 1 {
-        "1 tool".to_string()
-    } else {
-        format!("{n} tools")
-    };
-    const SAMPLE: usize = 3;
-    let names: Vec<&str> = tools
-        .iter()
-        .take(SAMPLE)
-        .map(|t| tool_display_name(&t.summary))
-        .collect();
-    if names.is_empty() {
-        count
-    } else {
-        format!("{count} · {}", names.join(", "))
-    }
-}
-
-/// Humanized tool verb from a summary line (`"Read · path"` → `"Read"`).
-fn tool_display_name(summary: &str) -> &str {
-    summary.split(" · ").next().unwrap_or(summary).trim()
-}
-
-/// Quiet row for an expanded Activity group. Status + summary on the row;
-/// truncated output sits under it. Group expand only — no per-tool expand state.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActivityRowView {
-    pub status: ToolRowStatus,
-    pub status_glyph: &'static str,
-    pub summary: String,
-    /// Truncated output lines under the row; empty while running or empty result.
-    pub output_lines: Vec<String>,
-}
-
-/// Shape expanded Activity presentation as one quiet row per tool.
-pub fn expanded_activity_rows(tools: &[ToolRow]) -> Vec<ActivityRowView> {
-    tools
-        .iter()
-        .map(|t| ActivityRowView {
-            status: t.status,
-            status_glyph: tool_status_glyph(t.status),
-            summary: t.summary.clone(),
-            output_lines: t.output_lines.clone(),
-        })
-        .collect()
-}
-
-pub fn tool_status_glyph(status: ToolRowStatus) -> &'static str {
-    match status {
-        ToolRowStatus::Running => "●",
-        ToolRowStatus::Done => "✓",
-        ToolRowStatus::Error => "✗",
-    }
-}
+// Shared segment model — construction and collapse live in duckcore.
+pub use duckcore::transcript::{
+    ActivityRowView, CollapseState, PRIMING_RECOLLAPSE_SECS, ToolRow, ToolRowStatus, TranscriptSeg,
+    activity_collapsed_label, build_transcript_segments, expanded_activity_rows, format_tool_summary,
+    is_host_choice_tool_name, priming_collapsed_label, recollapse_priming, strip_ansi_escapes,
+    strip_tool_wrapper_tags, sync_collapse_states, text_lines, thinking_collapsed_label,
+    toggle_collapse, tool_status_glyph, truncate_chars, truncate_output,
+};
 
 // ── Build blocks from session ──────────────────────────────────────────────
 
@@ -738,12 +461,14 @@ pub fn blocks_from_segments(segs: &[TranscriptSeg]) -> Vec<Block> {
                 },
                 lines: lines.clone(),
                 is_priming: *is_priming,
+                is_live: false,
             },
             TranscriptSeg::System { lines } => Block {
                 kind: BlockKind::System,
                 label: "System".to_string(),
                 lines: lines.clone(),
                 is_priming: false,
+                is_live: false,
             },
             TranscriptSeg::Thinking { lines, live } => Block {
                 kind: BlockKind::Reasoning,
@@ -754,6 +479,7 @@ pub fn blocks_from_segments(segs: &[TranscriptSeg]) -> Vec<Block> {
                 },
                 lines: lines.clone(),
                 is_priming: false,
+                is_live: *live,
             },
             TranscriptSeg::Answer { lines, live } => Block {
                 kind: BlockKind::Assistant,
@@ -764,12 +490,28 @@ pub fn blocks_from_segments(segs: &[TranscriptSeg]) -> Vec<Block> {
                 },
                 lines: lines.clone(),
                 is_priming: false,
+                is_live: *live,
             },
             TranscriptSeg::Activity { tools, .. } => Block {
                 kind: BlockKind::Activity,
                 label: activity_collapsed_label(tools),
                 lines: activity_body_lines(tools),
                 is_priming: false,
+                is_live: false,
+            },
+            TranscriptSeg::UserChoiceQuestion { text } => Block {
+                kind: BlockKind::UserChoiceQuestion,
+                label: "Question".to_string(),
+                lines: text_lines(text),
+                is_priming: false,
+                is_live: false,
+            },
+            TranscriptSeg::UserChoiceAnswer { text } => Block {
+                kind: BlockKind::UserChoiceAnswer,
+                label: "Answer".to_string(),
+                lines: text_lines(text),
+                is_priming: false,
+                is_live: false,
             },
         })
         .collect()
@@ -790,305 +532,202 @@ fn activity_body_lines(tools: &[ToolRow]) -> Vec<String> {
 
 /// Truncate tool output to a reasonable number of lines, filtering
 /// non-printable characters that cause rendering artifacts.
-fn truncate_output(output: &str) -> Vec<String> {
-    const MAX_LINES: usize = 10;
-    let cleaned = strip_ansi_escapes(output);
-    let cleaned = strip_tool_wrapper_tags(&cleaned);
-    let all_lines: Vec<String> = cleaned
-        .lines()
-        .map(sanitize_line)
-        .map(|s| s.trim_end().to_string())
-        .collect();
-    let mut lines = if all_lines.len() > MAX_LINES {
-        let mut truncated = all_lines[..MAX_LINES].to_vec();
-        truncated.push(format!("… ({} more lines)", all_lines.len() - MAX_LINES));
-        truncated
-    } else {
-        all_lines
-    };
-    while lines.last().is_some_and(|s| s.is_empty()) {
-        lines.pop();
-    }
-    lines
+// ── Last-Answer band ────────────────────────────────────────────────────────
+
+/// Index of the latest non-empty Answer (`BlockKind::Assistant`) block, if any.
+/// Empty Answer bodies are not band targets.
+pub fn last_answer_band_target(blocks: &[Block]) -> Option<usize> {
+    blocks
+        .iter()
+        .rposition(|b| b.kind == BlockKind::Assistant && b.lines.iter().any(|l| !l.is_empty()))
 }
 
-/// Remove ANSI CSI escape sequences (e.g. `\x1B[32m`). Parses the sequence
-/// greedily through its final byte so the parameter bytes don't leak through.
-fn strip_ansi_escapes(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '\x1B' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('[') => {
-                for next in chars.by_ref() {
-                    let n = next as u32;
-                    if (0x40..=0x7E).contains(&n) {
-                        break;
-                    }
-                }
-            }
-            Some(']') => {
-                // OSC: terminate on BEL (0x07) or ESC \\.
-                let mut prev_esc = false;
-                for next in chars.by_ref() {
-                    if next == '\x07' {
-                        break;
-                    }
-                    if prev_esc && next == '\\' {
-                        break;
-                    }
-                    prev_esc = next == '\x1B';
-                }
-            }
-            Some(_) | None => {}
-        }
-    }
-    out
-}
+// ── Answer reply landmarks ──────────────────────────────────────────────────
 
-/// Strip `<tool_use_error>` / `<tool_use_result>` wrapper tags that some
-/// agent backends emit around tool output.
-fn strip_tool_wrapper_tags(input: &str) -> String {
-    input
-        .replace("<tool_use_error>", "")
-        .replace("</tool_use_error>", "")
-        .replace("<tool_use_result>", "")
-        .replace("</tool_use_result>", "")
-}
-
-/// Replace remaining non-printable / non-standard-whitespace characters with a
-/// space to avoid rendering rectangles in the monospace font.
-fn sanitize_line(line: &str) -> String {
-    line.chars()
-        .map(|c| if c == '\t' || c.is_control() { ' ' } else { c })
+/// Block indices of every Answer (`BlockKind::Assistant`) in transcript order.
+pub fn answer_block_indices(blocks: &[Block]) -> Vec<usize> {
+    blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| b.kind == BlockKind::Assistant)
+        .map(|(i, _)| i)
         .collect()
 }
 
-/// Produce a short human-readable summary of a tool call.
+/// Previous Answer anchor before `from` (a block index). No wrap.
+pub fn prev_answer_idx(anchors: &[usize], from: Option<usize>) -> Option<usize> {
+    let from = from?;
+    let pos = anchors.iter().position(|&i| i == from)?;
+    pos.checked_sub(1).map(|p| anchors[p])
+}
+
+/// Next Answer anchor after `from` (a block index). No wrap.
+pub fn next_answer_idx(anchors: &[usize], from: Option<usize>) -> Option<usize> {
+    let from = from?;
+    let pos = anchors.iter().position(|&i| i == from)?;
+    anchors.get(pos + 1).copied()
+}
+
+/// Float slack when comparing Answer tops to the viewport scroll offset.
+const VIEWPORT_TOP_EPS: f32 = 1.0;
+
+/// Resolve the current Answer for ⌘←/→ from stick-to-bottom or scroll position.
 ///
-/// Shape: `Verb · detail` (or just `Verb`). Known Claude/Grok tools share a
-/// calm display verb; unknown names are humanized. Never dumps raw JSON.
-///
-/// Examples: `Read · agent_chat.rs`, `Shell · cargo test -p duckboard`.
-fn format_tool_summary(name: &str, input: &str) -> String {
-    let verb = known_tool_verb(name)
-        .map(str::to_string)
-        .unwrap_or_else(|| humanize_tool_name(name));
-    match tool_detail(input) {
-        Some(detail) if !detail.is_empty() => format!("{verb} · {detail}"),
-        _ => verb,
-    }
-}
-
-/// Map known Claude / Grok tool names to a short display verb (case-insensitive).
-/// Returns `None` for unmapped names (use [`humanize_tool_name`]).
-fn known_tool_verb(name: &str) -> Option<&'static str> {
-    let key = normalize_tool_key(name);
-    match key.as_str() {
-        // Shell
-        "bash" | "shell" | "run_terminal_command" | "run_terminal" => Some("Shell"),
-        // File read
-        "read" | "read_file" => Some("Read"),
-        // File write
-        "write" | "write_file" => Some("Write"),
-        // Edit / replace
-        "edit" | "search_replace" | "multi_edit" | "str_replace" | "strreplace" => Some("Edit"),
-        // Search
-        "grep" | "rg" => Some("Grep"),
-        // Glob / list
-        "glob" => Some("Glob"),
-        "ls" | "list" | "list_dir" => Some("List"),
-        // Web
-        "web_search" | "websearch" => Some("Search"),
-        "web_fetch" | "webfetch" | "open_page" | "open_page_with_find" | "web_fetch_url" => {
-            Some("Fetch")
-        }
-        // Misc agent tools
-        "todo_write" | "todowrite" => Some("Todo"),
-        "task" | "spawn_subagent" => Some("Task"),
-        "image_gen" | "image_edit" => Some("Image"),
-        _ => None,
-    }
-}
-
-/// Normalize a tool name for alias matching: `WebSearch` → `web_search`,
-/// `run-terminal-command` → `run_terminal_command`.
-fn normalize_tool_key(name: &str) -> String {
-    let mut out = String::with_capacity(name.len() + 4);
-    for (i, c) in name.trim().chars().enumerate() {
-        if c == '-' || c == ' ' {
-            if !out.ends_with('_') {
-                out.push('_');
-            }
-        } else if c.is_uppercase() {
-            if i > 0 && !out.ends_with('_') {
-                out.push('_');
-            }
-            for lower in c.to_lowercase() {
-                out.push(lower);
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    while out.contains("__") {
-        out = out.replace("__", "_");
-    }
-    out.trim_matches('_').to_string()
-}
-
-/// Humanize an unknown tool name for display: `some_obscure_tool` →
-/// `Some obscure tool`, `camelCase` → `Camel case`.
-fn humanize_tool_name(name: &str) -> String {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return "Tool".to_string();
-    }
-    let key = normalize_tool_key(trimmed);
-    let words: Vec<&str> = key.split('_').filter(|w| !w.is_empty()).collect();
-    if words.is_empty() {
-        return "Tool".to_string();
-    }
-    let mut parts = Vec::with_capacity(words.len());
-    for (i, w) in words.iter().enumerate() {
-        if i == 0 {
-            // Title-case the first word.
-            let mut chars = w.chars();
-            let first = chars
-                .next()
-                .map(|c| c.to_uppercase().to_string())
-                .unwrap_or_default();
-            parts.push(format!("{first}{}", chars.as_str()));
-        } else {
-            parts.push(w.to_string());
-        }
-    }
-    parts.join(" ")
-}
-
-/// Extract a single-line detail from tool input JSON for the summary row.
-/// Prefer path, command, pattern/query; never multi-line bodies or full JSON.
-fn tool_detail(input: &str) -> Option<String> {
-    let input = input.trim();
-    if input.is_empty() {
+/// `answer_tops` is `(block_idx, content_y)` for Answer blocks (layout coords
+/// relative to the scrollable content origin). When not stuck: last Answer
+/// whose top ≤ `offset_y`; if none, the first Answer.
+pub fn current_answer_for_reply_jumps(
+    anchors: &[usize],
+    answer_tops: &[(usize, f32)],
+    offset_y: f32,
+    stick_to_bottom: bool,
+) -> Option<usize> {
+    if anchors.is_empty() {
         return None;
     }
-    let Ok(serde_json::Value::Object(map)) = serde_json::from_str(input) else {
-        // Non-JSON input: one short line if it's already a simple string.
-        let one = input.lines().next().unwrap_or(input).trim();
-        if one.is_empty() || one.starts_with('{') {
-            return None;
-        }
-        return Some(truncate_chars(one, 50).to_string());
-    };
-
-    // Path-like fields (shorten to last components).
-    for key in [
-        "file_path",
-        "path",
-        "target_file",
-        "file",
-        "filename",
-        "target_directory",
-    ] {
-        if let Some(p) = map.get(key).and_then(|v| v.as_str()) {
-            let p = p.trim();
-            if !p.is_empty() {
-                return Some(shorten_path(p));
-            }
-        }
+    if stick_to_bottom {
+        return anchors.last().copied();
     }
-
-    // Shell command — first line only.
-    if let Some(cmd) = map.get("command").and_then(|v| v.as_str()) {
-        let one = cmd.lines().next().unwrap_or(cmd).trim();
-        if !one.is_empty() {
-            return Some(truncate_chars(one, 50).to_string());
-        }
-    }
-
-    // Search pattern / query — quoted.
-    for key in ["pattern", "query"] {
-        if let Some(s) = map.get(key).and_then(|v| v.as_str()) {
-            let s = s.trim();
-            if !s.is_empty() {
-                let t = truncate_chars(s, 40);
-                return Some(format!("\"{t}\""));
-            }
-        }
-    }
-
-    // URL (web fetch / open).
-    if let Some(url) = map.get("url").and_then(|v| v.as_str()) {
-        let url = url.trim();
-        if !url.is_empty() {
-            return Some(truncate_chars(url, 48).to_string());
-        }
-    }
-
-    // Fallback: first short single-line string field that isn't a bulky body.
-    const SKIP: &[&str] = &[
-        "contents",
-        "content",
-        "body",
-        "old_string",
-        "new_string",
-        "output",
-        "prompt",
-        "text",
-        "code",
-        "diff",
-    ];
-    for (key, value) in &map {
-        if SKIP.iter().any(|s| s.eq_ignore_ascii_case(key)) {
-            continue;
-        }
-        let Some(s) = value.as_str() else {
+    let mut current = None;
+    for &idx in anchors {
+        let Some(&(_, top)) = answer_tops.iter().find(|(i, _)| *i == idx) else {
             continue;
         };
-        let s = s.trim();
-        if s.is_empty() || s.contains('\n') {
-            continue;
+        if top <= offset_y + VIEWPORT_TOP_EPS {
+            current = Some(idx);
         }
-        if s.chars().count() > 80 {
-            continue;
-        }
-        return Some(truncate_chars(s, 40).to_string());
     }
-
-    None
+    current.or_else(|| anchors.first().copied())
 }
 
-/// Shorten a path to at most the last three components.
-fn shorten_path(p: &str) -> String {
-    let short: String = p
-        .rsplit('/')
-        .take(3)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("/");
-    if short.chars().count() > 48 {
-        truncate_chars(&short, 48).to_string()
-    } else {
-        short
-    }
-}
-
-/// Truncate a string to at most `max` characters, on char boundaries.
+/// Prev jump: re-align to `current` when the viewport is below its top; else prior Answer.
+/// Next jump: adjacent next only (no re-align-first).
 ///
-/// Slicing with a byte index (`&s[..n]`) panics when the index falls inside a
-/// multibyte UTF-8 character, so we count by `char` instead. Returns the whole
-/// string when it is already short enough.
-fn truncate_chars(s: &str, max: usize) -> &str {
-    match s.char_indices().nth(max) {
-        Some((byte_idx, _)) => &s[..byte_idx],
-        None => s,
+/// `answer_tops` is `(block_idx, content_y)` relative to the scrollable content origin.
+/// Alignment slack matches `current_answer_for_reply_jumps` (`VIEWPORT_TOP_EPS`).
+pub fn target_answer_for_reply_jump(
+    anchors: &[usize],
+    answer_tops: &[(usize, f32)],
+    current: Option<usize>,
+    go_prev: bool,
+    offset_y: f32,
+) -> Option<usize> {
+    if go_prev {
+        if let Some(cur) = current
+            && let Some(&(_, top)) = answer_tops.iter().find(|(i, _)| *i == cur)
+            && offset_y > top + VIEWPORT_TOP_EPS
+        {
+            return Some(cur);
+        }
+        return prev_answer_idx(anchors, current);
+    }
+    next_answer_idx(anchors, current)
+}
+
+/// Measure Answer block tops, resolve prev/next from viewport, scroll target
+/// to the top of the chat scrollable. No-op when there is no target.
+///
+/// `offset_y` / `stick_to_bottom` describe the viewport *before* the jump.
+/// When the layout Operation measures the scrollable translation, that measured
+/// offset is preferred over the passed `offset_y`.
+pub fn scroll_to_adjacent_answer<M: Send + 'static>(
+    anchors: &[usize],
+    go_prev: bool,
+    offset_y: f32,
+    stick_to_bottom: bool,
+) -> Task<M> {
+    if anchors.is_empty() {
+        return Task::none();
+    }
+    let answer_blocks: Vec<(usize, Id)> = anchors
+        .iter()
+        .map(|&i| (i, find::chat_block_widget_id(i)))
+        .collect();
+    let op = ScrollToAdjacentAnswer {
+        scrollable_id: Id::from(CHAT_SCROLLABLE_ID),
+        answer_blocks,
+        go_prev,
+        offset_y,
+        stick_to_bottom,
+        scrollable_y: None,
+        measured_offset_y: None,
+        collected_ys: Vec::new(),
+    };
+    iced::advanced::widget::operate(op).discard()
+}
+
+struct ScrollToAdjacentAnswer {
+    scrollable_id: Id,
+    answer_blocks: Vec<(usize, Id)>,
+    go_prev: bool,
+    offset_y: f32,
+    stick_to_bottom: bool,
+    scrollable_y: Option<f32>,
+    /// Layout translation.y of the chat scrollable, when measured.
+    measured_offset_y: Option<f32>,
+    /// Absolute layout `bounds.y` per answer block idx.
+    collected_ys: Vec<(usize, f32)>,
+}
+
+impl Operation<()> for ScrollToAdjacentAnswer {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<()>)) {
+        operate(self);
+    }
+
+    fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
+        let Some(id) = id else {
+            return;
+        };
+        for (idx, block_id) in &self.answer_blocks {
+            if id == block_id {
+                self.collected_ys.push((*idx, bounds.y));
+            }
+        }
+    }
+
+    fn scrollable(
+        &mut self,
+        id: Option<&Id>,
+        bounds: Rectangle,
+        _content_bounds: Rectangle,
+        translation: Vector,
+        _state: &mut dyn operation::Scrollable,
+    ) {
+        if id == Some(&self.scrollable_id) {
+            self.scrollable_y = Some(bounds.y);
+            self.measured_offset_y = Some(translation.y);
+        }
+    }
+
+    fn finish(&self) -> operation::Outcome<()> {
+        let Some(sy) = self.scrollable_y else {
+            return operation::Outcome::None;
+        };
+        let anchors: Vec<usize> = self.answer_blocks.iter().map(|(i, _)| *i).collect();
+        let tops: Vec<(usize, f32)> = self
+            .collected_ys
+            .iter()
+            .map(|(i, y)| (*i, (y - sy).max(0.0)))
+            .collect();
+        let offset_y = self.measured_offset_y.unwrap_or(self.offset_y);
+        let current =
+            current_answer_for_reply_jumps(&anchors, &tops, offset_y, self.stick_to_bottom);
+        let target = target_answer_for_reply_jump(&anchors, &tops, current, self.go_prev, offset_y);
+        let Some(target_idx) = target else {
+            return operation::Outcome::None;
+        };
+        let Some(&(_, by)) = self.collected_ys.iter().find(|(i, _)| *i == target_idx) else {
+            return operation::Outcome::None;
+        };
+        let target_y = (by - sy).max(0.0);
+        operation::Outcome::Chain(Box::new(operation::scrollable::scroll_to(
+            self.scrollable_id.clone(),
+            operation::scrollable::AbsoluteOffset {
+                x: 0.0,
+                y: target_y,
+            }
+            .into(),
+        )))
     }
 }
 
@@ -1107,20 +746,27 @@ pub fn view<'a>(
     status: StatusInfo,
     next_actions: &'a [crate::meta_card::NextAction],
     next_action_idx: usize,
-    // Under-input oneshot suggestions (never next-card actions).
-    oneshot_prompts: Vec<String>,
-    // True while the reply-suggestion oneshot is outstanding.
-    default_prompts_pending: bool,
-    // Multi-option obvious chrome (send form derived in view).
-    obvious_chrome: &'a crate::obvious_bubble::ObviousChrome,
-    // Spacer above chrome when history is shorter than the viewport.
-    chrome_top_pad: f32,
+    // Multi-option fast-response shell (send form derived in view).
+    fast_response: &'a crate::fast_response::FastResponse,
+    // Spacer above chips when history is shorter than the viewport.
+    fast_response_top_pad: f32,
     pinned_selections: &'a [SelectionContext],
     tentative_selection: Option<&'a SelectionContext>,
     block_highlights: Vec<(
         Vec<text_edit::HighlightRange>,
         Option<text_edit::HighlightRange>,
     )>,
+    // Above-composer phase pills when the setting is on and scope has a display.
+    phase_display: Option<crate::area::change::PhaseDisplay>,
+    // Build pilot mode plaque (`Build auto` / `Build fast`) when armed.
+    pilot_plaque: Option<&'static str>,
+    // Effective chat Answer viewer style (from config).
+    viewer_style: ViewerStyle,
+    // Ephemeral Focus section folds keyed by block index.
+    focus_folds: &'a std::collections::HashMap<
+        usize,
+        std::collections::HashMap<String, crate::focus_answer::SectionFoldState>,
+    >,
 ) -> Element<'a, Msg> {
     // Chat content — scrollable column of full-width sections.
     let mut chat_col = column![]
@@ -1128,6 +774,7 @@ pub fn view<'a>(
         .padding([theme::SPACING_SM, 0.0]);
 
     let mut block_highlights = block_highlights;
+    let last_answer_band = last_answer_band_target(blocks);
     for (i, block) in blocks.iter().enumerate() {
         let is_collapsed = collapse.get(i).map(|s| s.collapsed).unwrap_or(false);
         let (ranges, current) = if i < block_highlights.len() {
@@ -1135,7 +782,18 @@ pub fn view<'a>(
         } else {
             (Vec::new(), None)
         };
-        let block_el = view_block(i, block, editors.get(i), is_collapsed, ranges, current);
+        let is_last_answer = last_answer_band == Some(i);
+        let block_el = view_block(
+            i,
+            block,
+            editors.get(i),
+            is_collapsed,
+            ranges,
+            current,
+            is_last_answer,
+            viewer_style,
+            focus_folds.get(&i),
+        );
         // Tag each block with a stable widget id so `widget::find` can read
         // the laid-out bounds during an Operation pass and scroll the
         // matching block to the top of the viewport — bypasses all the
@@ -1159,26 +817,27 @@ pub fn view<'a>(
         );
     }
 
-    // Obvious chrome after transcript content, inside the scroll column.
+    // Fast response after transcript content, inside the scroll column.
     // Optional top pad pins chips to the bottom of the viewport when history
     // is short; when history already fills the viewport, pad is 0 and chips
     // sit naturally after the last message. Keeping chrome inside the scroll
     // (not between scroll and composer) preserves a stable outer widget tree
     // so the input keeps focus when chrome shows/hides.
     let input_empty = input_value.text().trim().is_empty();
-    if crate::obvious_bubble::chrome_visible(
+    if crate::fast_response::visible(
         status.is_streaming,
+        status.is_awaiting_user,
         input_empty,
-        obvious_chrome,
+        fast_response,
     ) {
-        if chrome_top_pad > 0.0 {
+        if fast_response_top_pad > 0.0 {
             chat_col = chat_col.push(
                 Space::new()
                     .width(Length::Fill)
-                    .height(chrome_top_pad),
+                    .height(fast_response_top_pad),
             );
         }
-        chat_col = chat_col.push(view_obvious_chrome(obvious_chrome));
+        chat_col = chat_col.push(view_fast_response(fast_response));
     }
 
     let chat_scroll = scrollable(chat_col)
@@ -1235,21 +894,17 @@ pub fn view<'a>(
 
     // Input area — promoted to the custom TextEdit widget so prompts get
     // markdown syntax highlighting and the full editor toolkit (undo,
-    // word-nav, selection). Plain Enter sends via `on_submit`; empty Cmd+Enter
-    // sends oneshot; Shift+Enter inserts a newline. Grows via `fit_content`.
-    // Display-only key prefixes on ghost / oneshot text; send paths never
-    // include the markers (next_actions.send / oneshot_cmd_submit_text).
+    // word-nav, selection). Plain Enter sends via `on_submit`; Shift+Enter
+    // inserts a newline. Grows via `fit_content`. Display-only key prefixes on
+    // ghost text; send paths use next_actions.send only.
     let show_tab_marker = crate::default_prompts::next_tab_marker_visible(
         input_empty,
         status.is_streaming,
         next_actions.len(),
     );
-    let ghost_body = crate::default_prompts::next_ghost_text(
-        status.is_streaming,
-        next_actions,
-        next_action_idx,
-    )
-    .unwrap_or("");
+    let ghost_body =
+        crate::default_prompts::next_ghost_text(status.is_streaming, next_actions, next_action_idx)
+            .unwrap_or("");
     let ghost = if ghost_body.is_empty() {
         String::new()
     } else if show_tab_marker {
@@ -1265,29 +920,10 @@ pub fn view<'a>(
         .fit_content(true)
         .max_rows(CHAT_INPUT_MAX_ROWS)
         .transparent_bg(true)
-        .on_submit(Msg::SendPressed)
-        .on_empty_cmd_submit(Msg::SendOneshotSuggestion);
+        .on_submit(Msg::SendPressed);
     if !ghost.is_empty() {
         input = input.placeholder(ghost);
     }
-
-    // Oneshot chrome under the input only when empty and not mid-turn:
-    // loading while pending, list when ready. Never lists next-card actions.
-    let defaults_chrome = crate::default_prompts::defaults_chrome(
-        input_empty,
-        default_prompts_pending,
-        status.is_streaming,
-        oneshot_prompts.len(),
-    );
-    let defaults_chrome_el: Option<Element<'a, Msg>> = match defaults_chrome {
-        crate::default_prompts::DefaultsChrome::Hidden => None,
-        crate::default_prompts::DefaultsChrome::Loading => {
-            Some(view_default_prompts_loading())
-        }
-        crate::default_prompts::DefaultsChrome::List => oneshot_prompts
-            .first()
-            .map(|s| view_oneshot_suggestion(s)),
-    };
 
     let input_divider = rule::horizontal(1).style(|_theme: &iced::Theme| rule::Style {
         color: theme::border_color(),
@@ -1302,8 +938,8 @@ pub fn view<'a>(
     // input's own text (container XS + TextEdit CONTENT_PAD = 12px).
     // Fill is measured against the *selected* model's window (`context_max`).
     // An unknown window yields no fill — raw token count only, no percentage.
-    let ctx_pct = context_fill(status.context_tokens, status.context_max)
-        .map(|fill| (fill * 100.0) as usize);
+    let ctx_pct =
+        context_fill(status.context_tokens, status.context_max).map(|fill| (fill * 100.0) as usize);
     let ctx_color = match ctx_pct {
         Some(pct) if pct >= 90 => theme::error(),
         Some(pct) if pct >= 75 => theme::warning(),
@@ -1321,9 +957,11 @@ pub fn view<'a>(
         );
     }
     meta_inner = meta_inner.push(Space::new().width(Length::Fill));
-    // Resend-history hint: only when the next send would actually re-feed the
-    // transcript (no resumable session *and* non-empty messages).
-    if show_resend_history_hint(status.will_resume, !session.messages.is_empty()) {
+    // Resend-history hint: non-empty transcript + stored but unresumable session.
+    if show_resend_history_hint(
+        !session.messages.is_empty(),
+        status.unresumable_stored_session,
+    ) {
         meta_inner = meta_inner.push(
             text("⟳ resends full history")
                 .size(theme::font_sm())
@@ -1334,6 +972,12 @@ pub fn view<'a>(
     // harness-prefixed `label` via Display. Equality is on (harness, id).
     let mut selected_closed = status.selected_model.clone();
     selected_closed.label = selected_closed.closed_label.clone();
+    let model_pick_style =
+        if crate::fast_response::awaiting_composer_chrome(status.is_awaiting_user) {
+            theme::pick_list_ghost_awaiting_style
+        } else {
+            theme::pick_list_ghost_style
+        };
     meta_inner = meta_inner.push(
         pick_list(
             status.model_choices,
@@ -1342,7 +986,7 @@ pub fn view<'a>(
         )
         .text_size(theme::font_sm())
         .padding([0.0, theme::SPACING_XS])
-        .style(theme::pick_list_ghost_style)
+        .style(model_pick_style)
         .menu_style(theme::pick_list_menu),
     );
     let ctx_label = match status.context_max {
@@ -1367,6 +1011,37 @@ pub fn view<'a>(
     // `Space` siblings still consume `column` spacing and inflated the gap
     // above the default-prompt strip.
     let mut composer_col = column![].spacing(theme::SPACING_XS);
+
+    if let Some(display) = phase_display.as_ref() {
+        let on_lifecycle = display
+            .lifecycle_send
+            .as_ref()
+            .map(|t| Msg::PhasePillSend(t.clone()));
+        let on_vcs = display
+            .vcs_send
+            .map(|t| Msg::PhasePillSend(t.to_string()));
+        composer_col = composer_col.push(
+            container(crate::widget::phase_pill::view_pair(
+                display,
+                on_lifecycle,
+                on_vcs,
+            ))
+            .padding([0.0, theme::SPACING_SM])
+            .width(Length::Fill),
+        );
+    }
+
+    if let Some(label) = pilot_plaque {
+        composer_col = composer_col.push(
+            container(
+                text(label)
+                    .size(theme::font_sm())
+                    .color(theme::text_muted()),
+            )
+            .padding([0.0, theme::SPACING_SM])
+            .width(Length::Fill),
+        );
+    }
 
     // Queue pill — renders above the input when a message is staged while the
     // agent is still streaming. Uses a read-only TextEdit so it matches the
@@ -1398,8 +1073,8 @@ pub fn view<'a>(
         ]
         .spacing(theme::SPACING_XS)
         .align_y(iced::Alignment::Center);
-        let pill_col = column![header_row, container(editor).width(Length::Fill)]
-            .spacing(theme::SPACING_XS);
+        let pill_col =
+            column![header_row, container(editor).width(Length::Fill)].spacing(theme::SPACING_XS);
         composer_col = composer_col.push(
             container(pill_col)
                 .padding([theme::SPACING_SM, theme::SPACING_MD])
@@ -1439,17 +1114,21 @@ pub fn view<'a>(
     }
 
     composer_col = composer_col.push(input);
-    if let Some(chrome) = defaults_chrome_el {
-        composer_col = composer_col.push(chrome);
-    }
     composer_col = composer_col.push(meta_row);
 
     // Horizontal padding here sums with TextEdit's internal CONTENT_PAD (8px)
     // to land the input's text at the same 12px the chat headers use.
+    // Awaiting a user choice: quiet accent tint on the whole composer section.
+    let composer_style = if crate::fast_response::awaiting_composer_chrome(status.is_awaiting_user)
+    {
+        theme::chat_composer_awaiting
+    } else {
+        theme::chat_input
+    };
     let input_row = container(composer_col)
         .padding([theme::SPACING_SM, theme::SPACING_XS])
         .width(Length::Fill)
-        .style(theme::chat_input);
+        .style(composer_style);
 
     // Stable outer column (scroll → completion → divider → input) so showing
     // or hiding in-scroll chrome never remounts the input and steals focus.
@@ -1511,7 +1190,7 @@ pub fn measure_scroll_bounds() -> iced::Task<(f32, f32)> {
 /// - **User** (priming Setup): collapsible muted header; user-card body when open.
 /// - **Answer / System**: plain text flowing on the chat background.
 /// - **Thinking**: muted collapsible header; body when expanded.
-/// - **Activity**: framed group card with quiet tool rows when expanded.
+/// - **Activity**: same flat secondary chrome + quiet tool rows when expanded.
 fn view_block<'a>(
     idx: usize,
     block: &'a Block,
@@ -1519,6 +1198,9 @@ fn view_block<'a>(
     collapsed: bool,
     hl_ranges: Vec<text_edit::HighlightRange>,
     hl_current: Option<text_edit::HighlightRange>,
+    is_last_answer: bool,
+    viewer_style: ViewerStyle,
+    focus_folds: Option<&'a std::collections::HashMap<String, crate::focus_answer::SectionFoldState>>,
 ) -> Element<'a, Msg> {
     match block.kind {
         BlockKind::Reasoning => {
@@ -1530,10 +1212,201 @@ fn view_block<'a>(
         BlockKind::User if block.is_priming => {
             view_priming_user_block(idx, block, editor, collapsed, hl_ranges, hl_current)
         }
-        BlockKind::User | BlockKind::Assistant | BlockKind::System => {
-            view_prose_block(idx, block, editor, hl_ranges, hl_current)
+        BlockKind::Assistant => {
+            let source = block.lines.join("\n");
+            match answer_body_presentation(viewer_style, block.is_live, &source) {
+                AnswerBodyPresentation::ClassicFullBody => {
+                    view_prose_block(idx, block, editor, hl_ranges, hl_current, is_last_answer)
+                }
+                AnswerBodyPresentation::FocusSectioned { sections, open: _ } => {
+                    view_focus_answer(
+                        idx,
+                        block,
+                        editor,
+                        &sections,
+                        focus_folds,
+                        hl_ranges,
+                        hl_current,
+                        is_last_answer,
+                    )
+                }
+            }
+        }
+        BlockKind::User | BlockKind::System => {
+            // Non-Answer prose: viewer style does not select the path.
+            view_prose_block(idx, block, editor, hl_ranges, hl_current, is_last_answer)
+        }
+        BlockKind::UserChoiceQuestion => {
+            view_transcript_choice_chip(block, theme::chat_fast_response_chip_question)
+        }
+        BlockKind::UserChoiceAnswer => {
+            view_transcript_choice_chip(block, theme::chat_fast_response_chip_numbered)
         }
     }
+}
+
+/// Focus Answer chrome: collapsible section headers + always-open meta region.
+///
+/// Hybrid C: expanded sections are plain content-font text (no band); the open
+/// region uses the Classic TextEdit body recipe, with last-answer band only there.
+fn view_focus_answer<'a>(
+    block_idx: usize,
+    block: &'a Block,
+    editor: Option<&'a EditorState>,
+    sections: &[crate::focus_answer::FoldableSection],
+    focus_folds: Option<&'a std::collections::HashMap<String, crate::focus_answer::SectionFoldState>>,
+    hl_ranges: Vec<text_edit::HighlightRange>,
+    hl_current: Option<text_edit::HighlightRange>,
+    is_last_answer: bool,
+) -> Element<'a, Msg> {
+    use crate::focus_answer::{range_line_count, section_collapsed_label, section_key};
+
+    debug_assert!(focus_slice_uses_classic_body_paint(FocusSliceKind::OpenRegion));
+    debug_assert!(!focus_slice_uses_classic_body_paint(
+        FocusSliceKind::ExpandedSection
+    ));
+
+    let mut col = column![].spacing(theme::SPACING_XS).width(Length::Fill);
+
+    for section in sections {
+        let key = section_key(&section.kind);
+        let line_count = range_line_count(section.lines);
+        let collapsed = focus_folds
+            .and_then(|m| m.get(&key))
+            .map(|s| s.collapsed)
+            .unwrap_or(true);
+        let label = if collapsed {
+            section_collapsed_label(&section.kind, line_count)
+        } else {
+            match &section.kind {
+                crate::focus_answer::SectionKind::Preamble => {
+                    section_collapsed_label(&section.kind, line_count)
+                }
+                crate::focus_answer::SectionKind::Heading { text, .. } => text.clone(),
+            }
+        };
+        let key_for_msg = key.clone();
+        let header_label = text(label)
+            .size(theme::content_size())
+            .font(theme::content_font())
+            .color(theme::text_muted());
+        let header_row = row![collapsible::chevron(!collapsed), header_label]
+            .spacing(theme::SPACING_XS)
+            .align_y(iced::Alignment::Center);
+        let header = button(header_row)
+            .on_press(Msg::ToggleFocusSection {
+                block_idx,
+                key: key_for_msg,
+            })
+            .padding(0.0)
+            .style(|_theme, _status| iced::widget::button::Style {
+                background: None,
+                ..Default::default()
+            });
+        col = col.push(
+            container(header)
+                .padding([theme::SPACING_XS, theme::SPACING_MD])
+                .width(Length::Fill),
+        );
+        if !collapsed {
+            // Expanded section: plain source text; never last-answer band.
+            let body = slice_lines(&block.lines, section.lines);
+            col = col.push(plain_section_body_view(body));
+        }
+    }
+
+    // Open region: Classic TextEdit recipe; band only when last Answer.
+    col = col.push(focus_open_region_view(
+        block_idx,
+        editor,
+        hl_ranges,
+        hl_current,
+        is_last_answer,
+    ));
+
+    col.into()
+}
+
+fn slice_lines(lines: &[String], range: crate::focus_answer::LineRange) -> String {
+    if lines.is_empty() {
+        return String::new();
+    }
+    let start = range.start.min(lines.len().saturating_sub(1));
+    let end = range.end.min(lines.len().saturating_sub(1));
+    if start > end {
+        return String::new();
+    }
+    lines[start..=end].join("\n")
+}
+
+/// Expanded Focus section body: plain content-font source (not classic paint).
+fn plain_section_body_view(body: String) -> Element<'static, Msg> {
+    let body_el = text(body)
+        .size(theme::content_size())
+        .font(theme::content_font())
+        .color(theme::text_primary());
+    container(body_el)
+        .padding([theme::SPACING_SM, theme::SPACING_MD])
+        .width(Length::Fill)
+        .into()
+}
+
+/// Open region: same Classic body recipe as [`view_prose_block`] for Answers.
+fn focus_open_region_view<'a>(
+    idx: usize,
+    editor: Option<&'a EditorState>,
+    hl_ranges: Vec<text_edit::HighlightRange>,
+    hl_current: Option<text_edit::HighlightRange>,
+    is_last_answer: bool,
+) -> Element<'a, Msg> {
+    let Some(ed) = editor else {
+        return Space::new().into();
+    };
+    if ed.lines.is_empty() || (ed.lines.len() == 1 && ed.lines[0].is_empty()) {
+        return Space::new().into();
+    }
+
+    let content = text_edit::TextEdit::new(ed, move |action| Msg::ChatAction(idx, action))
+        .show_gutter(false)
+        .word_wrap(true)
+        .md_tables(true)
+        .read_only(true)
+        .fit_content(true)
+        .transparent_bg(true)
+        .highlights(hl_ranges, hl_current);
+
+    let padded = container(content)
+        .padding([theme::SPACING_SM, theme::SPACING_MD])
+        .width(Length::Fill);
+
+    if focus_slice_uses_last_answer_band(FocusSliceKind::OpenRegion, is_last_answer) {
+        padded.style(theme::chat_last_answer_band).into()
+    } else {
+        padded.into()
+    }
+}
+
+/// Settled question/answer chip in the transcript (same chrome as live shell).
+fn view_transcript_choice_chip<'a>(
+    block: &'a Block,
+    style: fn(&iced::Theme) -> container::Style,
+) -> Element<'a, Msg> {
+    let label = block.lines.join("\n");
+    if label.is_empty() {
+        return Space::new().into();
+    }
+    let body = text(label)
+        .size(theme::content_size())
+        .color(theme::text_secondary())
+        .font(theme::content_font());
+    let card = container(body)
+        .padding([theme::SPACING_SM, theme::SPACING_MD])
+        .width(Length::Fill)
+        .style(style);
+    container(card)
+        .padding([0.0, theme::SPACING_SM])
+        .width(Length::Fill)
+        .into()
 }
 
 /// User / Answer / System: no header, no chevron.
@@ -1543,6 +1416,7 @@ fn view_prose_block<'a>(
     editor: Option<&'a EditorState>,
     hl_ranges: Vec<text_edit::HighlightRange>,
     hl_current: Option<text_edit::HighlightRange>,
+    is_last_answer: bool,
 ) -> Element<'a, Msg> {
     let has_content = !block.lines.is_empty();
     if !has_content {
@@ -1570,8 +1444,39 @@ fn view_prose_block<'a>(
             .padding([0.0, theme::SPACING_SM])
             .width(Length::Fill)
             .into(),
+        BlockKind::Assistant if is_last_answer => padded
+            .style(theme::chat_last_answer_band)
+            .width(Length::Fill)
+            .into(),
         _ => padded.into(),
     }
+}
+
+/// Flat collapsible header: chevron + muted label (shared by Thinking and Activity).
+fn secondary_segment_header<'a>(
+    expanded: bool,
+    label: impl Into<String>,
+    on_toggle: Msg,
+) -> Element<'a, Msg> {
+    let label = text(label.into())
+        .size(theme::content_size())
+        .font(theme::content_font())
+        .color(theme::text_muted());
+    let header_row = row![collapsible::chevron(expanded), label]
+        .spacing(theme::SPACING_XS)
+        .align_y(iced::Alignment::Center);
+    let header_content: Element<'a, Msg> = button(header_row)
+        .on_press(on_toggle)
+        .padding(0.0)
+        .style(|_theme, _status| iced::widget::button::Style {
+            background: None,
+            ..Default::default()
+        })
+        .into();
+    container(header_content)
+        .padding([theme::SPACING_XS, theme::SPACING_MD])
+        .width(Length::Fill)
+        .into()
 }
 
 /// Priming Setup user message: collapsible so scroll-to-top skips the
@@ -1654,27 +1559,7 @@ fn view_thinking_block<'a>(
     } else {
         block.label.clone()
     };
-    let label_color = theme::text_muted();
-
-    let label = text(header_label)
-        .size(theme::content_size())
-        .font(theme::content_font())
-        .color(label_color);
-    let header_row = row![collapsible::chevron(!collapsed), label]
-        .spacing(theme::SPACING_XS)
-        .align_y(iced::Alignment::Center);
-    let header_content: Element<'a, Msg> = button(header_row)
-        .on_press(Msg::ToggleCollapse(idx))
-        .padding(0.0)
-        .style(|_theme, _status| iced::widget::button::Style {
-            background: None,
-            ..Default::default()
-        })
-        .into();
-
-    let header = container(header_content)
-        .padding([theme::SPACING_XS, theme::SPACING_MD])
-        .width(Length::Fill);
+    let header = secondary_segment_header(!collapsed, header_label, Msg::ToggleCollapse(idx));
 
     let mut col = column![header].width(Length::Fill);
     if body_shown && let Some(ed) = editor {
@@ -1705,7 +1590,7 @@ fn view_thinking_block<'a>(
         .into()
 }
 
-/// Activity group: framed card with summary header and quiet tool rows.
+/// Activity group: flat secondary header with quiet tool rows (no card chrome).
 fn view_activity_block<'a>(
     idx: usize,
     block: &'a Block,
@@ -1714,42 +1599,12 @@ fn view_activity_block<'a>(
     hl_ranges: Vec<text_edit::HighlightRange>,
     hl_current: Option<text_edit::HighlightRange>,
 ) -> Element<'a, Msg> {
-    let label_color = block_header_color(block.kind);
     let has_content = !block.lines.is_empty();
     let body_shown = has_content && !collapsed && editor.is_some();
+    let header =
+        secondary_segment_header(!collapsed, block.label.clone(), Msg::ToggleCollapse(idx));
 
-    // Activity headers use the content (monospace) font so tool names and
-    // paths read like code, matching the quiet-row body below.
-    let header_content: Element<'a, Msg> = {
-        let label = text(&block.label)
-            .size(theme::content_size())
-            .font(theme::content_font())
-            .color(label_color);
-        let header_row = row![collapsible::chevron(!collapsed), label]
-            .spacing(theme::SPACING_XS)
-            .align_y(iced::Alignment::Center);
-        button(header_row)
-            .on_press(Msg::ToggleCollapse(idx))
-            .padding(0.0)
-            .style(|_theme, _status| iced::widget::button::Style {
-                background: None,
-                ..Default::default()
-            })
-            .into()
-    };
-
-    let header_style = if body_shown {
-        theme::chat_tool_card_header_open
-    } else {
-        theme::chat_tool_card_header_alone
-    };
-    let header = container(header_content)
-        .padding([theme::SPACING_SM, theme::SPACING_MD])
-        .width(Length::Fill)
-        .style(header_style);
-
-    let mut card_col = column![header].width(Length::Fill);
-
+    let mut col = column![header].width(Length::Fill);
     if body_shown && let Some(ed) = editor {
         let body = container(
             text_edit::TextEdit::new(ed, move |action| Msg::ChatAction(idx, action))
@@ -1759,23 +1614,20 @@ fn view_activity_block<'a>(
                 .read_only(true)
                 .fit_content(true)
                 .transparent_bg(true)
+                .base_color(theme::text_secondary())
                 .highlights(hl_ranges, hl_current),
         )
-        .padding([theme::SPACING_SM, theme::SPACING_MD])
-        .width(Length::Fill)
-        .style(theme::chat_tool_card_body);
-        card_col = card_col.push(body);
+        .padding(iced::Padding {
+            top: 0.0,
+            right: theme::SPACING_MD,
+            bottom: theme::SPACING_SM,
+            left: theme::SPACING_MD,
+        })
+        .width(Length::Fill);
+        col = col.push(body);
     }
 
-    // Outer: stack the column underneath a transparent-bg, border-only
-    // overlay so the 1px frame draws on top of the header/body surfaces.
-    let border_overlay = container(Space::new())
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .style(theme::chat_tool_card_frame);
-    let framed = stack![card_col, border_overlay];
-
-    container(framed)
+    container(col)
         .padding([0.0, theme::SPACING_SM])
         .width(Length::Fill)
         .into()
@@ -1806,20 +1658,6 @@ fn view_selection_chip<'a>(label: String, tentative: bool) -> Element<'a, Msg> {
     .into()
 }
 
-/// Header label color for a block kind (re-exported from text_edit for convenience).
-fn block_header_color(kind: BlockKind) -> iced::Color {
-    match kind {
-        BlockKind::User => theme::accent(),
-        BlockKind::Assistant => theme::text_secondary(),
-        BlockKind::Reasoning => theme::text_muted(),
-        // Activity sits in a neutral palette so tool names stay legible
-        // without competing with the accent-colored User card.
-        BlockKind::Activity | BlockKind::ToolUse => theme::text_primary(),
-        BlockKind::ToolResult => theme::text_secondary(),
-        BlockKind::System => theme::text_muted(),
-    }
-}
-
 fn format_number(n: usize) -> String {
     let s = n.to_string();
     let mut result = String::with_capacity(s.len() + s.len() / 3);
@@ -1832,37 +1670,21 @@ fn format_number(n: usize) -> String {
     result
 }
 
-/// Tint for an obvious-chrome chip background.
-#[derive(Clone, Copy)]
-enum ObviousChipTone {
-    /// Numbered options (⌘1…⌘n) — quiet light blue.
-    Numbered,
-    /// Cancel (⌘⌫).
-    Reject,
-}
-
-/// Option chrome: numbered chips then optional cancel. View chrome only until
-/// activation sends.
-fn view_obvious_chrome<'a>(
-    chrome: &'a crate::obvious_bubble::ObviousChrome,
-) -> Element<'a, Msg> {
-    use crate::obvious_bubble::{cancel_chip_label, option_chip_label};
+/// Option chrome: optional question chip, then numbered option chips.
+/// View chrome only until activation / settle commits host blocks.
+fn view_fast_response<'a>(fr: &'a crate::fast_response::FastResponse) -> Element<'a, Msg> {
+    use crate::fast_response::{FastResponsePick, live_question_prompt, option_chip_label};
 
     let mut col = column![].spacing(theme::SPACING_XS);
 
-    for (i, action) in chrome.options.iter().enumerate() {
-        col = col.push(view_obvious_chip(
-            option_chip_label(i + 1, action),
-            action.clone(),
-            ObviousChipTone::Numbered,
-        ));
+    if let Some(prompt) = live_question_prompt(fr) {
+        col = col.push(view_fast_response_question_chip(&prompt));
     }
 
-    if let Some(cancel) = chrome.cancel.as_deref() {
-        col = col.push(view_obvious_chip(
-            cancel_chip_label(cancel),
-            cancel.to_string(),
-            ObviousChipTone::Reject,
+    for (i, opt) in fr.options.iter().enumerate() {
+        col = col.push(view_fast_response_chip(
+            option_chip_label(i + 1, &opt.label),
+            FastResponsePick::Option { id: opt.id.clone() },
         ));
     }
 
@@ -1872,13 +1694,25 @@ fn view_obvious_chrome<'a>(
         .into()
 }
 
-/// One action chip: hotkey-first label; click sends `action` only.
+/// Non-selectable question chip above live option chips (chat-area fill).
+fn view_fast_response_question_chip<'a>(prompt: &str) -> Element<'a, Msg> {
+    let body = text(prompt.to_string())
+        .size(theme::content_size())
+        .color(theme::text_secondary())
+        .font(theme::content_font());
+    container(body)
+        .padding([theme::SPACING_SM, theme::SPACING_MD])
+        .width(Length::Fill)
+        .style(theme::chat_fast_response_chip_question)
+        .into()
+}
+
+/// One action chip: hotkey-first label; click activates the pick only.
 /// Label ink uses secondary text (full alpha) for readable contrast on quiet
-/// tinted fills in both light and dark themes — shared for all tones.
-fn view_obvious_chip<'a>(
+/// tinted fills in both light and dark themes.
+fn view_fast_response_chip<'a>(
     label: String,
-    action: String,
-    tone: ObviousChipTone,
+    pick: crate::fast_response::FastResponsePick,
 ) -> Element<'a, Msg> {
     let body = text(label)
         .size(theme::content_size())
@@ -1888,13 +1722,10 @@ fn view_obvious_chip<'a>(
     let card = container(body)
         .padding([theme::SPACING_SM, theme::SPACING_MD])
         .width(Length::Fill)
-        .style(move |t| match tone {
-            ObviousChipTone::Numbered => theme::chat_obvious_chip_numbered(t),
-            ObviousChipTone::Reject => theme::chat_obvious_chip_reject(t),
-        });
+        .style(theme::chat_fast_response_chip_numbered);
 
     button(card)
-        .on_press(Msg::SendObviousAction(action))
+        .on_press(Msg::ActivateFastResponse(pick))
         .padding(0.0)
         .width(Length::Fill)
         .style(|_theme, status| {
@@ -1903,61 +1734,14 @@ fn view_obvious_chip<'a>(
                 ..Default::default()
             };
             match status {
-                iced::widget::button::Status::Hovered
-                | iced::widget::button::Status::Pressed => base,
+                iced::widget::button::Status::Hovered | iced::widget::button::Status::Pressed => {
+                    base
+                }
                 _ => base,
             }
         })
         .into()
 }
-
-/// Quiet loading strip while the reply-suggestion oneshot is pending.
-fn view_default_prompts_loading<'a>() -> Element<'a, Msg> {
-    const CONTENT_PAD: f32 = 8.0;
-    container(
-        text("…")
-            .size(theme::content_size())
-            .color(theme::text_muted())
-            .font(theme::content_font()),
-    )
-    .padding(iced::Padding {
-        top: text_edit::CONTENT_PAD_Y,
-        right: 0.0,
-        bottom: text_edit::CONTENT_PAD_Y,
-        left: CONTENT_PAD,
-    })
-    .width(Length::Fill)
-    .into()
-}
-
-/// Under-input oneshot: display-only `⌘↩` prefix before the suggestion text.
-/// Soft-wraps; full text stays visible. Send uses the bare suggestion string.
-fn view_oneshot_suggestion<'a>(suggestion: &str) -> Element<'a, Msg> {
-    const CONTENT_PAD: f32 = 8.0;
-    let color = theme::text_muted();
-    let label = format!(
-        "{}  {suggestion}",
-        crate::default_prompts::ONESHOT_CMD_ENTER_MARKER
-    );
-    container(
-        text(label)
-            .size(theme::content_size())
-            .color(color)
-            // UI font so ⌘ renders; content monospace often lacks the glyph.
-            .font(theme::ui_font())
-            .width(Length::Fill)
-            .wrapping(Wrapping::Word),
-    )
-    .padding(iced::Padding {
-        top: text_edit::CONTENT_PAD_Y,
-        right: 0.0,
-        bottom: text_edit::CONTENT_PAD_Y,
-        left: CONTENT_PAD,
-    })
-    .width(Length::Fill)
-    .into()
-}
-
 
 // view_status_bar removed: model + context now blend into the input area
 // (see `view`), and stream state is conveyed by the streaming indicator.
@@ -2212,7 +1996,10 @@ mod tests {
         let choices = group_choices(models);
         // THEN each model appears under its owning harness — the choice carries
         // its model's harness and its label is presented under that harness.
-        let opus = choices.iter().find(|c| c.id.as_deref() == Some("opus")).unwrap();
+        let opus = choices
+            .iter()
+            .find(|c| c.id.as_deref() == Some("opus"))
+            .unwrap();
         assert_eq!(opus.harness.as_deref(), Some("claude-code"));
         assert!(opus.label.starts_with("Claude Code · "));
         let grok = choices
@@ -2251,38 +2038,68 @@ mod tests {
         assert_eq!(fill, None);
     }
 
-    /// @spec chat/composer-footer Resend hint only when history would be resent: Hint shown when history would be resent
+    /// @spec chat/composer-footer Resend hint only for unresumable stored session: Hint shown when stored session is unresumable
     #[test]
-    fn hint_shown_when_history_would_be_resent() {
-        // GIVEN a chat with no resumable agent session AND a non-empty transcript.
-        let will_resume = false;
+    fn hint_shown_when_stored_session_is_unresumable() {
+        // GIVEN a non-empty transcript AND a stored agent session id that is
+        // not resumable for the effective harness.
         let has_messages = true;
+        let has_stored_agent_id = true;
+        let will_resume = false;
         // WHEN the composer footer is rendered (hint visibility is computed).
-        let show = show_resend_history_hint(will_resume, has_messages);
+        let show = show_resend_history_hint(
+            has_messages,
+            unresumable_stored_session(has_stored_agent_id, will_resume),
+        );
         // THEN the resend-history hint is shown.
         assert!(show);
     }
 
-    /// @spec chat/composer-footer Resend hint only when history would be resent: Hint hidden when next send would resume
+    /// @spec chat/composer-footer Resend hint only for unresumable stored session: Hint hidden when stored session is resumable
     #[test]
-    fn hint_hidden_when_next_send_would_resume() {
-        // GIVEN a chat with a resumable agent session AND a non-empty transcript.
-        let will_resume = true;
+    fn hint_hidden_when_stored_session_is_resumable() {
+        // GIVEN a non-empty transcript AND a stored agent session id that is
+        // resumable for the effective harness.
         let has_messages = true;
+        let has_stored_agent_id = true;
+        let will_resume = true;
         // WHEN the composer footer is rendered.
-        let show = show_resend_history_hint(will_resume, has_messages);
+        let show = show_resend_history_hint(
+            has_messages,
+            unresumable_stored_session(has_stored_agent_id, will_resume),
+        );
         // THEN the resend-history hint is not shown.
         assert!(!show);
     }
 
-    /// @spec chat/composer-footer Resend hint only when history would be resent: Hint hidden when transcript is empty
+    /// @spec chat/composer-footer Resend hint only for unresumable stored session: Hint hidden when transcript is empty
     #[test]
     fn hint_hidden_when_transcript_is_empty() {
-        // GIVEN a chat with no resumable agent session AND an empty transcript.
-        let will_resume = false;
+        // GIVEN an empty transcript.
         let has_messages = false;
+        let has_stored_agent_id = true;
+        let will_resume = false;
         // WHEN the composer footer is rendered.
-        let show = show_resend_history_hint(will_resume, has_messages);
+        let show = show_resend_history_hint(
+            has_messages,
+            unresumable_stored_session(has_stored_agent_id, will_resume),
+        );
+        // THEN the resend-history hint is not shown.
+        assert!(!show);
+    }
+
+    /// @spec chat/composer-footer Resend hint only for unresumable stored session: Hint hidden when no stored agent session id
+    #[test]
+    fn hint_hidden_when_no_stored_agent_session_id() {
+        // GIVEN a non-empty transcript AND no stored agent session id.
+        let has_messages = true;
+        let has_stored_agent_id = false;
+        let will_resume = false;
+        // WHEN the composer footer is rendered.
+        let show = show_resend_history_hint(
+            has_messages,
+            unresumable_stored_session(has_stored_agent_id, will_resume),
+        );
         // THEN the resend-history hint is not shown.
         assert!(!show);
     }
@@ -2331,6 +2148,21 @@ mod tests {
         assert!(!choice.closed_label.contains('·'));
         // Menu label remains harness-prefixed for grouped choices.
         assert!(choice.label.starts_with("Grok · "));
+    }
+
+    /// @spec chat/composer-footer Missing closed model label: Closed label is Missing when the effective model is not available
+    #[test]
+    fn closed_label_is_missing_when_the_effective_model_is_not_available() {
+        // GIVEN an effective model that is not available
+        let preferred = ModelRef::new("grok", "grok-4.5");
+        // WHEN the closed model control label is built
+        let with_preferred = missing_closed_model_choice(Some(&preferred));
+        let unconfigured = missing_closed_model_choice(None);
+        // THEN the label is Missing
+        assert_eq!(with_preferred.closed_label, "Missing");
+        assert_eq!(with_preferred.label, "Missing");
+        assert_eq!(unconfigured.closed_label, "Missing");
+        assert_eq!(unconfigured.label, "Missing");
     }
 
     #[test]
@@ -2408,7 +2240,10 @@ mod tests {
     fn known_claude_and_grok_tools_share_calm_labels() {
         // Claude-style names
         assert_eq!(
-            format_tool_summary("Read", r#"{"path":"crates/duckboard/src/widget/agent_chat.rs"}"#),
+            format_tool_summary(
+                "Read",
+                r#"{"path":"crates/duckboard/src/widget/agent_chat.rs"}"#
+            ),
             "Read · src/widget/agent_chat.rs"
         );
         assert_eq!(
@@ -2420,7 +2255,10 @@ mod tests {
             "Grep · \"format_tool_summary\""
         );
         assert_eq!(
-            format_tool_summary("Edit", r#"{"file_path":"src/state.rs","old_string":"a","new_string":"b"}"#),
+            format_tool_summary(
+                "Edit",
+                r#"{"file_path":"src/state.rs","old_string":"a","new_string":"b"}"#
+            ),
             "Edit · src/state.rs"
         );
 
@@ -2430,10 +2268,7 @@ mod tests {
             "Read · foo.rs"
         );
         assert_eq!(
-            format_tool_summary(
-                "run_terminal_command",
-                r#"{"command":"ds status"}"#
-            ),
+            format_tool_summary("run_terminal_command", r#"{"command":"ds status"}"#),
             "Shell · ds status"
         );
         assert_eq!(
@@ -2454,13 +2289,22 @@ mod tests {
         );
         assert_eq!(summary, "Some obscure tool · widget");
         assert!(!summary.contains('{'), "must not dump JSON: {summary}");
-        assert!(!summary.contains("nested"), "must not dump nested objects: {summary}");
+        assert!(
+            !summary.contains("nested"),
+            "must not dump nested objects: {summary}"
+        );
 
         // Empty / minimal input: name alone, still clean.
-        assert_eq!(format_tool_summary("camelCaseThing", ""), "Camel case thing");
+        assert_eq!(
+            format_tool_summary("camelCaseThing", ""),
+            "Camel case thing"
+        );
         assert_eq!(format_tool_summary("  ", r#"{}"#), "Tool");
         assert_eq!(
-            format_tool_summary("run_mystery", r#"{"old_string":"a\nb","new_string":"c\nd"}"#),
+            format_tool_summary(
+                "run_mystery",
+                r#"{"old_string":"a\nb","new_string":"c\nd"}"#
+            ),
             "Run mystery"
         );
     }
@@ -2485,6 +2329,43 @@ mod tests {
         assert!(
             !label.contains("run_terminal") && !label.contains("read_file"),
             "raw harness ids must not appear: {label}"
+        );
+    }
+
+    // @spec chat/transcript Host-choice tools omitted from Activity: AskUserQuestion tool content is omitted from Activity
+    #[test]
+    fn ask_user_question_tools_are_omitted_from_activity() {
+        assert!(is_host_choice_tool_name("AskUserQuestion"));
+        assert!(is_host_choice_tool_name("Ask user question"));
+        assert!(!is_host_choice_tool_name("Read"));
+
+        // GIVEN ToolUse/ToolResult for AskUserQuestion plus a real Read tool
+        let session = assistant_blocks(vec![
+            tool_use("q1", "AskUserQuestion", r#"{"questions":[]}"#),
+            tool_result("q1", "AskUserQuestion", "ok"),
+            tool_use("q2", "Ask user question", r#"{}"#),
+            tool_result("q2", "Ask user question", "ok"),
+            tool_use("r1", "Read", r#"{"path":"a.rs"}"#),
+            tool_result("r1", "Read", "file"),
+        ]);
+        // WHEN transcript segments are built
+        let segs = build_transcript_segments(&session);
+        // THEN no Ask user activity rows; Read still appears
+        let tools = activity_tools(&segs);
+        assert_eq!(tools.len(), 1, "tools={tools:?}");
+        assert!(
+            tools[0].summary.contains("Read"),
+            "expected Read only, got {:?}",
+            tools[0].summary
+        );
+        assert!(
+            segs.iter().all(|s| match s {
+                TranscriptSeg::Activity { tools, .. } => tools
+                    .iter()
+                    .all(|t| !t.summary.to_lowercase().contains("ask user")),
+                _ => true,
+            }),
+            "Ask user question must not appear in Activity: {segs:?}"
         );
     }
 
@@ -2604,10 +2485,16 @@ mod tests {
 
         // THEN the segments are Thinking, Activity, Thinking, Answer in order.
         assert_eq!(segs.len(), 4);
-        assert!(matches!(&segs[0], TranscriptSeg::Thinking { lines, .. } if lines == &["first thought".to_string()]));
+        assert!(
+            matches!(&segs[0], TranscriptSeg::Thinking { lines, .. } if lines == &["first thought".to_string()])
+        );
         assert!(matches!(&segs[1], TranscriptSeg::Activity { tools, .. } if tools.len() == 1));
-        assert!(matches!(&segs[2], TranscriptSeg::Thinking { lines, .. } if lines == &["second thought".to_string()]));
-        assert!(matches!(&segs[3], TranscriptSeg::Answer { lines, .. } if lines == &["final answer".to_string()]));
+        assert!(
+            matches!(&segs[2], TranscriptSeg::Thinking { lines, .. } if lines == &["second thought".to_string()])
+        );
+        assert!(
+            matches!(&segs[3], TranscriptSeg::Answer { lines, .. } if lines == &["final answer".to_string()])
+        );
     }
 
     /// @spec chat/transcript Segment construction: Live pending reasoning appears on an open Thinking segment
@@ -2750,11 +2637,7 @@ mod tests {
     #[test]
     fn thinking_collapsed_label_includes_line_count() {
         // GIVEN a Thinking segment whose body has a known number of lines.
-        let lines: Vec<String> = vec![
-            "line one".into(),
-            "line two".into(),
-            "line three".into(),
-        ];
+        let lines: Vec<String> = vec!["line one".into(), "line two".into(), "line three".into()];
 
         // WHEN the collapsed label for that segment is produced.
         let label = thinking_collapsed_label(&lines);
@@ -2855,6 +2738,590 @@ mod tests {
 
     // ── Segment → editor blocks ─────────────────────────────────────────
 
+    fn answer_block(text: &str) -> Block {
+        Block {
+            kind: BlockKind::Assistant,
+            label: "Answer".into(),
+            lines: if text.is_empty() {
+                vec![]
+            } else {
+                text.lines().map(String::from).collect()
+            },
+            is_priming: false,
+            is_live: false,
+        }
+    }
+
+    fn user_block(text: &str) -> Block {
+        Block {
+            kind: BlockKind::User,
+            label: "User".into(),
+            lines: vec![text.into()],
+            is_priming: false,
+            is_live: false,
+        }
+    }
+
+    // ── Viewer style / Classic Answer path ──────────────────────────────
+
+    /// @spec chat/viewer-style Classic Answer identity path: Effective classic presents Answer as one full body
+    #[test]
+    fn effective_classic_presents_answer_as_one_full_body() {
+        // GIVEN the effective viewer style is classic
+        // AND a settled Answer with body text
+        let style = ViewerStyle::Classic;
+        let block = answer_block("settled reply body");
+        assert_eq!(block.kind, BlockKind::Assistant);
+        assert!(!block.lines.is_empty());
+
+        // WHEN the Answer is presented
+        let source = block.lines.join("\n");
+        let mode = answer_body_presentation(style, false, &source);
+
+        // THEN the Answer uses the full-body classic presentation
+        assert_eq!(mode, AnswerBodyPresentation::ClassicFullBody);
+        assert!(block_presentation_uses_viewer_style(block.kind));
+        // Identity: Classic editor content is the full Answer body, not Focus slices.
+        assert_eq!(
+            answer_editor_desired_lines(&block, style),
+            block.lines.clone()
+        );
+    }
+
+    /// @spec chat/viewer-style Classic Answer identity path: Non-Answer segments ignore viewer style for presentation mode
+    #[test]
+    fn non_answer_segments_ignore_viewer_style_for_presentation_mode() {
+        // GIVEN the effective viewer style is classic or focus
+        // AND a transcript that includes User, Thinking, or Activity segments
+        let styles = [ViewerStyle::Classic, ViewerStyle::Focus];
+        let non_answer = [
+            BlockKind::User,
+            BlockKind::System,
+            BlockKind::Reasoning,
+            BlockKind::Activity,
+            BlockKind::ToolUse,
+            BlockKind::ToolResult,
+        ];
+
+        for style in styles {
+            // WHEN those non-Answer segments are presented
+            // THEN their presentation mode is not selected by the viewer style
+            for kind in non_answer {
+                assert!(
+                    !block_presentation_uses_viewer_style(kind),
+                    "{kind:?} must ignore viewer style (effective {style:?})"
+                );
+            }
+            // Answer still selects presentation via viewer style (for contrast).
+            assert!(block_presentation_uses_viewer_style(BlockKind::Assistant));
+            // Plain prose without trailing next stays Classic under Focus (passthrough).
+            assert_eq!(
+                answer_body_presentation(style, false, "hello"),
+                AnswerBodyPresentation::ClassicFullBody
+            );
+        }
+    }
+
+    fn sample_focus_answer_source() -> &'static str {
+        "\
+## Motivation
+
+Why.
+
+## Intent
+
+What.
+
+> **write**
+>
+> path
+
+# Preview
+
+> **next**
+>
+> `confirm`
+"
+    }
+
+    /// @spec chat/focus-answer When Focus applies: Live Answer under focus style uses classic presentation
+    #[test]
+    fn live_answer_under_focus_style_uses_classic_presentation() {
+        // GIVEN the effective viewer style is focus
+        // AND a live Answer segment
+        let src = sample_focus_answer_source();
+        // WHEN the Answer is presented
+        let mode = answer_body_presentation(ViewerStyle::Focus, true, src);
+        // THEN the Answer uses classic presentation
+        assert_eq!(mode, AnswerBodyPresentation::ClassicFullBody);
+    }
+
+    /// @spec chat/focus-answer When Focus applies: Settled Answer without trailing next uses classic passthrough
+    #[test]
+    fn settled_answer_without_trailing_next_uses_classic_passthrough() {
+        // GIVEN the effective viewer style is focus
+        // AND a settled Answer with no trailing `next` meta card
+        let src = "## Only\n\nbody without gate.\n";
+        // WHEN the Answer is presented
+        let mode = answer_body_presentation(ViewerStyle::Focus, false, src);
+        // THEN the Answer uses classic presentation
+        assert_eq!(mode, AnswerBodyPresentation::ClassicFullBody);
+    }
+
+    /// @spec chat/focus-answer When Focus applies: Settled Answer with trailing next uses Focus layout
+    #[test]
+    fn settled_answer_with_trailing_next_uses_focus_layout() {
+        // GIVEN the effective viewer style is focus
+        // AND a settled Answer that ends with a trailing `next` meta card
+        let src = sample_focus_answer_source();
+        // WHEN the Answer is presented
+        let mode = answer_body_presentation(ViewerStyle::Focus, false, src);
+        // THEN the Answer uses Focus layout
+        assert!(matches!(mode, AnswerBodyPresentation::FocusSectioned { .. }));
+    }
+
+    /// @spec chat/focus-answer Fold defaults and toggles: First sight collapses foldable sections and shows open region
+    #[test]
+    fn first_sight_collapses_foldable_sections_and_shows_open_region() {
+        use crate::focus_answer::{
+            focus_layout, range_line_count, section_key, sync_section_folds, FocusLayout,
+            SectionFoldState,
+        };
+        use std::collections::HashMap;
+
+        // GIVEN a settled Answer under Focus layout with at least one foldable section and an
+        // open region
+        // AND no user fold overrides for that Answer
+        let src = sample_focus_answer_source();
+        let FocusLayout::Sectioned { sections, open } = focus_layout(src) else {
+            panic!("expected sectioned");
+        };
+        assert!(!sections.is_empty());
+        let mut folds = HashMap::new();
+        // WHEN the Answer is first presented under Focus
+        sync_section_folds(&mut folds, &sections);
+        // THEN every foldable section is collapsed
+        // AND the open region is shown
+        for s in &sections {
+            let st = folds.get(&section_key(&s.kind)).expect("fold state");
+            assert!(st.collapsed);
+            assert!(!st.user_set);
+        }
+        assert!(range_line_count(open) > 0);
+        let _ = SectionFoldState {
+            collapsed: true,
+            user_set: false,
+        };
+    }
+
+    /// @spec chat/focus-answer Fold defaults and toggles: User expand survives rematerialize for the same section key
+    #[test]
+    fn user_expand_survives_rematerialize_for_the_same_section_key() {
+        use crate::focus_answer::{
+            focus_layout, section_key, sync_section_folds, toggle_section_fold, FocusLayout,
+        };
+        use std::collections::HashMap;
+
+        // GIVEN a Focus layout Answer with a foldable section the user has expanded
+        let src = sample_focus_answer_source();
+        let FocusLayout::Sectioned { sections, .. } = focus_layout(src) else {
+            panic!("expected sectioned");
+        };
+        let mut folds = HashMap::new();
+        sync_section_folds(&mut folds, &sections);
+        let key = section_key(&sections[0].kind);
+        toggle_section_fold(&mut folds, &key);
+        assert!(!folds[&key].collapsed);
+        assert!(folds[&key].user_set);
+
+        // WHEN the Answer is rematerialized with that section key still present
+        sync_section_folds(&mut folds, &sections);
+
+        // THEN that section remains expanded
+        assert!(!folds[&key].collapsed);
+        assert!(folds[&key].user_set);
+    }
+
+    /// @spec chat/focus-answer Fold defaults and toggles: Leaving Focus clears section fold state
+    #[test]
+    fn leaving_focus_clears_section_fold_state() {
+        use std::collections::HashMap;
+
+        // GIVEN Focus section fold state for one or more Answers
+        let mut folds: HashMap<usize, HashMap<String, crate::focus_answer::SectionFoldState>> =
+            HashMap::new();
+        folds.insert(
+            0,
+            HashMap::from([(
+                "2:Motivation".into(),
+                crate::focus_answer::SectionFoldState {
+                    collapsed: false,
+                    user_set: true,
+                },
+            )]),
+        );
+        // WHEN the effective viewer style is no longer focus
+        let style = ViewerStyle::Classic;
+        if style != ViewerStyle::Focus {
+            folds.clear();
+        }
+        // THEN all Focus section fold state is cleared
+        assert!(folds.is_empty());
+    }
+
+    /// @spec chat/focus-answer Focus slice presentation (Hybrid C): Open region uses classic Answer body paint
+    #[test]
+    fn open_region_uses_classic_answer_body_paint() {
+        // GIVEN a Focus layout Answer with an open region
+        let src = sample_focus_answer_source();
+        let mode = answer_body_presentation(ViewerStyle::Focus, false, src);
+        assert!(matches!(mode, AnswerBodyPresentation::FocusSectioned { .. }));
+        // WHEN the open region is presented
+        // THEN the open region uses classic Answer body paint
+        assert!(focus_slice_uses_classic_body_paint(FocusSliceKind::OpenRegion));
+        // Editor content for Focus is open-region lines only (TextEdit recipe surface).
+        let block = answer_block(src);
+        let desired = answer_editor_desired_lines(&block, ViewerStyle::Focus);
+        assert!(
+            !desired.is_empty(),
+            "open-region editor should hold open-region lines"
+        );
+        assert!(
+            desired.iter().any(|l| l.contains("**next**")),
+            "open-region editor should include trailing next: {desired:?}"
+        );
+        assert!(
+            desired.iter().all(|l| !l.starts_with("## ")),
+            "open-region editor should not include foldable H2 sections: {desired:?}"
+        );
+    }
+
+    /// @spec chat/focus-answer Focus slice presentation (Hybrid C): Expanded foldable section uses plain content presentation
+    #[test]
+    fn expanded_foldable_section_uses_plain_content_presentation() {
+        // GIVEN a Focus layout Answer with an expanded foldable section
+        let src = sample_focus_answer_source();
+        assert!(matches!(
+            answer_body_presentation(ViewerStyle::Focus, false, src),
+            AnswerBodyPresentation::FocusSectioned { .. }
+        ));
+        // WHEN that section body is presented
+        // THEN the section body uses plain content-font source presentation
+        // AND the section body does not use classic Answer body paint
+        assert!(!focus_slice_uses_classic_body_paint(
+            FocusSliceKind::ExpandedSection
+        ));
+        assert!(!focus_slice_uses_last_answer_band(
+            FocusSliceKind::ExpandedSection,
+            true
+        ));
+    }
+
+    /// @spec chat/focus-answer Focus slice presentation (Hybrid C): Collapsed preamble label uses line count form
+    #[test]
+    fn collapsed_preamble_label_uses_line_count_form() {
+        use crate::focus_answer::{section_collapsed_label, SectionKind};
+
+        // GIVEN a Focus layout Answer with a collapsed preamble section of known line count
+        let kind = SectionKind::Preamble;
+        let line_count = 4;
+        // WHEN the collapsed preamble header is presented
+        let label = section_collapsed_label(&kind, line_count);
+        // THEN the label includes that line count
+        assert!(
+            label.contains("4"),
+            "preamble label should include line count: {label}"
+        );
+        assert!(
+            label.to_lowercase().contains("preamble"),
+            "label: {label}"
+        );
+    }
+
+    /// @spec chat/focus-answer Last-answer band under Focus: Last Focus Answer bands only the open region
+    #[test]
+    fn last_focus_answer_bands_only_the_open_region() {
+        // GIVEN a Focus layout Answer that is the last-answer band target
+        // AND that Answer has an open region
+        assert!(matches!(
+            answer_body_presentation(ViewerStyle::Focus, false, sample_focus_answer_source()),
+            AnswerBodyPresentation::FocusSectioned { .. }
+        ));
+        // WHEN the Answer is presented
+        // THEN the open region has last-answer band styling
+        assert!(focus_slice_uses_last_answer_band(
+            FocusSliceKind::OpenRegion,
+            true
+        ));
+        // Non-last Focus Answer: no band on open region either.
+        assert!(!focus_slice_uses_last_answer_band(
+            FocusSliceKind::OpenRegion,
+            false
+        ));
+    }
+
+    /// @spec chat/focus-answer Last-answer band under Focus: Expanded section of last Focus Answer is not banded
+    #[test]
+    fn expanded_section_of_last_focus_answer_is_not_banded() {
+        // GIVEN a Focus layout Answer that is the last-answer band target
+        // AND an expanded foldable section on that Answer
+        assert!(matches!(
+            answer_body_presentation(ViewerStyle::Focus, false, sample_focus_answer_source()),
+            AnswerBodyPresentation::FocusSectioned { .. }
+        ));
+        // WHEN that section body is presented
+        // THEN the section body does not have last-answer band styling
+        assert!(!focus_slice_uses_last_answer_band(
+            FocusSliceKind::ExpandedSection,
+            true
+        ));
+    }
+
+    /// Smoke: switching stored style does not rewrite session messages.
+    #[test]
+    fn switching_viewer_style_does_not_rewrite_session_messages() {
+        let mut session = ChatSession::new("smoke".into());
+        session.messages.push(crate::chat_store::ChatMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text("hello".into())],
+            timestamp: String::new(),
+            is_priming: false,
+        });
+        session.messages.push(crate::chat_store::ChatMessage {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text("world".into())],
+            timestamp: String::new(),
+            is_priming: false,
+        });
+        let before = format!("{:?}", session.messages);
+
+        // Style lives on config; presentation helpers must not mutate the session.
+        let _classic = answer_body_presentation(ViewerStyle::Classic, false, "world");
+        let _focus = answer_body_presentation(ViewerStyle::Focus, false, "world");
+        let _doc = answer_body_presentation(ViewerStyle::Document, false, "world");
+
+        assert_eq!(format!("{:?}", session.messages), before);
+        assert_eq!(session.messages.len(), 2);
+    }
+
+    // ── Last Answer band target ─────────────────────────────────────────
+
+    /// @spec chat/answer-landmarks Last Answer contrast band: Sole latest non-empty Answer is the band target
+    #[test]
+    fn sole_latest_non_empty_answer_is_the_band_target() {
+        // GIVEN a transcript with more than one Answer segment that has non-empty body text
+        let blocks = vec![
+            user_block("q1"),
+            answer_block("first reply"),
+            user_block("q2"),
+            answer_block("second reply"),
+        ];
+
+        // WHEN the last-Answer band target is resolved
+        let target = last_answer_band_target(&blocks);
+
+        // THEN only the latest non-empty Answer is the band target
+        // AND every earlier Answer is not a band target
+        assert_eq!(target, Some(3));
+        assert_ne!(target, Some(1));
+    }
+
+    /// @spec chat/answer-landmarks Last Answer contrast band: Empty latest Answer is not a band target
+    #[test]
+    fn empty_latest_answer_is_not_a_band_target() {
+        // GIVEN a transcript whose latest Answer segment has empty body text
+        // AND an earlier Answer segment has non-empty body text
+        let blocks = vec![
+            answer_block("settled reply"),
+            answer_block(""), // empty latest
+        ];
+
+        // WHEN the last-Answer band target is resolved
+        let target = last_answer_band_target(&blocks);
+
+        // THEN the empty latest Answer is not the band target
+        // AND the latest non-empty Answer is the band target
+        assert_eq!(target, Some(0));
+        assert_ne!(target, Some(1));
+    }
+
+    fn thinking_block(text: &str) -> Block {
+        Block {
+            kind: BlockKind::Reasoning,
+            label: "Thinking".into(),
+            lines: vec![text.into()],
+            is_priming: false,
+            is_live: false,
+        }
+    }
+
+    fn activity_block() -> Block {
+        Block {
+            kind: BlockKind::Activity,
+            label: "1 tool".into(),
+            lines: vec!["· Read a.rs".into()],
+            is_priming: false,
+            is_live: false,
+        }
+    }
+
+    // ── Answer reply anchors ────────────────────────────────────────────
+
+    /// @spec chat/answer-landmarks Answer reply anchors: Only Answer blocks are reply anchors
+    #[test]
+    fn only_answer_blocks_are_reply_anchors() {
+        // GIVEN a transcript that mixes Answer segments with Thinking, Activity, or User
+        let blocks = vec![
+            user_block("q"),
+            thinking_block("why"),
+            activity_block(),
+            answer_block("a1"),
+            thinking_block("more"),
+            answer_block("a2"),
+        ];
+
+        // WHEN the reply-anchor list is built
+        let anchors = answer_block_indices(&blocks);
+
+        // THEN the anchors are exactly the Answer segments in transcript order
+        // AND no Thinking, Activity, or User segment is an anchor
+        assert_eq!(anchors, vec![3, 5]);
+    }
+
+    /// @spec chat/answer-landmarks Answer reply anchors: Prev and next step to adjacent Answer anchors
+    #[test]
+    fn prev_and_next_step_to_adjacent_answer_anchors() {
+        // GIVEN a transcript with at least three Answer anchors
+        // AND the current Answer is the middle of those three
+        let blocks = vec![
+            answer_block("a0"),
+            thinking_block("t"),
+            answer_block("a1"),
+            answer_block("a2"),
+        ];
+        let anchors = answer_block_indices(&blocks);
+        assert_eq!(anchors, vec![0, 2, 3]);
+        let current = Some(2); // middle Answer block index
+
+        // WHEN previous and next reply targets are resolved
+        let prev = prev_answer_idx(&anchors, current);
+        let next = next_answer_idx(&anchors, current);
+
+        // THEN previous is the Answer immediately before the current one
+        // AND next is the Answer immediately after the current one
+        assert_eq!(prev, Some(0));
+        assert_eq!(next, Some(3));
+    }
+
+    /// @spec chat/answer-landmarks Answer reply anchors: Prev at first and next at last yield no target
+    #[test]
+    fn prev_at_first_and_next_at_last_yield_no_target() {
+        // GIVEN a transcript with at least one Answer anchor
+        let blocks = vec![answer_block("only"), answer_block("last")];
+        let anchors = answer_block_indices(&blocks);
+        let first = anchors.first().copied();
+        let last = anchors.last().copied();
+
+        // WHEN previous is resolved from the first Answer and next is resolved from the last Answer
+        let prev = prev_answer_idx(&anchors, first);
+        let next = next_answer_idx(&anchors, last);
+
+        // THEN there is no previous target
+        // AND there is no next target
+        assert_eq!(prev, None);
+        assert_eq!(next, None);
+    }
+
+    // ── Viewport current for reply jumps ────────────────────────────────
+
+    /// @spec chat/answer-landmarks Viewport current for reply jumps: Stick-to-bottom treats the last Answer as current
+    #[test]
+    fn stick_to_bottom_treats_the_last_answer_as_current() {
+        // GIVEN a transcript with more than one Answer anchor
+        // AND the chat is stuck to the bottom
+        let anchors = vec![0, 2, 4];
+        let tops = [(0, 0.0), (2, 100.0), (4, 200.0)];
+
+        // WHEN the current Answer for reply jumps is resolved
+        let current = current_answer_for_reply_jumps(&anchors, &tops, 0.0, true);
+
+        // THEN the current Answer is the last Answer anchor
+        assert_eq!(current, Some(4));
+    }
+
+    /// @spec chat/answer-landmarks Viewport current for reply jumps: Scroll offset selects the Answer at or above the viewport top
+    #[test]
+    fn scroll_offset_selects_the_answer_at_or_above_the_viewport_top() {
+        // GIVEN a transcript with more than one Answer anchor with known tops
+        // AND the chat is not stuck to the bottom
+        // AND the viewport top lies at or below one Answer top and above the next
+        let anchors = vec![0, 2, 4];
+        let tops = [(0, 0.0), (2, 100.0), (4, 200.0)];
+        let offset_y = 150.0; // past Answer 2's top, before Answer 4's top
+
+        // WHEN the current Answer for reply jumps is resolved
+        let current = current_answer_for_reply_jumps(&anchors, &tops, offset_y, false);
+
+        // THEN the current Answer is the last Answer whose top is at or above the viewport top
+        assert_eq!(current, Some(2));
+    }
+
+    // ── Previous reply re-align ─────────────────────────────────────────
+
+    /// @spec chat/answer-landmarks Previous reply re-align: Viewport below current top targets current Answer
+    #[test]
+    fn viewport_below_current_top_targets_current_answer() {
+        // GIVEN a transcript with more than one Answer anchor with known tops
+        // AND a resolved current Answer
+        // AND the viewport top is strictly below that Answer's top
+        let anchors = vec![0, 2, 4];
+        let tops = [(0, 0.0), (2, 100.0), (4, 200.0)];
+        let current = Some(2);
+        let offset_y = 150.0; // below Answer 2's top (100)
+
+        // WHEN the previous reply target is resolved
+        let target = target_answer_for_reply_jump(&anchors, &tops, current, true, offset_y);
+
+        // THEN the target is the current Answer
+        assert_eq!(target, Some(2));
+    }
+
+    /// @spec chat/answer-landmarks Previous reply re-align: At current top previous targets prior Answer
+    #[test]
+    fn at_current_top_previous_targets_prior_answer() {
+        // GIVEN a transcript with more than one Answer anchor with known tops
+        // AND a resolved current Answer that is not the first
+        // AND the viewport top is at that Answer's top
+        let anchors = vec![0, 2, 4];
+        let tops = [(0, 0.0), (2, 100.0), (4, 200.0)];
+        let current = Some(2);
+        let offset_y = 100.0; // at Answer 2's top
+
+        // WHEN the previous reply target is resolved
+        let target = target_answer_for_reply_jump(&anchors, &tops, current, true, offset_y);
+
+        // THEN the target is the Answer immediately before the current one
+        assert_eq!(target, Some(0));
+    }
+
+    /// @spec chat/answer-landmarks Previous reply re-align: Next ignores re-align when below current top
+    #[test]
+    fn next_ignores_re_align_when_below_current_top() {
+        // GIVEN a transcript with more than one Answer anchor with known tops
+        // AND a resolved current Answer that is not the last
+        // AND the viewport top is strictly below that Answer's top
+        let anchors = vec![0, 2, 4];
+        let tops = [(0, 0.0), (2, 100.0), (4, 200.0)];
+        let current = Some(2);
+        let offset_y = 150.0; // below Answer 2's top
+
+        // WHEN the next reply target is resolved
+        let target = target_answer_for_reply_jump(&anchors, &tops, current, false, offset_y);
+
+        // THEN the target is the Answer immediately after the current one
+        assert_eq!(target, Some(4));
+    }
+
     #[test]
     fn blocks_from_segments_maps_calm_transcript_not_adjacency() {
         // Reasoning + tools + orphan-style pairing + answer become
@@ -2895,10 +3362,7 @@ mod tests {
         let mut states = Vec::new();
         sync_collapse_states(&mut states, &segs_live);
         assert_eq!(states.len(), 1);
-        assert!(
-            !states[0].collapsed,
-            "live Thinking should start expanded"
-        );
+        assert!(!states[0].collapsed, "live Thinking should start expanded");
         assert!(!states[0].user_set);
 
         // Intermediate: reasoning committed, still streaming, NO answer yet.
@@ -2914,7 +3378,10 @@ mod tests {
         let segs_committed = build_transcript_segments(&session);
         assert_eq!(segs_committed.len(), 1);
         assert!(
-            matches!(&segs_committed[0], TranscriptSeg::Thinking { live: true, .. }),
+            matches!(
+                &segs_committed[0],
+                TranscriptSeg::Thinking { live: true, .. }
+            ),
             "committed Thinking mid-stream with no Answer should stay live: {segs_committed:?}"
         );
         sync_collapse_states(&mut states, &segs_committed);
@@ -3041,10 +3508,7 @@ mod tests {
             "Thinking must stay expanded while following Activity is live"
         );
         assert!(!states[0].user_set);
-        assert!(
-            !states[1].collapsed,
-            "live Activity should start expanded"
-        );
+        assert!(!states[1].collapsed, "live Activity should start expanded");
     }
 
     #[test]
@@ -3093,15 +3557,14 @@ mod tests {
 
         // TurnComplete / settled: still collapsed, Activity settles too.
         session.pending_text.clear();
-        session.messages[0].content.push(ContentBlock::Text("final answer".into()));
+        session.messages[0]
+            .content
+            .push(ContentBlock::Text("final answer".into()));
         session.is_streaming = false;
         let segs_settled = build_transcript_segments(&session);
         sync_collapse_states(&mut states, &segs_settled);
         assert!(states[0].collapsed, "settled Thinking stays collapsed");
-        assert!(
-            states[1].collapsed,
-            "settled Activity should be collapsed"
-        );
+        assert!(states[1].collapsed, "settled Activity should be collapsed");
         assert!(!states[0].user_set);
     }
 

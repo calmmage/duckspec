@@ -20,13 +20,17 @@ pub mod title;
 pub mod worker;
 
 pub mod acp;
+pub mod agy;
 pub mod claude_code;
 pub mod grok;
+pub mod openai_codex;
 
 pub use cancel::CancelToken;
 pub use cwd::normalize_cwd;
 pub use error::Error;
-pub use event::{AgentEvent, Usage};
+pub use event::{
+    AgentEvent, PendingUserChoices, Usage, UserChoiceAnswer, UserChoiceOption, UserChoiceRequest,
+};
 pub use hook::{ContextHook, HookOutput};
 pub use provider::{
     Capabilities, ModelInfo, ModelRef, Provider, SlashCommand, SlashCommandKind,

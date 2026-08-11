@@ -4,6 +4,11 @@ Model choices carry an explicit harness identity that persists across restarts, 
 dispatch to the provider their model names, and the default model cascade resolves to
 grok-4.5.
 
+Model choices carry an explicit harness identity that persists across restarts, turns
+dispatch to the provider their model names, and the default model cascade prefers a
+per-chat pin, then a project override, then a global default — available only when that
+preferred model is in the process catalog.
+
 ## Requirement: Harness-tagged model identity
 
 A persisted model choice SHALL record both its harness and its model id and SHALL
@@ -19,7 +24,7 @@ as the Claude harness.
 - **THEN** the loaded choice names the same harness and model
 
 > test: code
-> - crates/duckchat/src/provider.rs:195
+> - crates/duckchat/src/provider.rs:211
 
 ### Scenario: A legacy bare model id loads as the Claude harness
 
@@ -28,33 +33,71 @@ as the Claude harness.
 - **THEN** the loaded choice names the Claude harness and that model
 
 > test: code
-> - crates/duckchat/src/provider.rs:206
+> - crates/duckchat/src/provider.rs:222
 
 ## Requirement: Default model resolution
 
-Resolving the model for a turn SHALL prefer a per-chat pin, then a project default, then a
-built-in default. When neither a per-chat pin nor a project default is set, resolution
-SHALL yield grok-4.5.
+Resolving the preferred model for a turn SHALL prefer a per-chat pin, then a project
+override, then a global default. The preferred model is **available** only when it is
+present in the process model catalog. When no preferred model is set at any cascade level,
+or the preferred model is absent from the catalog, the model for the turn is not
+available.
 
 > test: code
-
-### Scenario: An empty cascade resolves to grok-4.5
-
-- **GIVEN** neither a per-chat pin nor a project default
-- **WHEN** the model for a turn is resolved
-- **THEN** the resolved model is grok-4.5 on the grok harness
-
-> test: code
-> - crates/duckboard/src/area/interaction.rs:927
 
 ### Scenario: A per-chat pin overrides a project default
 
-- **GIVEN** a per-chat pin and a different project default
-- **WHEN** the model for a turn is resolved
-- **THEN** the resolved model is the per-chat pin
+- **GIVEN** a per-chat pin
+- **AND** a different project override
+- **AND** a different global default
+- **WHEN** the preferred model for a turn is resolved
+- **THEN** the preferred model is the per-chat pin
 
 > test: code
-> - crates/duckboard/src/area/interaction.rs:938
+> - crates/duckboard/src/area/interaction.rs:1350
+
+### Scenario: A project override is preferred over the global default
+
+- **GIVEN** no per-chat pin
+- **AND** a project override
+- **AND** a different global default
+- **WHEN** the preferred model for a turn is resolved
+- **THEN** the preferred model is the project override
+
+> test: code
+> - crates/duckboard/src/area/interaction.rs:1365
+
+### Scenario: The global default is preferred when pin and project override are unset
+
+- **GIVEN** no per-chat pin
+- **AND** no project override
+- **AND** a global default
+- **WHEN** the preferred model for a turn is resolved
+- **THEN** the preferred model is the global default
+
+> test: code
+> - crates/duckboard/src/area/interaction.rs:1379
+
+### Scenario: A preferred model absent from the catalog is not available
+
+- **GIVEN** a preferred model from the cascade
+- **AND** that model absent from the process model catalog
+- **WHEN** the effective model for a turn is resolved
+- **THEN** the model for the turn is not available
+
+> test: code
+> - crates/duckboard/src/area/interaction.rs:1392
+
+### Scenario: With no preferred model at any cascade level, the model is not available
+
+- **GIVEN** no per-chat pin
+- **AND** no project override
+- **AND** no global default
+- **WHEN** the effective model for a turn is resolved
+- **THEN** the model for the turn is not available
+
+> test: code
+> - crates/duckboard/src/area/interaction.rs:1411
 
 ## Requirement: Harness dispatch
 
@@ -70,7 +113,7 @@ of models offered for selection SHALL include the models of every registered har
 - **THEN** the provider that runs the turn is the one identified by that harness
 
 > test: code
-> - crates/duckboard/src/agent.rs:220
+> - crates/duckcore/src/agent.rs:442
 
 ### Scenario: The offered models span every registered harness
 
@@ -79,4 +122,60 @@ of models offered for selection SHALL include the models of every registered har
 - **THEN** the list includes models from every registered harness
 
 > test: code
-> - crates/duckboard/src/agent.rs:237
+> - crates/duckcore/src/agent.rs:465
+
+## Requirement: Global default model setting
+
+The application SHALL store a global main-chat default model as an application setting
+(not scoped to a project). When the global default is unset and the process model catalog
+is non-empty, the application SHALL seed the global default: prefer the former built-in
+model (`grok` / `grok-4.5`) when that model is in the catalog; otherwise use the first
+model in catalog order.
+
+> test: code
+
+### Scenario: A configured global default is stored as an application setting
+
+- **GIVEN** a harness-tagged model choice for the global main-chat default
+- **WHEN** the global default setting is saved
+- **THEN** that choice is stored as a global application setting
+
+> test: code
+> - crates/duckboard/src/config.rs:644
+
+### Scenario: An unset global default is seeded from the former built-in when that model is in the catalog
+
+- **GIVEN** no configured global default
+- **AND** a non-empty process model catalog that includes `grok` / `grok-4.5`
+- **WHEN** the global default is seeded
+- **THEN** the global default is `grok` / `grok-4.5`
+
+> test: code
+> - crates/duckcore/src/agent.rs:698
+
+### Scenario: An unset global default is seeded from the first catalog model when the former built-in is absent
+
+- **GIVEN** no configured global default
+- **AND** a non-empty process model catalog that does not include `grok` / `grok-4.5`
+- **WHEN** the global default is seeded
+- **THEN** the global default is the first model in catalog order
+
+> test: code
+> - crates/duckcore/src/agent.rs:721
+
+## Requirement: Send requires an available model
+
+A new main-chat turn SHALL NOT start when the effective model for the turn is not
+available. The application SHALL NOT invent a substitute model in that case.
+
+> test: code
+
+### Scenario: A turn does not start when the preferred model is not available
+
+- **GIVEN** an effective model that is not available
+- **WHEN** the user attempts to send a main-chat turn
+- **THEN** no new turn is started
+- **AND** no substitute model is chosen for the turn
+
+> test: code
+> - crates/duckboard/src/area/interaction.rs:1426

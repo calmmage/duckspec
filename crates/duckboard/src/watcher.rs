@@ -1,30 +1,11 @@
-//! File-system watcher with debouncing and .gitignore filtering.
-//!
-//! Watches the project root recursively, debounces events, filters through
-//! the ignore crate (respects .gitignore), and emits classified file events
-//! as an Iced subscription.
+//! iced subscription adapter around duckcore file watching.
 
 use std::hash::{Hash, Hasher};
-use std::path::{Path, PathBuf};
-use std::sync::mpsc;
-use std::time::Duration;
+use std::path::PathBuf;
 
-use ignore::gitignore::GitignoreBuilder;
-use notify_debouncer_mini::{DebouncedEventKind, new_debouncer};
+use tokio::sync::mpsc;
 
-// ── Event types ─────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone)]
-pub enum FileEvent {
-    /// File content was modified (or created — debouncer merges both).
-    Modified(PathBuf),
-    /// File or directory was removed.
-    Removed(PathBuf),
-    /// Git metadata changed outside duckboard (commit, checkout, ref update).
-    VcsStateChanged(PathBuf),
-}
-
-// ── Subscription ────────────────────────────────────────────────────────────
+pub use duckcore::watcher::FileEvent;
 
 /// Hashable wrapper so `Subscription::run_with` can deduplicate. Only
 /// `project_root` contributes to the hash — the subscription should survive
@@ -69,147 +50,16 @@ fn watch_stream(
         |mut sender: iced::futures::channel::mpsc::Sender<Vec<FileEvent>>| async move {
             use iced::futures::SinkExt;
 
-            // notify's debouncer sends to a std::sync::mpsc channel (blocking).
-            // We bridge it to the async world via a tokio mpsc channel and a
-            // dedicated background thread that does the blocking recv.
-            let (notify_tx, notify_rx) = mpsc::channel();
-            let (async_tx, mut async_rx) = tokio::sync::mpsc::channel::<Vec<FileEvent>>(32);
+            let (tx, mut rx) = mpsc::channel::<Vec<FileEvent>>(32);
+            let _handle = duckcore::watcher::spawn_watcher(project_root, duckspec_root, tx);
 
-            let mut debouncer = match new_debouncer(Duration::from_millis(250), notify_tx) {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::error!("failed to create file watcher: {e}");
-                    std::future::pending::<()>().await;
-                    return;
-                }
-            };
-
-            if let Err(e) = debouncer.watcher().watch(
-                &project_root,
-                notify_debouncer_mini::notify::RecursiveMode::Recursive,
-            ) {
-                tracing::error!("failed to watch {}: {e}", project_root.display());
-                std::future::pending::<()>().await;
-                return;
-            }
-
-            tracing::info!("file watcher active on {}", project_root.display());
-
-            let gitignore = build_gitignore(&project_root);
-
-            // Background thread: blocking recv from notify → async send.
-            std::thread::spawn(move || {
-                loop {
-                    match notify_rx.recv() {
-                        Ok(Ok(events)) => {
-                            let file_events: Vec<FileEvent> = events
-                                .into_iter()
-                                .filter_map(|ev| {
-                                    if let Some(vcs_ev) =
-                                        classify_vcs_state(&ev.path, &project_root)
-                                    {
-                                        return Some(vcs_ev);
-                                    }
-                                    if is_ignored(&ev.path, &gitignore, duckspec_root.as_deref()) {
-                                        return None;
-                                    }
-                                    classify(&ev.path, ev.kind)
-                                })
-                                .collect();
-
-                            if !file_events.is_empty()
-                                && async_tx.blocking_send(file_events).is_err()
-                            {
-                                break;
-                            }
-                        }
-                        Ok(Err(err)) => {
-                            tracing::warn!("file watcher error: {err}");
-                        }
-                        Err(_) => {
-                            tracing::debug!("file watcher notify channel closed");
-                            break;
-                        }
-                    }
-                }
-            });
-
-            // Async loop: forward from tokio channel to iced stream.
-            while let Some(file_events) = async_rx.recv().await {
+            while let Some(file_events) = rx.recv().await {
                 tracing::debug!(count = file_events.len(), "forwarding file events to UI");
                 if sender.send(file_events).await.is_err() {
                     tracing::debug!("file watcher iced receiver dropped");
                     break;
                 }
             }
-
-            // Keep debouncer alive so the watcher doesn't get dropped.
-            drop(debouncer);
         },
     )
-}
-
-// ── Helpers ─────────────────────────────────────────────────────────────────
-
-fn build_gitignore(project_root: &Path) -> ignore::gitignore::Gitignore {
-    let mut builder = GitignoreBuilder::new(project_root);
-    let gitignore_path = project_root.join(".gitignore");
-    if gitignore_path.exists() {
-        let _ = builder.add(&gitignore_path);
-    }
-    // Always ignore VCS and build internals even without a .gitignore.
-    let _ = builder.add_line(None, ".git/");
-    let _ = builder.add_line(None, ".jj/");
-    let _ = builder.add_line(None, "target/");
-    builder.build().unwrap_or_else(|e| {
-        tracing::warn!("failed to build gitignore matcher: {e}");
-        GitignoreBuilder::new(project_root).build().unwrap()
-    })
-}
-
-fn is_ignored(
-    path: &Path,
-    gitignore: &ignore::gitignore::Gitignore,
-    duckspec_root: Option<&Path>,
-) -> bool {
-    // The duckspec directory is duckboard's source of truth, so always observe
-    // events there even when the host project's .gitignore lists it.
-    if let Some(root) = duckspec_root
-        && path.starts_with(root)
-    {
-        return false;
-    }
-    let is_dir = path.is_dir();
-    gitignore
-        .matched_path_or_any_parents(path, is_dir)
-        .is_ignore()
-}
-
-/// Detect changes to git metadata that signal a commit, checkout, or ref
-/// update performed outside duckboard. These don't move the working tree, so
-/// the regular watcher wouldn't notice them — but the changed-files list
-/// depends on HEAD, so we trigger a refresh.
-fn classify_vcs_state(path: &Path, project_root: &Path) -> Option<FileEvent> {
-    let rel = path.strip_prefix(project_root).ok()?;
-    let mut comps = rel.components();
-    if comps.next()?.as_os_str() != ".git" {
-        return None;
-    }
-    let rest: PathBuf = comps.collect();
-    let is_state =
-        rest.starts_with("HEAD") || rest.starts_with("index") || rest.starts_with("refs");
-    is_state.then(|| FileEvent::VcsStateChanged(path.to_path_buf()))
-}
-
-fn classify(path: &Path, kind: DebouncedEventKind) -> Option<FileEvent> {
-    match kind {
-        DebouncedEventKind::Any => {
-            if path.exists() {
-                Some(FileEvent::Modified(path.to_path_buf()))
-            } else {
-                Some(FileEvent::Removed(path.to_path_buf()))
-            }
-        }
-        DebouncedEventKind::AnyContinuous | _ => None,
-    }
 }

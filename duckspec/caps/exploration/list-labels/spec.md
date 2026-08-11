@@ -24,7 +24,7 @@ leave the existing display name unchanged.
   exploration
 
 > test: code
-> - crates/duckboard/src/chat_store.rs:835
+> - crates/duckcore/src/chat_store.rs:932
 
 ### Scenario: Blank rename leaves the label unchanged
 
@@ -33,7 +33,7 @@ leave the existing display name unchanged.
 - **THEN** the exploration's list label remains `Cloud agent options`
 
 > test: code
-> - crates/duckboard/src/chat_store.rs:859
+> - crates/duckcore/src/chat_store.rs:957
 
 ## Requirement: Refresh retitles from the active session chat
 
@@ -64,7 +64,7 @@ exploration display name SHALL remain unchanged.
 - **AND** the exploration list label is `New direction`
 
 > test: code
-> - crates/duckboard/src/chat_store.rs:915
+> - crates/duckcore/src/chat_store.rs:1015
 
 ### Scenario: Refresh input includes later user turns when present
 
@@ -74,7 +74,7 @@ exploration display name SHALL remain unchanged.
 - **THEN** the summarizer input includes the later user message, not only `Hello`
 
 > test: code
-> - crates/duckboard/src/chat_store.rs:873
+> - crates/duckcore/src/chat_store.rs:972
 
 ### Scenario: Refresh with no summarizable content leaves labels unchanged
 
@@ -85,7 +85,7 @@ exploration display name SHALL remain unchanged.
 - **AND** the session title is left unchanged
 
 > test: code
-> - crates/duckboard/src/chat_store.rs:891
+> - crates/duckcore/src/chat_store.rs:990
 
 ### Scenario: Failed or empty refresh leaves labels unchanged
 
@@ -96,4 +96,4 @@ exploration display name SHALL remain unchanged.
 - **AND** the session title remains the prior non-empty title
 
 > test: code
-> - crates/duckboard/src/chat_store.rs:947
+> - crates/duckcore/src/chat_store.rs:1048

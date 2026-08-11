@@ -3,3 +3,6 @@
 .DS_Store
 # Local convenience shim for the Just task runner.
 Makefile
+# Local agent notes (fork workflow); auto-loaded, not for upstream.
+CLAUDE.local.md
+claude.local.md

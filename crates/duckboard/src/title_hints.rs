@@ -148,6 +148,7 @@ mod tests {
                 cap_tree: vec![],
                 steps,
                 reviews: vec![],
+                shallow_mtime_nanos: None,
             }],
             ..Default::default()
         }

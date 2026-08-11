@@ -1,6 +1,8 @@
 //! Long-lived duplex `claude` child: open, prompt, cancel/kill.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -9,9 +11,22 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
+use super::ask_user::{
+    self, ASK_USER_QUESTION, PermissionDecision, encode_control_response, parse_control_permission,
+};
 use super::map::claude_line_to_updates;
 use super::protocol::ProtocolMsg;
 use super::spawn::build_claude_command;
+
+/// Async resolver for Claude control permission / canUseTool requests.
+/// `(request_id, tool_name, tool_input) → decision`.
+pub type PermissionResolver<'a> = dyn FnMut(
+        String,
+        String,
+        Value,
+    ) -> Pin<Box<dyn Future<Output = Result<PermissionDecision, DuplexError>> + Send + 'a>>
+    + Send
+    + 'a;
 
 /// Arguments used when spawning an inner Claude process.
 #[derive(Debug, Clone)]
@@ -86,15 +101,16 @@ impl std::fmt::Display for DuplexError {
 }
 
 impl ClaudeDuplex {
+    /// Test helper: [`open_with_first_prompt_resolved`] with auto-allow for all
+    /// control permissions (no parent AskUserQuestion bridge).
+    ///
     /// Spawn Claude, write the first user message, then read init + stream until
     /// `result`. Live `claude` only emits a session id after user content, so
     /// this path never waits for init before write.
     ///
-    /// Profile updates are delivered via `on_update` as each Claude line is
-    /// mapped (not batched until the end).
-    ///
     /// `resume`: `None` for a fresh conversation; `Some(id)` for `--resume`.
     /// Missing resume sessions surface as [`DuplexError::SessionNotFound`].
+    #[cfg(test)]
     pub async fn open_with_first_prompt(
         factory: &ClaudeSpawnFactory,
         cwd: &Path,
@@ -104,13 +120,44 @@ impl ClaudeDuplex {
         content: Vec<Value>,
         on_update: &mut (dyn FnMut(Value) + Send),
     ) -> Result<Self, DuplexError> {
+        let mut auto = |_rid: String, _name: String, _input: Value| {
+            Box::pin(async { Ok(ask_user::auto_allow_ordinary_tool()) })
+                as Pin<Box<dyn Future<Output = Result<PermissionDecision, DuplexError>> + Send>>
+        };
+        Self::open_with_first_prompt_resolved(
+            factory,
+            cwd,
+            resume,
+            model,
+            bypass_permissions,
+            content,
+            on_update,
+            &mut auto,
+        )
+        .await
+    }
+
+    /// Spawn Claude, write the first user message, then stream until `result`,
+    /// with an explicit control-permission resolver (ACP parent answers
+    /// AskUserQuestion mid-turn).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_with_first_prompt_resolved(
+        factory: &ClaudeSpawnFactory,
+        cwd: &Path,
+        resume: Option<&str>,
+        model: Option<&str>,
+        bypass_permissions: bool,
+        content: Vec<Value>,
+        on_update: &mut (dyn FnMut(Value) + Send),
+        resolve: &mut PermissionResolver<'_>,
+    ) -> Result<Self, DuplexError> {
         let args = ClaudeSpawnArgs {
             cwd: cwd.to_path_buf(),
             resume: resume.map(str::to_string),
             model: model.map(str::to_string),
             bypass_permissions,
         };
-        match Self::spawn_write_and_stream(factory, args, content, on_update).await {
+        match Self::spawn_write_and_stream(factory, args, content, on_update, resolve).await {
             Err(DuplexError::Process(m)) if resume.is_some() && looks_like_missing_session(&m) => {
                 Err(DuplexError::SessionNotFound(m))
             }
@@ -127,6 +174,7 @@ impl ClaudeDuplex {
         args: ClaudeSpawnArgs,
         content: Vec<Value>,
         on_update: &mut (dyn FnMut(Value) + Send),
+        resolve: &mut PermissionResolver<'_>,
     ) -> Result<Self, DuplexError> {
         let mut cmd = factory(&args);
         let mut child = cmd
@@ -156,7 +204,10 @@ impl ClaudeDuplex {
             session_id: initial_id,
         };
 
-        if let Err(e) = duplex.prompt(content, on_update).await {
+        if let Err(e) = duplex
+            .prompt_with_resolver(content, on_update, resolve)
+            .await
+        {
             let _ = duplex.child.kill().await;
             // Resume miss often arrives as process/protocol error on first write.
             if args.resume.is_some() {
@@ -183,14 +234,34 @@ impl ClaudeDuplex {
         Ok(duplex)
     }
 
-    /// Write one user message and stream mapped profile updates until `result`.
-    ///
-    /// Each mapped update is delivered via `on_update` as soon as its Claude
-    /// line is read — before the prompt result is known.
+    /// Test helper: [`prompt_with_resolver`] with auto-allow for all control
+    /// permissions (no parent AskUserQuestion bridge).
+    #[cfg(test)]
     pub async fn prompt(
         &mut self,
         content: Vec<Value>,
         on_update: &mut (dyn FnMut(Value) + Send),
+    ) -> Result<(), DuplexError> {
+        let mut auto = |_rid: String, _name: String, _input: Value| {
+            Box::pin(async { Ok(ask_user::auto_allow_ordinary_tool()) })
+                as Pin<Box<dyn Future<Output = Result<PermissionDecision, DuplexError>> + Send>>
+        };
+        self.prompt_with_resolver(content, on_update, &mut auto)
+            .await
+    }
+
+    /// Write one user message and stream mapped profile updates until `result`.
+    ///
+    /// Each mapped update is delivered via `on_update` as soon as its Claude
+    /// line is read — before the prompt result is known.
+    ///
+    /// Control / permission lines are resolved via `resolve` (AskUserQuestion →
+    /// parent choice; ordinary tools → auto-allow).
+    pub async fn prompt_with_resolver(
+        &mut self,
+        content: Vec<Value>,
+        on_update: &mut (dyn FnMut(Value) + Send),
+        resolve: &mut PermissionResolver<'_>,
     ) -> Result<(), DuplexError> {
         let stream_msg = json!({
             "type": "user",
@@ -225,7 +296,27 @@ impl ClaudeDuplex {
             if trimmed.is_empty() {
                 continue;
             }
-            let msg: ProtocolMsg = match serde_json::from_str(trimmed) {
+
+            // Prefer raw Value so control requests are not dropped by typed parse.
+            let raw: Value = match serde_json::from_str(trimmed) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            if let Some((request_id, tool_name, tool_input)) = parse_control_permission(&raw) {
+                let decision = if tool_name == ASK_USER_QUESTION {
+                    // Host chips own the UI — do not emit tool_call Activity chrome.
+                    resolve(request_id.clone(), tool_name, tool_input).await?
+                } else {
+                    // Ordinary tools: never park on host UI (bypass path).
+                    ask_user::auto_allow_ordinary_tool()
+                };
+                let reply = encode_control_response(&request_id, &decision);
+                self.write_claude_line(&reply).await?;
+                continue;
+            }
+
+            let msg: ProtocolMsg = match serde_json::from_value(raw) {
                 Ok(m) => m,
                 Err(_) => continue,
             };
@@ -252,6 +343,21 @@ impl ClaudeDuplex {
                 break;
             }
         }
+        Ok(())
+    }
+
+    async fn write_claude_line(&mut self, msg: &Value) -> Result<(), DuplexError> {
+        let mut line = serde_json::to_string(msg)
+            .map_err(|e| DuplexError::Process(format!("encode control response: {e}")))?;
+        line.push('\n');
+        self.stdin
+            .write_all(line.as_bytes())
+            .await
+            .map_err(|e| DuplexError::Process(format!("write control response: {e}")))?;
+        self.stdin
+            .flush()
+            .await
+            .map_err(|e| DuplexError::Process(format!("flush control response: {e}")))?;
         Ok(())
     }
 
@@ -350,7 +456,6 @@ for line in sys.stdin:
             cmd
         })
     }
-
 
     #[tokio::test]
     async fn open_with_first_prompt_surfaces_native_session_id() {

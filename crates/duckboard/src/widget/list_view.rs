@@ -2,15 +2,15 @@
 //!
 //! Two layers:
 //!
-//! - [`ListRow`] — builder for a single row (leading + icon + label). Used
-//!   standalone by file_finder and slash-completion for visual consistency.
+//! - [`ListRow`] — builder for a single row (leading + icon + label [+ trailing]).
+//!   Used standalone by file_finder and slash-completion for visual consistency.
 //! - [`view`] — renders `Vec<ListRow>` as a column, with empty-state text.
 //!   Callers own scrolling and section wrapping (`collapsible::view`).
 //!
 //! Error state is conveyed by coloring the label and icon red via the
-//! [`ListRow::errored`] setter. Rows carry no trailing indicators, so
-//! horizontal panning (see [`super::horizontal_pan`]) can scroll freely
-//! without hiding per-row affordances.
+//! [`ListRow::errored`] setter. Optional [`ListRow::trailing`] content sits
+//! after the label at natural content width (end-of-name for shrink-width
+//! pan rows) so horizontal panning still reveals full labels.
 
 use std::borrow::Cow;
 
@@ -28,6 +28,8 @@ type StyleFn = fn(&iced::Theme, button::Status) -> button::Style;
 
 pub struct ListRow<'a, Msg> {
     label: Cow<'a, str>,
+    /// When set, replaces the string label (e.g. an inline rename field).
+    label_content: Option<Element<'a, Msg>>,
     icon: Option<&'static [u8]>,
     icon_tint: Option<Color>,
     leading: Option<Element<'a, Msg>>,
@@ -36,6 +38,10 @@ pub struct ListRow<'a, Msg> {
     /// for decorations/actions that attach to the row's subject, not to its
     /// leading gutter.
     after_icon: Option<Element<'a, Msg>>,
+    /// Element after the label (end-of-name / natural content end). Prefer
+    /// this for hover actions that must not occupy the after-icon slot
+    /// (reserved for subject decorations like future fav marks).
+    trailing: Option<Element<'a, Msg>>,
     indent_level: usize,
     selected: bool,
     errored: bool,
@@ -54,10 +60,12 @@ impl<'a, Msg: Clone + 'a> ListRow<'a, Msg> {
     pub fn new(label: impl Into<Cow<'a, str>>) -> Self {
         Self {
             label: label.into(),
+            label_content: None,
             icon: None,
             icon_tint: None,
             leading: None,
             after_icon: None,
+            trailing: None,
             indent_level: 0,
             selected: false,
             errored: false,
@@ -103,6 +111,18 @@ impl<'a, Msg: Clone + 'a> ListRow<'a, Msg> {
 
     pub fn after_icon(mut self, el: Element<'a, Msg>) -> Self {
         self.after_icon = Some(el);
+        self
+    }
+
+    /// Replace the string label with a custom element (inline rename, etc.).
+    pub fn label_content(mut self, el: Element<'a, Msg>) -> Self {
+        self.label_content = Some(el);
+        self
+    }
+
+    /// Content after the label at natural content width.
+    pub fn trailing(mut self, el: Element<'a, Msg>) -> Self {
+        self.trailing = Some(el);
         self
     }
 
@@ -163,15 +183,23 @@ impl<'a, Msg: Clone + 'a> ListRow<'a, Msg> {
             inner = inner.push(after_icon);
         }
 
-        let mut label = text(self.label)
-            .size(theme::font_md())
-            .wrapping(Wrapping::None);
-        if self.errored {
-            label = label.color(theme::error());
-        } else if let Some(tint) = self.tint {
-            label = label.color(tint);
+        if let Some(label_content) = self.label_content {
+            inner = inner.push(label_content);
+        } else {
+            let mut label = text(self.label)
+                .size(theme::font_md())
+                .wrapping(Wrapping::None);
+            if self.errored {
+                label = label.color(theme::error());
+            } else if let Some(tint) = self.tint {
+                label = label.color(tint);
+            }
+            inner = inner.push(label);
         }
-        inner = inner.push(label);
+
+        if let Some(trailing) = self.trailing {
+            inner = inner.push(trailing);
+        }
 
         let content: Element<'a, Msg> = if self.indent_level > 0 {
             let indent = (self.indent_level as f32) * theme::SPACING_LG;

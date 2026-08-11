@@ -21,6 +21,53 @@ pub struct State {
     /// now armed; the next matching `DeleteRecentData` commits and wipes
     /// the project's on-disk data dir.
     pub armed_delete_recent: Option<PathBuf>,
+    /// Filter-law expand flags (resting = shortlist). Reset on project open.
+    pub expanded_changes: bool,
+    pub expanded_explorations: bool,
+    /// When the Archived section is open, show the full newest-first list
+    /// instead of the N-row prefix shortlist.
+    pub expanded_archived: bool,
+    /// Archived section body visible. Default **false** (header only).
+    pub archived_open: bool,
+    /// Warm scope → latest chat activity (unix nanos). Recomputed on project
+    /// open, project reload/watcher reconcile, and session write/flush —
+    /// never by loading sessions inside the paint path.
+    pub chat_activity: HashMap<String, i128>,
+}
+
+impl State {
+    /// Clear expand flags, recent-row chrome, and warm activity when a project
+    /// is opened. Caller should follow with [`Self::refresh_chat_activity`].
+    pub fn on_project_opened(&mut self) {
+        self.expanded_changes = false;
+        self.expanded_explorations = false;
+        self.expanded_archived = false;
+        self.archived_open = false;
+        self.hovered_recent = None;
+        self.armed_delete_recent = None;
+        self.chat_activity.clear();
+    }
+
+    /// Full recompute of the warm activity map for Dashboard ranking scopes.
+    pub fn refresh_chat_activity(
+        &mut self,
+        project: &ProjectData,
+        explorations: &[crate::chat_store::Exploration],
+    ) {
+        self.chat_activity = crate::dashboard_digest::collect_chat_activity(
+            project.project_root.as_deref(),
+            crate::dashboard_digest::dashboard_scopes(project, explorations),
+        );
+    }
+
+    /// Fold one session's attention into the warm map (post-write / post-flush).
+    pub fn note_session_activity(&mut self, session: &crate::chat_store::ChatSession) {
+        let t = crate::dashboard_digest::session_attention_nanos(session);
+        self.chat_activity
+            .entry(session.scope.clone())
+            .and_modify(|v| *v = (*v).max(t))
+            .or_insert(t);
+    }
 }
 
 // ── Messages ─────────────────────────────────────────────────────────────────
@@ -31,6 +78,12 @@ pub enum Message {
     ArchivedChangeClicked(String),
     ExplorationClicked(String),
     AddExploration,
+    ToggleExpandChanges,
+    ToggleExpandExplorations,
+    /// Toggle Archived section open/closed (collapsed by default).
+    ToggleArchivedOpen,
+    /// Within an open Archived section: shortlist vs full list.
+    ToggleExpandArchived,
     SelectAuditError {
         change: String,
         artifact_id: String,
@@ -68,6 +121,7 @@ pub fn view<'a>(
     explorations: &'a [crate::chat_store::Exploration],
     recent_projects: &'a [PathBuf],
     idea_format_errors: &'a HashMap<PathBuf, Vec<String>>,
+    dirty: &'a [crate::vcs::ChangedFile],
 ) -> Element<'a, Message> {
     let header = view_header(project);
 
@@ -80,7 +134,7 @@ pub fn view<'a>(
         .height(Length::Fill)
         .into()
     } else {
-        let items = view_items_panel(project, explorations);
+        let items = view_items_panel(state, project, explorations, dirty);
         let audit = view_audit_panel(project, idea_format_errors);
 
         let divider = container(Space::new().height(Length::Fill))
@@ -405,46 +459,175 @@ fn recent_row_idle_bg(_theme: &iced::Theme) -> container::Style {
 // ── Items panel (left) ─────────────────────────────────────────────────────
 
 fn view_items_panel<'a>(
+    state: &'a State,
     project: &'a ProjectData,
     explorations: &'a [crate::chat_store::Exploration],
+    dirty: &'a [crate::vcs::ChangedFile],
 ) -> Element<'a, Message> {
     let mut content = column![].spacing(theme::SPACING_LG);
 
-    // ── Active Changes ──────────────────────────────────────────────────
-    if !project.active_changes.is_empty() {
-        let mut list = column![].spacing(2.0);
-        for change in &project.active_changes {
-            let step_count = change.steps.len();
-            let detail = if step_count > 0 {
-                format!(
-                    "{} step{}",
-                    step_count,
-                    if step_count == 1 { "" } else { "s" }
-                )
-            } else {
-                String::new()
-            };
-            let error_count = project
-                .validations
-                .get(&change.name)
-                .map(|v| v.total_count())
-                .unwrap_or(0);
-            list = list.push(change_row(
-                &change.name,
-                &detail,
-                error_count,
-                Message::ChangeClicked(change.name.clone()),
-            ));
+    let day_seed = crate::dashboard_digest::local_day_seed();
+    // Ranking reads the warm map only — no session file I/O on paint.
+    let ranked_changes =
+        crate::dashboard_digest::ranked_change_names(project, &state.chat_activity);
+    let ranked_exps =
+        crate::dashboard_digest::ranked_exploration_ids(explorations, &state.chat_activity);
+
+    // Single section plan — only allowlisted names from dashboard_digest.
+    let has_changes = !project.active_changes.is_empty();
+    let show_explorations = true; // always: New Exploration control
+    let has_archived =
+        crate::area::change::has_archived_section(&project.archived_changes, explorations, dirty);
+    let section_plan = crate::dashboard_digest::dashboard_left_section_names(
+        has_changes,
+        show_explorations,
+        has_archived,
+    );
+    debug_assert!(
+        section_plan
+            .iter()
+            .all(|n| crate::dashboard_digest::is_dashboard_left_section(n))
+    );
+
+    for section_name in section_plan {
+        match section_name {
+            "Changes" => {
+                content = content.push(view_changes_section(
+                    state,
+                    project,
+                    &ranked_changes,
+                    &day_seed,
+                ));
+            }
+            "Explorations" => {
+                content = content.push(view_explorations_section(
+                    state,
+                    explorations,
+                    &ranked_exps,
+                    &day_seed,
+                ));
+            }
+            "Archived" => {
+                content = content.push(view_archived_section(
+                    state,
+                    project,
+                    explorations,
+                    dirty,
+                ));
+            }
+            other => {
+                // Refuse unknown headings — section plan is the sole allowlist.
+                debug_assert!(
+                    false,
+                    "unexpected dashboard left section {other:?}"
+                );
+            }
         }
-        content = content.push(section("Changes", list.into()));
     }
 
-    // ── Explorations ────────────────────────────────────────────────────
-    // Explorations owned by an idea are hidden here; they surface on the
-    // Ideas list instead.
+    scrollable(content.width(Length::Fill))
+        .direction(theme::thin_scrollbar_direction())
+        .style(theme::thin_scrollbar)
+        .height(Length::Fill)
+        .width(Length::Fill)
+        .into()
+}
+
+fn view_changes_section<'a>(
+    state: &'a State,
+    project: &'a ProjectData,
+    ranked_changes: &[String],
+    day_seed: &str,
+) -> Element<'a, Message> {
+    let change_by_name: HashMap<&str, &crate::data::ChangeData> = project
+        .active_changes
+        .iter()
+        .map(|c| (c.name.as_str(), c))
+        .collect();
+    let slice = crate::dashboard_digest::filter_law_slice(
+        ranked_changes,
+        state.expanded_changes,
+        day_seed,
+    );
+    let mut list = column![].spacing(2.0);
+    for name in &slice.visible {
+        let Some(change) = change_by_name.get(name.as_str()) else {
+            continue;
+        };
+        let step_count = change.steps.len();
+        let detail = if step_count > 0 {
+            format!(
+                "{} step{}",
+                step_count,
+                if step_count == 1 { "" } else { "s" }
+            )
+        } else {
+            String::new()
+        };
+        let error_count = project
+            .validations
+            .get(&change.name)
+            .map(|v| v.total_count())
+            .unwrap_or(0);
+        list = list.push(change_row(
+            &change.name,
+            &detail,
+            error_count,
+            Message::ChangeClicked(change.name.clone()),
+        ));
+    }
+    if let Some(n) = slice.more_count {
+        list = list.push(overflow_row(
+            format!("\u{2026} {n} more"),
+            Message::ToggleExpandChanges,
+        ));
+    } else if state.expanded_changes
+        && ranked_changes.len() > crate::dashboard_digest::SHORTLIST_N
+    {
+        list = list.push(overflow_row(
+            "show less".into(),
+            Message::ToggleExpandChanges,
+        ));
+    }
+    section("Changes", list.into())
+}
+
+fn view_explorations_section<'a>(
+    state: &'a State,
+    explorations: &'a [crate::chat_store::Exploration],
+    ranked_exps: &[String],
+    day_seed: &str,
+) -> Element<'a, Message> {
+    // New Exploration stays below the shortlist and is never counted in N.
+    let exp_by_id: HashMap<&str, &crate::chat_store::Exploration> =
+        explorations.iter().map(|e| (e.id.as_str(), e)).collect();
+    let exp_slice = crate::dashboard_digest::filter_law_slice(
+        ranked_exps,
+        state.expanded_explorations,
+        day_seed,
+    );
     let mut exp_list = column![].spacing(2.0);
-    for exp in explorations.iter().filter(|e| e.idea_path.is_none()) {
+    for id in &exp_slice.visible {
+        let Some(exp) = exp_by_id.get(id.as_str()) else {
+            continue;
+        };
+        if !exp.is_on_live_list() {
+            continue;
+        }
         exp_list = exp_list.push(exploration_row(&exp.id, &exp.display_name));
+    }
+    if let Some(n) = exp_slice.more_count {
+        exp_list = exp_list.push(overflow_row(
+            format!("\u{2026} {n} more"),
+            Message::ToggleExpandExplorations,
+        ));
+    } else if state.expanded_explorations
+        && ranked_exps.len() > crate::dashboard_digest::SHORTLIST_N
+    {
+        exp_list = exp_list.push(overflow_row(
+            "show less".into(),
+            Message::ToggleExpandExplorations,
+        ));
     }
     let plus_icon = svg(svg::Handle::from_memory(
         crate::widget::collapsible::ICON_PLUS,
@@ -468,28 +651,90 @@ fn view_items_panel<'a>(
     .width(Length::Fill);
     exp_list = exp_list.push(Space::new().height(theme::SPACING_SM));
     exp_list = exp_list.push(new_btn);
-    content = content.push(section("Explorations", exp_list.into()));
+    section("Explorations", exp_list.into())
+}
 
-    // ── Archived ────────────────────────────────────────────────────────
-    if !project.archived_changes.is_empty() {
+fn view_archived_section<'a>(
+    state: &'a State,
+    project: &'a ProjectData,
+    explorations: &'a [crate::chat_store::Exploration],
+    dirty: &'a [crate::vcs::ChangedFile],
+) -> Element<'a, Message> {
+    let entries =
+        crate::area::change::archived_entries(&project.archived_changes, explorations, dirty);
+    let ranked_ids: Vec<String> = entries
+        .iter()
+        .map(|e| match e {
+            crate::area::change::ArchivedEntry::Change(c) => c.name.clone(),
+            crate::area::change::ArchivedEntry::Exploration(exp) => exp.id.clone(),
+        })
+        .collect();
+    let total = ranked_ids.len();
+    let header_label = if state.archived_open {
+        "Archived".to_string()
+    } else {
+        format!("Archived \u{00b7} {total}")
+    };
+    let header = button(
+        text(header_label)
+            .size(SECTION_HEADING_SIZE)
+            .color(theme::text_primary()),
+    )
+    .on_press(Message::ToggleArchivedOpen)
+    .padding([0.0, theme::SPACING_SM])
+    .style(theme::list_item);
+
+    let mut body = column![header];
+    if state.archived_open {
+        let slice = crate::dashboard_digest::archive_filter_law_slice(
+            &ranked_ids,
+            state.expanded_archived,
+        );
+        let by_id: HashMap<&str, &crate::area::change::ArchivedEntry<'_>> = entries
+            .iter()
+            .map(|e| {
+                let key: &str = match e {
+                    crate::area::change::ArchivedEntry::Change(c) => c.name.as_str(),
+                    crate::area::change::ArchivedEntry::Exploration(exp) => exp.id.as_str(),
+                };
+                (key, e)
+            })
+            .collect();
         let mut list = column![].spacing(2.0);
-        for change in &project.archived_changes {
-            list = list.push(change_row(
-                &change.name,
-                "",
-                0,
-                Message::ArchivedChangeClicked(change.name.clone()),
+        for id in &slice.visible {
+            let Some(entry) = by_id.get(id.as_str()) else {
+                continue;
+            };
+            match entry {
+                crate::area::change::ArchivedEntry::Change(change) => {
+                    list = list.push(change_row(
+                        &change.name,
+                        "",
+                        0,
+                        Message::ArchivedChangeClicked(change.name.clone()),
+                    ));
+                }
+                crate::area::change::ArchivedEntry::Exploration(exp) => {
+                    list = list.push(exploration_row(&exp.id, &exp.display_name));
+                }
+            }
+        }
+        if let Some(n) = slice.more_count {
+            list = list.push(overflow_row(
+                format!("\u{2026} {n} more"),
+                Message::ToggleExpandArchived,
+            ));
+        } else if state.expanded_archived && total > crate::dashboard_digest::SHORTLIST_N {
+            list = list.push(overflow_row(
+                "show less".into(),
+                Message::ToggleExpandArchived,
             ));
         }
-        content = content.push(section("Archived", list.into()));
+        body = body
+            .push(Space::new().height(theme::SPACING_SM))
+            .push(list);
     }
-
-    scrollable(content.width(Length::Fill))
-        .direction(theme::thin_scrollbar_direction())
-        .style(theme::thin_scrollbar)
-        .height(Length::Fill)
-        .width(Length::Fill)
-        .into()
+    body.spacing(0.0).into()
 }
 
 // ── Audit panel (right) ────────────────────────────────────────────────────
@@ -919,6 +1164,49 @@ fn section<'a>(title: &'a str, body: Element<'a, Message>) -> Element<'a, Messag
     ]
     .spacing(0.0)
     .into()
+}
+
+fn overflow_row<'a>(label: String, msg: Message) -> Element<'a, Message> {
+    button(
+        text(label)
+            .size(theme::font_sm())
+            .color(theme::text_muted()),
+    )
+    .on_press(msg)
+    .width(Length::Fill)
+    .padding([theme::SPACING_SM, theme::SPACING_MD])
+    .style(theme::list_item)
+    .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // @spec shell/dashboard-digest Expand state lifecycle: Project switch resets expand flags
+    #[test]
+    fn project_switch_resets_expand_flags() {
+        let mut state = State {
+            expanded_changes: true,
+            expanded_explorations: true,
+            expanded_archived: true,
+            archived_open: true,
+            ..Default::default()
+        };
+        state.on_project_opened();
+        assert!(!state.expanded_changes);
+        assert!(!state.expanded_explorations);
+        assert!(!state.expanded_archived);
+        assert!(!state.archived_open);
+    }
+
+    // @spec shell/dashboard-digest Archived density on Dashboard: Dashboard Archived starts collapsed
+    #[test]
+    fn dashboard_archived_starts_collapsed() {
+        let state = State::default();
+        assert!(!state.archived_open);
+        assert!(!state.expanded_archived);
+    }
 }
 
 fn change_row<'a>(

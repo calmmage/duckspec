@@ -212,6 +212,13 @@ pub fn bg_chat_area() -> Color {
     }
 }
 
+/// Full-width last-Answer band — lifts the latest reply off the recessed
+/// chat area (`bg_chat_area` is halfway base→surface). Full `bg_surface`
+/// is the mid contrast: clearer than a half-step, quieter than elevated.
+pub fn bg_chat_last_answer() -> Color {
+    bg_surface()
+}
+
 // ── Chat message backgrounds ───────────────────────────────────────────────
 // All sit in a narrow brightness band, distinguished by subtle colour tints.
 
@@ -431,6 +438,10 @@ pub fn font_md() -> f32 {
     ui_size()
 }
 
+pub fn font_lg() -> f32 {
+    ui_size() + 2.0
+}
+
 // ── Spacing ────────────────────────────────────────────────────────────────
 
 pub const SPACING_XS: f32 = 4.0;
@@ -443,8 +454,8 @@ pub const SPACING_XL: f32 = 24.0;
 
 pub const SIDEBAR_WIDTH: f32 = 48.0;
 pub const LIST_COLUMN_WIDTH: f32 = 260.0;
-/// Default chat/terminal column width on a fresh interaction panel.
-pub const INTERACTION_COLUMN_WIDTH: f32 = 480.0;
+/// Logical window width seed matching `iced::application` `.window_size` default.
+pub const DEFAULT_WINDOW_WIDTH: f32 = 1200.0;
 pub const BORDER_RADIUS: f32 = 4.0;
 
 // ── Custom theme ───────────────────────────────────────────────────────────
@@ -559,66 +570,23 @@ pub fn chat_input(_theme: &Theme) -> container::Style {
     }
 }
 
-/// Outer frame for tool-use / tool-result cards: 1px border + full radius,
-/// no background. Inner header/body containers paint the surface colors.
-pub fn chat_tool_card_frame(_theme: &Theme) -> container::Style {
-    container::Style {
-        border: Border {
-            color: border_color(),
-            width: 1.0,
-            radius: BORDER_RADIUS.into(),
-        },
-        ..Default::default()
+/// Quiet accent fill (~8% accent into `bg_base`) — same treatment as numbered
+/// fast-response chips. Used for awaiting-user composer chrome.
+pub fn quiet_accent_surface() -> Color {
+    let base = bg_base();
+    let tint = accent();
+    Color {
+        r: base.r * 0.92 + tint.r * 0.08,
+        g: base.g * 0.92 + tint.g * 0.08,
+        b: base.b * 0.92 + tint.b * 0.08,
+        a: base.a,
     }
 }
 
-/// Header surface of an open tool card — `bg_surface` (quiet, only one step
-/// from the chat area) with the top corners rounded and bottom corners
-/// square so it seats flush against the body below.
-pub fn chat_tool_card_header_open(_theme: &Theme) -> container::Style {
+/// Composer section while awaiting a user choice (custom-answer surface).
+pub fn chat_composer_awaiting(_theme: &Theme) -> container::Style {
     container::Style {
-        background: Some(bg_surface().into()),
-        border: Border {
-            radius: iced::border::Radius {
-                top_left: BORDER_RADIUS,
-                top_right: BORDER_RADIUS,
-                bottom_right: 0.0,
-                bottom_left: 0.0,
-            },
-            ..Default::default()
-        },
-        ..Default::default()
-    }
-}
-
-/// Header surface of a collapsed tool card — same tint as the open header
-/// but rounded on all four corners because there's no body beneath it.
-pub fn chat_tool_card_header_alone(_theme: &Theme) -> container::Style {
-    container::Style {
-        background: Some(bg_surface().into()),
-        border: Border {
-            radius: BORDER_RADIUS.into(),
-            ..Default::default()
-        },
-        ..Default::default()
-    }
-}
-
-/// Body surface of an open tool card — matches the user bubble's "paper"
-/// background (`bg_base`) with bottom corners rounded and top square so it
-/// seats flush against the header above.
-pub fn chat_tool_card_body(_theme: &Theme) -> container::Style {
-    container::Style {
-        background: Some(bg_base().into()),
-        border: Border {
-            radius: iced::border::Radius {
-                top_left: 0.0,
-                top_right: 0.0,
-                bottom_right: BORDER_RADIUS,
-                bottom_left: BORDER_RADIUS,
-            },
-            ..Default::default()
-        },
+        background: Some(quiet_accent_surface().into()),
         ..Default::default()
     }
 }
@@ -639,9 +607,17 @@ pub fn chat_user_card(_theme: &Theme) -> container::Style {
     }
 }
 
-/// Untinted obvious-chrome chip base (muted paper). Tint helpers mix ~8% color
-/// into this surface for numbered / reject roles.
-pub fn chat_obvious_chip_neutral(_theme: &Theme) -> container::Style {
+/// Full-width band for the latest non-empty Answer — edge-to-edge surface
+/// lift with no border or radius (not a card/bubble).
+pub fn chat_last_answer_band(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(bg_chat_last_answer().into()),
+        ..Default::default()
+    }
+}
+
+/// Untinted fast-response chip base (muted paper). Numbered chips mix ~8% accent.
+pub fn chat_fast_response_chip_neutral(_theme: &Theme) -> container::Style {
     let mut border = border_color();
     border.a *= 0.55;
     let mut bg = bg_base();
@@ -657,20 +633,31 @@ pub fn chat_obvious_chip_neutral(_theme: &Theme) -> container::Style {
     }
 }
 
-/// Quiet light-blue chip — multi-option numbered lifecycle (⌘1…⌘n).
-/// Same ~8% tint strength as reject.
-pub fn chat_obvious_chip_numbered(_theme: &Theme) -> container::Style {
-    tint_obvious_chip(_theme, accent())
+/// Quiet light-blue chip — multi-option numbered choices (⌘1…⌘n).
+pub fn chat_fast_response_chip_numbered(_theme: &Theme) -> container::Style {
+    tint_fast_response_chip(_theme, accent())
 }
 
-/// Very subtle red chip — Reject.
-pub fn chat_obvious_chip_reject(_theme: &Theme) -> container::Style {
-    tint_obvious_chip(_theme, error())
+/// Question chip: same geometry as option chips, chat-area fill (agent-like),
+/// not accent-tinted. Used live above options and for settled host question
+/// entries in the transcript.
+pub fn chat_fast_response_chip_question(_theme: &Theme) -> container::Style {
+    let mut border = border_color();
+    border.a *= 0.55;
+    container::Style {
+        background: Some(bg_chat_area().into()),
+        border: Border {
+            color: border,
+            width: 1.0,
+            radius: BORDER_RADIUS.into(),
+        },
+        ..Default::default()
+    }
 }
 
 /// Mix ~8% of `tint` into the muted chrome base (fill + faint border lean).
-fn tint_obvious_chip(_theme: &Theme, tint: Color) -> container::Style {
-    let mut style = chat_obvious_chip_neutral(_theme);
+fn tint_fast_response_chip(_theme: &Theme, tint: Color) -> container::Style {
+    let mut style = chat_fast_response_chip_neutral(_theme);
     if let Some(iced::Background::Color(c)) = style.background.as_mut() {
         // ~8% tint into the muted base — hint, not a painted button.
         *c = Color {
@@ -976,6 +963,42 @@ pub fn pick_list_ghost_style(_theme: &Theme, status: pick_list::Status) -> pick_
             a: 0.0,
             ..Color::BLACK
         },
+    };
+    pick_list::Style {
+        text_color: text_secondary(),
+        placeholder_color: text_muted(),
+        handle_color: text_muted(),
+        background: Background::Color(background),
+        border: Border {
+            color: Color {
+                a: 0.0,
+                ..Color::BLACK
+            },
+            width: 0.0,
+            radius: BORDER_RADIUS.into(),
+        },
+    }
+}
+
+/// Model selector while awaiting a user choice: same quiet accent fill as the
+/// composer section so the control does not stand out as an untinted island.
+pub fn pick_list_ghost_awaiting_style(
+    _theme: &Theme,
+    status: pick_list::Status,
+) -> pick_list::Style {
+    let fill = quiet_accent_surface();
+    let background = match status {
+        pick_list::Status::Hovered | pick_list::Status::Opened { .. } => {
+            // Slightly stronger hover still on the accent family.
+            let h = bg_hover();
+            Color {
+                r: fill.r * 0.7 + h.r * 0.3,
+                g: fill.g * 0.7 + h.g * 0.3,
+                b: fill.b * 0.7 + h.b * 0.3,
+                a: fill.a,
+            }
+        }
+        pick_list::Status::Active => fill,
     };
     pick_list::Style {
         text_color: text_secondary(),

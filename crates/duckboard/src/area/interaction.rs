@@ -345,13 +345,18 @@ pub struct AgentSession {
     pub chat_editors: Vec<EditorState>,
     /// Segment-index-aligned collapse state (user override + auto-collapse).
     pub chat_collapse: Vec<agent_chat::CollapseState>,
+    /// Ephemeral Focus Answer section folds: block index → section key → state.
+    /// Cleared when effective viewer style leaves Focus.
+    pub focus_folds: HashMap<usize, HashMap<String, crate::focus_answer::SectionFoldState>>,
+    /// Effective viewer style stamped from config (transient).
+    pub viewer_style: crate::config::ViewerStyle,
     pub esc_count: u8,
-    /// Resolved project-level default model (harness-tagged `ModelRef`) for
-    /// this session's project. Transient (not persisted) — refreshed from
-    /// `Config` by the main loop. Used to render the picker's "Default (…)"
-    /// label and to resolve the effective model when `session.selected_model`
-    /// is `None`.
+    /// Project override of the global default for this session's project.
+    /// Transient (not persisted) — refreshed from `Config` by the main loop.
     pub project_model_default: Option<ModelRef>,
+    /// Global main-chat default. Transient — refreshed from `Config` by the
+    /// main loop. Used when pin and project override are unset.
+    pub global_model_default: Option<ModelRef>,
     /// Global VCS workflow for first-turn priming inject. Transient — stamped
     /// from `Config.vcs.workflow` on each chat update path.
     pub vcs_workflow: crate::config::VcsWorkflow,
@@ -360,11 +365,13 @@ pub struct AgentSession {
     pub model_dirty: bool,
     pub agent_input_tokens: usize,
     pub agent_output_tokens: usize,
-    /// Multi-option obvious chrome (lifecycle / affirm / decline). Ephemeral —
-    /// refreshed from disk + session emptiness + VCS dirty; not persisted.
-    /// Soft hint for oneshot uses lifecycle[0] only (composer list does not).
-    pub obvious_chrome: crate::obvious_bubble::ObviousChrome,
-    /// Settled oneshot parse for under-input chrome only.
+    /// Multi-option fast-response shell (empty until a live user choice fills
+    /// it). Ephemeral — not persisted.
+    pub fast_response: crate::fast_response::FastResponse,
+    /// True while a mid-turn structured choice is pending. Chips stay visible
+    /// even though `is_streaming` remains true for the open turn.
+    pub is_awaiting_user: bool,
+    /// Settled oneshot reply strings (0–3); may fill fast-response chips when eligible.
     /// Ephemeral — not persisted. Never seeded into `next_actions`.
     pub agent_default_prompts: Vec<String>,
     /// Monotonic generation; oneshot results apply only when gen matches.
@@ -372,13 +379,21 @@ pub struct AgentSession {
     /// True while a reply-suggestion oneshot is outstanding for
     /// `default_prompts_gen`. Does not disarm next-action empty Enter / Tab.
     pub default_prompts_pending: bool,
-    /// Empty-composer next actions (lifecycle bootstrap or trailing `next`).
-    /// Ephemeral — not persisted. Refreshed from last assistant / scope facts.
+    /// Empty-composer next actions (inherited, lifecycle bootstrap, or trailing
+    /// `next`). Ephemeral — not persisted. Refreshed from last assistant /
+    /// scope facts / inherited list.
     pub next_actions: Vec<crate::meta_card::NextAction>,
     /// Active index into `next_actions` for ghost / empty Enter / Tab cycle.
     pub next_action_idx: usize,
+    /// Build pilot arm (auto/fast). Ephemeral — process-local only; not written
+    /// into the session file. Survives exploration→change promotion with the
+    /// session value.
+    pub pilot: crate::build_pilot::PilotState,
+    /// Donor list for empty-session ghost continuity after NewSession.
+    /// Ephemeral — not persisted. Cleared when the session is no longer empty.
+    pub inherited_next_actions: Option<Vec<crate::meta_card::NextAction>>,
     /// Lifecycle facts for this session's change scope (phase, step progress,
-    /// next stage). Refreshed alongside `obvious_chrome`; `None` for
+    /// next stage). Refreshed alongside `fast_response`; `None` for
     /// non-change scopes. Feeds the first-turn scope orientation blurb.
     pub scope_facts: Option<crate::area::change::ChangeScopeFacts>,
     /// Pending message staged while the agent is streaming. Sent automatically
@@ -402,10 +417,10 @@ pub struct AgentSession {
     /// (offset unchanged but content bounds grew). Without this distinction
     /// the latter would race the auto-snap task and unstick us.
     pub last_chat_offset_y: Option<f32>,
-    /// Spacer above obvious chrome so short history pins chips above the
+    /// Spacer above fast response so short history pins chips above the
     /// composer inside the scroll column. Recomputed from scroll/measure
-    /// bounds via [`crate::obvious_bubble::chrome_bottom_pad`]. Ephemeral.
-    pub chrome_top_pad: f32,
+    /// bounds via [`crate::fast_response::bottom_pad`]. Ephemeral.
+    pub fast_response_top_pad: f32,
     /// Set by `send_prompt_text` when the user submits while sticking to the
     /// bottom: the user's message lands in the transcript immediately but the
     /// agent's first event may take a moment, so the auto-snap path keyed on
@@ -441,6 +456,11 @@ pub struct AgentSession {
     /// Cleared on cancel/error so a backed-out priming doesn't strand a
     /// phantom command.
     pub pending_followup_prompt: Option<String>,
+    /// True between a user cancel and that turn's `TurnComplete`. Deltas can
+    /// keep arriving until the agent actually stops; the `TurnComplete`
+    /// handler re-captures the unsynced draft when this is set so late text
+    /// the user saw is part of the resync. Reset when a new turn starts.
+    pub cancel_in_flight: bool,
     /// Bumped each time the priming Setup block is expanded or manually
     /// re-collapsed. Delayed re-collapse tasks carry a generation and
     /// no-op when it no longer matches.
@@ -458,16 +478,27 @@ pub struct AgentSession {
     /// rebuilding editors; `StreamTick` and structural events drain it.
     /// Transient — never persisted.
     pub chat_ui_dirty: bool,
+    /// Whether this process may persist the session file (`chat/session-sharing`).
+    /// Loaded sessions start displayed; local turns promote to driven.
+    pub drive_role: duckcore::session_sharing::DriveRole,
+    /// When set, agent turns are blocked until the named base scope is on Main
+    /// (`worktree/stack-and-merge` require-base-merged). Transient — stamped by main.
+    pub send_block_reason: Option<String>,
 }
 
 impl AgentSession {
-    /// Create a fresh session for a scope.
+    /// Create a fresh session for a scope (this process owns it → driven).
     pub fn new(scope: String, scope_kind: ScopeKind) -> Self {
-        Self::from_session(ChatSession::new(scope), scope_kind)
+        let mut ax = Self::from_session(ChatSession::new(scope), scope_kind);
+        ax.mark_driven();
+        ax
     }
 
     /// Wrap a loaded ChatSession with fresh UI state.
     pub fn from_session(session: ChatSession, scope_kind: ScopeKind) -> Self {
+        // Seed the live meter from last-known usage so restart shows fill
+        // without waiting for a new UsageUpdate.
+        let context_tokens = session.context_tokens;
         Self {
             session,
             scope_kind,
@@ -482,24 +513,30 @@ impl AgentSession {
             chat_blocks: Vec::new(),
             chat_editors: Vec::new(),
             chat_collapse: Vec::new(),
+            focus_folds: HashMap::new(),
+            viewer_style: crate::config::ViewerStyle::Classic,
             esc_count: 0,
             project_model_default: None,
+            global_model_default: None,
             vcs_workflow: crate::config::VcsWorkflow::default(),
             model_dirty: false,
-            agent_input_tokens: 0,
+            agent_input_tokens: context_tokens,
             agent_output_tokens: 0,
-            obvious_chrome: crate::obvious_bubble::ObviousChrome::default(),
+            fast_response: crate::fast_response::FastResponse::default(),
+            is_awaiting_user: false,
             agent_default_prompts: Vec::new(),
             default_prompts_gen: 0,
             default_prompts_pending: false,
             next_actions: Vec::new(),
             next_action_idx: 0,
+            pilot: crate::build_pilot::PilotState::Off,
+            inherited_next_actions: None,
             scope_facts: None,
             queue_editor: None,
             idea_description: None,
             stick_to_bottom: true,
             last_chat_offset_y: None,
-            chrome_top_pad: 0.0,
+            fast_response_top_pad: 0.0,
             pending_snap_to_bottom: false,
             pending_chat_autoscroll: None,
             selection_pinned: Vec::new(),
@@ -507,21 +544,56 @@ impl AgentSession {
             chat_input_focused: false,
             priming_in_flight: false,
             pending_followup_prompt: None,
+            cancel_in_flight: false,
             priming_expand_gen: 0,
             pending_priming_recollapse: None,
             needs_flush: false,
             chat_ui_dirty: false,
+            // Loaded sessions start displayed; `AgentSession::new` and
+            // `mark_driven` promote when this process owns turns.
+            drive_role: duckcore::session_sharing::DriveRole::Displayed,
+            send_block_reason: None,
         }
+    }
+
+    /// Mark this session as driven so subsequent persists may write the file.
+    pub fn mark_driven(&mut self) {
+        self.drive_role = duckcore::session_sharing::DriveRole::Driven;
+    }
+
+    /// Persist this session if driven (`chat/session-sharing`). Returns whether
+    /// a write completed. Displayed-only sessions are skipped without error.
+    pub fn persist(&self, project_root: Option<&std::path::Path>) -> bool {
+        matches!(
+            duckcore::session_sharing::persist_driven(
+                &self.session,
+                self.drive_role,
+                project_root
+            ),
+            duckcore::session_sharing::PersistOutcome::Written
+        )
+    }
+
+    /// Mark driven and persist. Use for intentional local edits (send, title,
+    /// model pick, system help, recovery).
+    pub fn mark_driven_and_persist(&mut self, project_root: Option<&std::path::Path>) -> bool {
+        self.mark_driven();
+        self.persist(project_root)
     }
 
     /// Invalidate in-flight reply-suggestion oneshots and drop agent defaults.
     /// No oneshot is outstanding for the new gen, so readiness is ready with an
     /// empty list until the next TurnComplete spawns one. Called when a turn
-    /// starts streaming. Does not clear `next_actions`.
+    /// starts streaming. Does not clear `next_actions`. Clears oneshot-hint
+    /// chips when not awaiting a user choice.
     pub fn clear_agent_default_prompts(&mut self) {
         self.default_prompts_gen = self.default_prompts_gen.wrapping_add(1);
         self.agent_default_prompts.clear();
         self.default_prompts_pending = false;
+        if !self.is_awaiting_user {
+            self.fast_response = crate::fast_response::clear();
+            self.fast_response_top_pad = 0.0;
+        }
     }
 
     /// Mark a new reply-suggestion oneshot as in flight for the current gen.
@@ -545,40 +617,43 @@ impl AgentSession {
         }
     }
 
-    /// Rebuild `next_actions` from empty-session lifecycle bootstrap or the
-    /// trailing `next` card on the last non-priming assistant message.
+    /// Rebuild `next_actions` from empty-session inherited list or lifecycle
+    /// bootstrap, or the trailing `next` card on the last non-priming
+    /// assistant message.
     ///
     /// `after_turn`: pass true from TurnComplete so the ghost starts at the
     /// first ranked action. Chrome/scope rebuilds pass false so Tab cycle is
     /// preserved while the list is unchanged.
     pub fn refresh_next_actions(&mut self, after_turn: bool) {
         let session_empty = self.session.messages.is_empty();
+        if !session_empty {
+            self.inherited_next_actions = None;
+        }
         let bootstrap = self.lifecycle_bootstrap();
         let last_assistant = if session_empty {
             None
         } else {
-            crate::default_prompts::last_assistant_and_user(&self.session)
-                .map(|(a, _)| a)
+            crate::default_prompts::last_assistant_and_user(&self.session).map(|(a, _)| a)
         };
-        let prev_sends: Vec<String> =
-            self.next_actions.iter().map(|a| a.send.clone()).collect();
+        let prev_sends: Vec<String> = self.next_actions.iter().map(|a| a.send.clone()).collect();
         let prev_idx = self.next_action_idx;
+        // Clone so list rebuild can take owned slices without fighting other
+        // borrows of `self` (bootstrap points into scope_facts).
+        let inherited = self.inherited_next_actions.clone();
         self.next_actions = crate::default_prompts::next_action_list(
             session_empty,
             bootstrap,
             last_assistant.as_deref(),
+            inherited.as_deref(),
         );
         let prev_refs: Vec<&str> = prev_sends.iter().map(String::as_str).collect();
         let new_refs: Vec<&str> = self.next_actions.iter().map(|a| a.send.as_str()).collect();
         self.next_action_idx = crate::default_prompts::next_action_idx_after_refresh(
-            after_turn,
-            &prev_refs,
-            &new_refs,
-            prev_idx,
+            after_turn, &prev_refs, &new_refs, prev_idx,
         );
     }
 
-    /// Under-input oneshot suggestions when agent input hints is enabled.
+    /// Settled oneshot display list when agent input hints is enabled.
     /// Never includes next-card actions or lifecycle bootstrap.
     pub fn session_oneshot_prompts(&self, agent_input_hints: bool) -> Vec<String> {
         crate::default_prompts::oneshot_display_prompts(
@@ -587,14 +662,26 @@ impl AgentSession {
         )
     }
 
-    /// The harness this session's next turn dispatches to, resolved through the
-    /// model cascade (per-chat pin → project default → built-in default).
-    pub(crate) fn effective_harness(&self) -> String {
-        resolve_turn_model(
+    /// Preferred model from the cascade (pin → project override → global).
+    pub(crate) fn preferred_model(&self) -> Option<ModelRef> {
+        preferred_turn_model(
             self.session.selected_model.as_ref(),
             self.project_model_default.as_ref(),
+            self.global_model_default.as_ref(),
         )
-        .harness
+    }
+
+    /// Effective model: preferred + process-catalog availability.
+    pub(crate) fn effective_model(&self) -> EffectiveModel {
+        resolve_effective_model(self.preferred_model().as_ref(), model_in_process_catalog)
+    }
+
+    /// The harness this session's next turn dispatches to, from the preferred
+    /// model when set. Unconfigured falls back to Claude for worker keying.
+    pub(crate) fn effective_harness(&self) -> String {
+        self.preferred_model()
+            .map(|m| m.harness)
+            .unwrap_or_else(|| "claude-code".into())
     }
 
     /// The stored agent session id, but only when it belongs to the harness the
@@ -615,6 +702,87 @@ impl AgentSession {
     }
 }
 
+// ── Content / chat free-space geometry ──────────────────────────────────────
+
+/// Free width for the content ↔ interaction split: window minus fixed left
+/// chrome (sidebar, list, list-resize grip, their dividers) and the interaction
+/// handle. Matches `view_area_three_column` + outer sidebar row geometry.
+///
+/// Uses the default list column width. Prefer
+/// [`free_content_chat_width_for`] when the list has been resized.
+pub fn free_content_chat_width(window_w: f32) -> f32 {
+    free_content_chat_width_for(window_w, theme::LIST_COLUMN_WIDTH)
+}
+
+/// Free content↔chat width with an explicit list-column width.
+pub fn free_content_chat_width_for(window_w: f32, list_w: f32) -> f32 {
+    let fixed = theme::SIDEBAR_WIDTH
+        + 1.0 // sidebar_divider
+        + list_w
+        + crate::widget::list_resize::HANDLE_WIDTH
+        + interaction_toggle::HANDLE_WIDTH;
+    (window_w - fixed).max(0.0)
+}
+
+/// Uncustomized interaction column width: half of free space, floored at min.
+pub fn equal_interaction_width(window_w: f32) -> f32 {
+    equal_interaction_width_for(window_w, theme::LIST_COLUMN_WIDTH)
+}
+
+/// Uncustomized interaction width with an explicit list-column width.
+pub fn equal_interaction_width_for(window_w: f32, list_w: f32) -> f32 {
+    (free_content_chat_width_for(window_w, list_w) / 2.0).max(interaction_toggle::MIN_PANEL_WIDTH)
+}
+
+/// Recompute equal width when the panel has not been grip-customized.
+pub fn rebalance_uncustomized(ix: &mut InteractionState, window_w: f32) {
+    rebalance_uncustomized_for(ix, window_w, theme::LIST_COLUMN_WIDTH);
+}
+
+/// Rebalance uncustomized width with an explicit list-column width.
+pub fn rebalance_uncustomized_for(ix: &mut InteractionState, window_w: f32, list_w: f32) {
+    if !ix.width_customized {
+        ix.width = equal_interaction_width_for(window_w, list_w);
+    }
+}
+
+/// Force-show the interaction panel and rebalance uncustomized width from the
+/// live window. Same equal-half rule as door open; does not mark customized.
+pub fn show_panel(ix: &mut InteractionState, window_w: f32) {
+    show_panel_for(ix, window_w, theme::LIST_COLUMN_WIDTH);
+}
+
+/// Force-show with an explicit list-column width for free-space math.
+pub fn show_panel_for(ix: &mut InteractionState, window_w: f32, list_w: f32) {
+    ix.visible = true;
+    rebalance_uncustomized_for(ix, window_w, list_w);
+}
+
+/// How the interaction column is sized in the three-column row.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InteractionColumnSize {
+    /// Content is shown — fixed absolute/equal width.
+    Fixed(f32),
+    /// Content is hidden — fill remaining free space after left chrome.
+    Fill,
+}
+
+/// Resolve interaction column size from whether content is shown and the
+/// remembered split width (used only when content is visible).
+pub fn interaction_column_size(show_content: bool, width: f32) -> InteractionColumnSize {
+    if show_content {
+        InteractionColumnSize::Fixed(width)
+    } else {
+        InteractionColumnSize::Fill
+    }
+}
+
+/// Whether the content column is shown in a three-column area.
+/// True only when there is at least one open tab and content is not collapsed.
+pub fn show_content_column(has_tabs: bool, content_collapsed: bool) -> bool {
+    has_tabs && !content_collapsed
+}
+
 // ── Interaction state ───────────────────────────────────────────────────────
 
 pub struct InteractionState {
@@ -629,6 +797,8 @@ pub struct InteractionState {
     /// split width to restore to.
     pub content_collapsed: bool,
     pub width: f32,
+    /// False until the user first middle-grip sets width. Session memory only.
+    pub width_customized: bool,
     /// Currently selected tab.
     pub active_tab: ActiveTab,
     /// Terminal tabs (chat is implicit at the start of the bar).
@@ -648,13 +818,15 @@ pub struct InteractionState {
     pub chat_section_expanded: bool,
 }
 
-impl Default for InteractionState {
-    fn default() -> Self {
+impl InteractionState {
+    /// Same as [`Default`], but equal width from free space for `window_w`.
+    pub fn for_window(window_w: f32) -> Self {
         Self {
             instance_id: NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             visible: false,
             content_collapsed: false,
-            width: theme::INTERACTION_COLUMN_WIDTH,
+            width: equal_interaction_width(window_w),
+            width_customized: false,
             active_tab: ActiveTab::Chat,
             terminals: Vec::new(),
             next_terminal_id: 1,
@@ -664,6 +836,43 @@ impl Default for InteractionState {
             chat_section_expanded: false,
         }
     }
+}
+
+impl Default for InteractionState {
+    fn default() -> Self {
+        Self::for_window(theme::DEFAULT_WINDOW_WIDTH)
+    }
+}
+
+/// Build a fresh empty session, optionally inheriting next actions from the
+/// current active session (change multi-session only).
+///
+/// Call while `ix.active()` is still the donor — before inserting the new
+/// session at index 0. When `scope_kind` is Change and the donor has a
+/// non-empty `next_actions` list, that list is sticky-inherited; otherwise
+/// the empty session follows normal lifecycle bootstrap once scope facts are
+/// present. Active index starts at 0.
+pub fn new_session_with_inherited_next_actions(
+    ix: &InteractionState,
+    scope_key: String,
+    scope_kind: ScopeKind,
+) -> AgentSession {
+    let donor = ix.active();
+    let donor_actions = match (scope_kind, donor) {
+        (ScopeKind::Change, Some(d)) if !d.next_actions.is_empty() => Some(d.next_actions.clone()),
+        _ => None,
+    };
+    let mut fresh = AgentSession::new(scope_key, scope_kind);
+    // Same change scope as the donor — carry facts so empty-donor bootstrap
+    // can resolve without waiting for the next project refresh tick.
+    if let Some(d) = donor {
+        fresh.scope_facts = d.scope_facts.clone();
+    }
+    if let Some(actions) = donor_actions {
+        fresh.inherited_next_actions = Some(actions);
+    }
+    fresh.refresh_next_actions(true);
+    fresh
 }
 
 impl InteractionState {
@@ -734,6 +943,7 @@ mod tests {
                 kind,
                 scope_key: key.into(),
                 change_facts: None,
+                has_inputs_ledger: false,
             })
             .expect("scope hook always produces orientation")
             .text
@@ -840,6 +1050,242 @@ mod tests {
         assert_eq!(ax.next_actions[0].send, "/ds-apply");
     }
 
+    // @spec chat/default-prompts New-session next-action inheritance: New change session inherits active session next actions
+    #[test]
+    fn new_change_session_inherits_active_session_next_actions() {
+        // GIVEN change multi-session chat + active session with two next actions
+        let mut donor = AgentSession::new("foo".into(), ScopeKind::Change);
+        donor.next_actions = vec![
+            crate::meta_card::NextAction {
+                send: "/ds-spec".into(),
+                reason: Some("write specs".into()),
+            },
+            crate::meta_card::NextAction {
+                send: "confirm".into(),
+                reason: None,
+            },
+        ];
+        donor.next_action_idx = 0;
+        let mut ix = InteractionState::default();
+        ix.sessions.push(donor);
+        ix.active_session = 0;
+        // WHEN a new chat session is created for that change
+        let fresh = new_session_with_inherited_next_actions(&ix, "foo".into(), ScopeKind::Change);
+        // THEN the new session's list matches the donor tokens; transcript empty
+        assert!(fresh.session.messages.is_empty());
+        assert_eq!(fresh.next_actions.len(), 2);
+        assert_eq!(fresh.next_actions[0].send, "/ds-spec");
+        assert_eq!(fresh.next_actions[1].send, "confirm");
+        assert!(fresh.inherited_next_actions.is_some());
+    }
+
+    // @spec chat/default-prompts New-session next-action inheritance: New change session with empty donor keeps bootstrap behavior
+    #[test]
+    fn new_change_session_with_empty_donor_keeps_bootstrap_behavior() {
+        // GIVEN change multi-session + active empty next_actions + lifecycle option
+        let mut donor = AgentSession::new("foo".into(), ScopeKind::Change);
+        donor.next_actions.clear();
+        donor.scope_facts = Some(crate::area::change::ChangeScopeFacts {
+            phase: "proposal",
+            steps_done: 0,
+            step_count: 0,
+            active_step_tasks: None,
+            next_command: Some("ds-propose".into()),
+            current_review: None,
+        });
+        let mut ix = InteractionState::default();
+        ix.sessions.push(donor);
+        ix.active_session = 0;
+        // WHEN a new chat session is created for that change
+        let fresh = new_session_with_inherited_next_actions(&ix, "foo".into(), ScopeKind::Change);
+        // THEN bootstrap only (no inheritance)
+        assert!(fresh.inherited_next_actions.is_none());
+        assert_eq!(fresh.next_actions.len(), 1);
+        assert_eq!(fresh.next_actions[0].send, "/ds-propose");
+        assert!(fresh.session.messages.is_empty());
+    }
+
+    // @spec chat/default-prompts New-session next-action inheritance: Inherited list starts at first action
+    #[test]
+    fn inherited_list_starts_at_first_action() {
+        // GIVEN donor with ≥2 next actions and active index not first
+        let mut donor = AgentSession::new("foo".into(), ScopeKind::Change);
+        donor.next_actions = vec![
+            crate::meta_card::NextAction {
+                send: "/ds-spec".into(),
+                reason: None,
+            },
+            crate::meta_card::NextAction {
+                send: "/ds-design".into(),
+                reason: None,
+            },
+        ];
+        donor.next_action_idx = 1;
+        let mut ix = InteractionState::default();
+        ix.sessions.push(donor);
+        ix.active_session = 0;
+        // WHEN a new chat session is created for that change
+        let fresh = new_session_with_inherited_next_actions(&ix, "foo".into(), ScopeKind::Change);
+        // THEN empty submit sends the first inherited token
+        assert_eq!(fresh.next_action_idx, 0);
+        assert_eq!(
+            crate::default_prompts::next_empty_submit_text(
+                false,
+                &fresh.next_actions,
+                fresh.next_action_idx
+            )
+            .as_deref(),
+            Some("/ds-spec")
+        );
+    }
+
+    /// @spec chat/build-pilot Disarm controls: Esc-Esc while streaming cancels turn and disarms
+    #[test]
+    fn esc_esc_while_streaming_cancels_turn_and_disarms() {
+        use iced::keyboard::{Key, Modifiers, key::Named};
+
+        let mut ix = InteractionState::default();
+        let mut ax = AgentSession::new("exp-1".into(), ScopeKind::Exploration);
+        ax.pilot = crate::build_pilot::PilotState::Armed(
+            crate::slash_commands::BuildPilotMode::Auto,
+        );
+        ax.session.is_streaming = true;
+        ix.sessions.push(ax);
+        ix.active_session = 0;
+
+        let esc = Key::Named(Named::Escape);
+        let mods = Modifiers::default();
+        // First Escape arms the double-tap
+        assert!(matches!(
+            handle_agent_chat_key(&mut ix, &esc, mods, false),
+            AgentChatKeyResult::Handled
+        ));
+        // WHEN the user presses Escape twice while streaming
+        let second = handle_agent_chat_key(&mut ix, &esc, mods, false);
+        // THEN cancel is dispatched AND pilot is disarmed
+        assert!(matches!(
+            second,
+            AgentChatKeyResult::Dispatch(agent_chat::Msg::CancelPressed)
+        ));
+        assert!(!ix.sessions[0].pilot.is_armed());
+        assert!(ix.sessions[0].session.is_streaming); // cancel not applied yet
+    }
+
+    /// @spec chat/build-pilot Disarm controls: Esc-Esc while idle and armed only disarms
+    #[test]
+    fn esc_esc_while_idle_and_armed_only_disarms() {
+        use iced::keyboard::{Key, Modifiers, key::Named};
+
+        let mut ix = InteractionState::default();
+        let mut ax = AgentSession::new("exp-1".into(), ScopeKind::Exploration);
+        ax.pilot = crate::build_pilot::PilotState::Armed(
+            crate::slash_commands::BuildPilotMode::Fast,
+        );
+        ax.session.is_streaming = false;
+        ix.sessions.push(ax);
+        ix.active_session = 0;
+
+        let esc = Key::Named(Named::Escape);
+        let mods = Modifiers::default();
+        assert!(matches!(
+            handle_agent_chat_key(&mut ix, &esc, mods, false),
+            AgentChatKeyResult::Handled
+        ));
+        // WHEN the user presses Escape twice while idle and armed
+        let second = handle_agent_chat_key(&mut ix, &esc, mods, false);
+        // THEN pilot disarms AND no cancel dispatch (no turn started/cancelled)
+        assert!(matches!(second, AgentChatKeyResult::Handled));
+        assert!(!ix.sessions[0].pilot.is_armed());
+        assert!(!ix.sessions[0].session.is_streaming);
+    }
+
+    /// Thrash-style cancel leaves pilot Off and blocks auto-send.
+    #[test]
+    fn thrash_cancel_leaves_pilot_off_and_blocks_auto_send() {
+        // GIVEN armed pilot mid-stream
+        let mut ax = AgentSession::new("exp-1".into(), ScopeKind::Exploration);
+        ax.pilot = crate::build_pilot::PilotState::Armed(
+            crate::slash_commands::BuildPilotMode::Auto,
+        );
+        ax.session.is_streaming = true;
+        apply_answer_content_delta(&mut ax.session, "half-written");
+        // WHEN thrash cancel path runs (notice + disarm + cancel flags)
+        thrash_cancel_main_turn(&mut ax);
+        // THEN pilot is Off and cancel_in_flight so TurnComplete would skip hop
+        assert!(!ax.pilot.is_armed());
+        assert!(ax.cancel_in_flight);
+        let was_cancel = ax.cancel_in_flight;
+        ax.cancel_in_flight = false;
+        let safe_next = [crate::meta_card::NextAction {
+            send: "confirm".into(),
+            reason: None,
+        }];
+        let pilot_send = if !was_cancel {
+            crate::build_pilot::maybe_auto_send(&mut ax.pilot, &safe_next)
+        } else {
+            None
+        };
+        assert!(pilot_send.is_none());
+        assert!(crate::build_pilot::maybe_auto_send(&mut ax.pilot, &safe_next).is_none());
+    }
+
+    /// Failed/no-op kick send leaves pilot Off (atomic arm+kick).
+    #[test]
+    fn build_pilot_submit_noop_send_leaves_pilot_off() {
+        use crate::highlight::SyntaxHighlighter;
+
+        // GIVEN exploration session ready to kick, no agent handle (send no-ops)
+        let mut ax = AgentSession::new("exp-1".into(), ScopeKind::Exploration);
+        assert!(ax.agent_handle.is_none());
+        assert!(!ax.pilot.is_armed());
+        let hl = SyntaxHighlighter::new();
+        // WHEN /build-auto would kick but send cannot start
+        run_build_pilot_submit(
+            &mut ax,
+            crate::slash_commands::BuildPilotMode::Auto,
+            "idea",
+            &hl,
+        );
+        // THEN pilot stays Off (no arm without a started turn)
+        assert!(!ax.pilot.is_armed());
+        assert!(ax.session.messages.is_empty());
+    }
+
+    /// @spec chat/build-pilot Disarm controls: User cancel of main turn disarms without pilot auto-send on that completion
+    #[test]
+    fn user_cancel_of_main_turn_disarms_without_pilot_auto_send_on_that_completion() {
+        // GIVEN a session armed in auto mode with a main agent turn streaming
+        // AND the completed turn would otherwise expose a safe rank-1 next
+        let mut ax = AgentSession::new("exp-1".into(), ScopeKind::Exploration);
+        ax.pilot = crate::build_pilot::PilotState::Armed(
+            crate::slash_commands::BuildPilotMode::Auto,
+        );
+        ax.session.is_streaming = true;
+        let safe_next = [crate::meta_card::NextAction {
+            send: "confirm".into(),
+            reason: None,
+        }];
+
+        // WHEN the user cancels that main agent turn (composer cancel path)
+        cancel_streaming_main_turn(&mut ax);
+        // AND that cancelled turn completes (same gates as TurnComplete)
+        let was_cancel = ax.cancel_in_flight;
+        assert!(was_cancel);
+        ax.cancel_in_flight = false;
+        ax.pilot = crate::build_pilot::PilotState::Off;
+        let pilot_send = if !was_cancel {
+            crate::build_pilot::maybe_auto_send(&mut ax.pilot, &safe_next)
+        } else {
+            None
+        };
+
+        // THEN pilot is disarmed AND no pilot auto-send for that completion
+        assert!(!ax.pilot.is_armed());
+        assert!(pilot_send.is_none());
+        // And even if someone forgot was_cancel, pilot Off still blocks send
+        assert!(crate::build_pilot::maybe_auto_send(&mut ax.pilot, &safe_next).is_none());
+    }
+
     // @spec chat/default-prompts Agent input hints gate: Empty-session next actions remain when agent input hints disabled
     #[test]
     fn empty_session_next_actions_remain_when_agent_input_hints_disabled() {
@@ -924,27 +1370,99 @@ mod tests {
         assert!(!ax.session.is_streaming);
     }
 
-    /// @spec harness/selection Default model resolution: An empty cascade resolves to grok-4.5
-    #[test]
-    fn empty_cascade_resolves_to_grok_4_5() {
-        // GIVEN neither a per-chat pin nor a project default.
-        // WHEN the model for a turn is resolved.
-        let resolved = resolve_turn_model(None, None);
-        // THEN the resolved model is grok-4.5 on the grok harness.
-        assert_eq!(resolved.harness, "grok");
-        assert_eq!(resolved.model, "grok-4.5");
-    }
-
     /// @spec harness/selection Default model resolution: A per-chat pin overrides a project default
     #[test]
     fn per_chat_pin_overrides_project_default() {
-        // GIVEN a per-chat pin and a different project default.
+        // GIVEN a per-chat pin
+        // AND a different project override
+        // AND a different global default
         let pin = ModelRef::new("claude-code", "opus");
-        let project_default = ModelRef::new("grok", "grok-4.5");
-        // WHEN the model for a turn is resolved.
-        let resolved = resolve_turn_model(Some(&pin), Some(&project_default));
-        // THEN the resolved model is the per-chat pin.
-        assert_eq!(resolved, pin);
+        let project = ModelRef::new("grok", "grok-4.5");
+        let global = ModelRef::new("claude-code", "sonnet");
+        // WHEN the preferred model for a turn is resolved
+        let resolved = preferred_turn_model(Some(&pin), Some(&project), Some(&global));
+        // THEN the preferred model is the per-chat pin
+        assert_eq!(resolved, Some(pin));
+    }
+
+    /// @spec harness/selection Default model resolution: A project override is preferred over the global default
+    #[test]
+    fn project_override_is_preferred_over_the_global_default() {
+        // GIVEN no per-chat pin
+        // AND a project override
+        // AND a different global default
+        let project = ModelRef::new("claude-code", "opus");
+        let global = ModelRef::new("grok", "grok-4.5");
+        // WHEN the preferred model for a turn is resolved
+        let resolved = preferred_turn_model(None, Some(&project), Some(&global));
+        // THEN the preferred model is the project override
+        assert_eq!(resolved, Some(project));
+    }
+
+    /// @spec harness/selection Default model resolution: The global default is preferred when pin and project override are unset
+    #[test]
+    fn global_default_is_preferred_when_pin_and_project_override_are_unset() {
+        // GIVEN no per-chat pin
+        // AND no project override
+        // AND a global default
+        let global = ModelRef::new("claude-code", "sonnet");
+        // WHEN the preferred model for a turn is resolved
+        let resolved = preferred_turn_model(None, None, Some(&global));
+        // THEN the preferred model is the global default
+        assert_eq!(resolved, Some(global));
+    }
+
+    /// @spec harness/selection Default model resolution: A preferred model absent from the catalog is not available
+    #[test]
+    fn preferred_model_absent_from_the_catalog_is_not_available() {
+        // GIVEN a preferred model from the cascade
+        let preferred = ModelRef::new("grok", "grok-4.5");
+        // AND that model absent from the process model catalog
+        let in_catalog = |_: &ModelRef| false;
+        // WHEN the effective model for a turn is resolved
+        let effective = resolve_effective_model(Some(&preferred), in_catalog);
+        // THEN the model for the turn is not available
+        assert!(!effective.is_available());
+        assert_eq!(
+            effective,
+            EffectiveModel::Missing {
+                preferred: preferred.clone()
+            }
+        );
+    }
+
+    /// @spec harness/selection Default model resolution: With no preferred model at any cascade level, the model is not available
+    #[test]
+    fn with_no_preferred_model_at_any_cascade_level_the_model_is_not_available() {
+        // GIVEN no per-chat pin
+        // AND no project override
+        // AND no global default
+        // WHEN the effective model for a turn is resolved
+        let preferred = preferred_turn_model(None, None, None);
+        let effective = resolve_effective_model(preferred.as_ref(), |_| true);
+        // THEN the model for the turn is not available
+        assert!(preferred.is_none());
+        assert!(!effective.is_available());
+        assert_eq!(effective, EffectiveModel::Unconfigured);
+    }
+
+    /// @spec harness/selection Send requires an available model: A turn does not start when the preferred model is not available
+    #[test]
+    fn turn_does_not_start_when_the_preferred_model_is_not_available() {
+        // GIVEN an effective model that is not available
+        let preferred = ModelRef::new("grok", "grok-4.5");
+        let missing = EffectiveModel::Missing {
+            preferred: preferred.clone(),
+        };
+        let unconfigured = EffectiveModel::Unconfigured;
+        // WHEN the user attempts to send a main-chat turn
+        // THEN no new turn is started
+        // AND no substitute model is chosen for the turn
+        assert!(!main_chat_turn_allowed(&missing));
+        assert!(!main_chat_turn_allowed(&unconfigured));
+        assert!(main_chat_turn_allowed(&EffectiveModel::Available(
+            preferred
+        )));
     }
 
     /// @spec session/scope Reliable first-turn delivery: The first turn's message body carries the scope orientation
@@ -986,11 +1504,16 @@ mod tests {
         );
     }
 
+    // @spec shell/vcs-workflow First-turn priming injection: First-turn priming body includes the selected workflow's standing instructions
     #[test]
     fn priming_body_includes_vcs_workflow_instructions() {
         let blurb = scope_blurb(ScopeKind::Exploration, "exp-1");
         let vcs = crate::config::VcsWorkflow::Jj.standing_instructions();
         let body = assemble_priming_body(None, Some(&blurb), vcs);
+        assert!(
+            body.contains(vcs),
+            "selected workflow standing instructions must ride the priming body: {body}"
+        );
         assert!(
             body.contains("`jj`"),
             "jj workflow instructions must ride the priming body: {body}"
@@ -1308,33 +1831,29 @@ mod tests {
     #[test]
     fn pure_content_deltas_alone_do_not_materialize() {
         assert!(!should_materialize_chat_ui(
-            &crate::agent::AgentEvent::ContentDelta {
-                text: "x".into()
-            },
+            &crate::agent::AgentEvent::ContentDelta { text: "x".into() },
             true,
             false,
         ));
         assert!(!should_materialize_chat_ui(
-            &crate::agent::AgentEvent::ReasoningDelta {
-                text: "y".into()
-            },
+            &crate::agent::AgentEvent::ReasoningDelta { text: "y".into() },
             true,
             false,
         ));
         // Kind switch is structural even for content deltas.
         assert!(should_materialize_chat_ui(
-            &crate::agent::AgentEvent::ContentDelta {
-                text: "x".into()
-            },
+            &crate::agent::AgentEvent::ContentDelta { text: "x".into() },
             true,
             true,
         ));
         // Structural events always materialize.
-        assert!(is_structural_chat_event(&crate::agent::AgentEvent::ToolUse {
-            id: "1".into(),
-            name: "Bash".into(),
-            input: "ls".into(),
-        }));
+        assert!(is_structural_chat_event(
+            &crate::agent::AgentEvent::ToolUse {
+                id: "1".into(),
+                name: "Bash".into(),
+                input: "ls".into(),
+            }
+        ));
         assert!(is_structural_chat_event(
             &crate::agent::AgentEvent::TurnComplete
         ));
@@ -1418,6 +1937,51 @@ mod tests {
             joined.contains("deferred while up"),
             "re-stick must paint deferred answer: {joined:?}"
         );
+    }
+
+    // @spec chat/stream-ui Stream UI tick need: Active streaming without awaiting needs the stream UI tick
+    #[test]
+    fn active_streaming_without_awaiting_needs_stream_ui_tick() {
+        let mut ax = streaming_session();
+        ax.is_awaiting_user = false;
+        ax.chat_ui_dirty = false;
+        ax.stick_to_bottom = true;
+        assert!(session_needs_stream_tick(
+            ax.session.is_streaming,
+            ax.is_awaiting_user,
+            ax.chat_ui_dirty,
+            ax.stick_to_bottom,
+        ));
+    }
+
+    // @spec chat/stream-ui Stream UI tick need: Idle awaiting without deferred materialize does not need the stream UI tick
+    #[test]
+    fn idle_awaiting_without_deferred_materialize_does_not_need_stream_ui_tick() {
+        let mut ax = streaming_session();
+        ax.is_awaiting_user = true;
+        ax.chat_ui_dirty = false;
+        ax.stick_to_bottom = true;
+        assert!(!session_needs_stream_tick(
+            ax.session.is_streaming,
+            ax.is_awaiting_user,
+            ax.chat_ui_dirty,
+            ax.stick_to_bottom,
+        ));
+    }
+
+    // @spec chat/stream-ui Stream UI tick need: Awaiting with deferred pure content on stick-to-bottom needs the stream UI tick
+    #[test]
+    fn awaiting_with_deferred_pure_content_on_stick_needs_stream_ui_tick() {
+        let mut ax = streaming_session();
+        ax.is_awaiting_user = true;
+        ax.chat_ui_dirty = true;
+        ax.stick_to_bottom = true;
+        assert!(session_needs_stream_tick(
+            ax.session.is_streaming,
+            ax.is_awaiting_user,
+            ax.chat_ui_dirty,
+            ax.stick_to_bottom,
+        ));
     }
 
     // @spec chat/stream-ui Bounded materialization while streaming: Tool use materializes the chat UI immediately with an Activity row
@@ -1613,36 +2177,34 @@ mod tests {
         }
     }
 
-    // @spec chat/stream-ui Answer thrash budget: Third answer-after-thought cancels and keeps the last draft
+    // @spec chat/stream-ui Answer thrash budget: Exceeding the budget cancels and keeps the last draft
     #[test]
-    fn third_answer_after_thought_trips_thrash_keeps_last_draft() {
+    fn exceeding_budget_trips_thrash_keeps_last_draft() {
         let mut ax = streaming_session();
-        // Two allowed replacements → draft is body-2.
-        thrash_replaces(&mut ax.session, 2);
-        assert_eq!(ax.session.pending_text, "body-2");
+        // Use the full allowed replacement budget → draft is body-{budget}.
+        thrash_replaces(&mut ax.session, ANSWER_REPLACE_BUDGET);
+        let last_allowed = format!("body-{ANSWER_REPLACE_BUDGET}");
+        assert_eq!(ax.session.pending_text, last_allowed);
         assert!(!ax.session.answer_thrash_tripped);
-        assert_eq!(ax.session.answer_replace_count, 2);
+        assert_eq!(ax.session.answer_replace_count, ANSWER_REPLACE_BUDGET);
 
-        // Third replace attempt: trip without replacing the last complete draft.
+        // Next replace attempt: trip without replacing the last complete draft.
         apply_reasoning_content_delta(&mut ax.session, "think again");
-        let ks = apply_answer_content_delta(&mut ax.session, "body-3-should-not-apply");
+        let ks = apply_answer_content_delta(&mut ax.session, "body-should-not-apply");
         assert!(ks);
         assert!(ax.session.answer_thrash_tripped);
-        assert_eq!(ax.session.pending_text, "body-2");
+        assert_eq!(ax.session.pending_text, last_allowed);
 
         // Caller settles: flush draft + stop notice (mirrors main thrash path).
         on_answer_thrash_trip(&mut ax.session);
         assert!(ax.session.pending_text.is_empty());
-        assert_eq!(
-            committed_answer_texts(&ax.session),
-            vec!["body-2".to_string()]
-        );
+        assert_eq!(committed_answer_texts(&ax.session), vec![last_allowed]);
         assert!(
             ax.session.messages.iter().any(|m| {
                 m.role == Role::System
-                    && m.content.iter().any(|b| {
-                        matches!(b, ContentBlock::Text(t) if t == ANSWER_THRASH_STOP_NOTICE)
-                    })
+                    && m.content.iter().any(
+                        |b| matches!(b, ContentBlock::Text(t) if t == ANSWER_THRASH_STOP_NOTICE),
+                    )
             }),
             "stop notice must be present as a system message"
         );
@@ -1658,8 +2220,8 @@ mod tests {
     #[test]
     fn tool_use_resets_thrash_budget() {
         let mut ax = streaming_session();
-        thrash_replaces(&mut ax.session, 2);
-        assert_eq!(ax.session.answer_replace_count, 2);
+        thrash_replaces(&mut ax.session, ANSWER_REPLACE_BUDGET);
+        assert_eq!(ax.session.answer_replace_count, ANSWER_REPLACE_BUDGET);
 
         // Tool boundary: commit draft and reset thrash (mirrors ToolUse handling).
         flush_all_pending(&mut ax.session);
@@ -1679,13 +2241,171 @@ mod tests {
         assert!(!ax.session.answer_thrash_tripped);
 
         // A new answer-after-thought replace after tools must not trip solely
-        // from the pre-tool thrash count.
+        // from the pre-tool thrash count (still within a fresh budget).
         apply_answer_content_delta(&mut ax.session, "after-tool-1");
         apply_reasoning_content_delta(&mut ax.session, "think");
         apply_answer_content_delta(&mut ax.session, "after-tool-2");
         assert!(!ax.session.answer_thrash_tripped);
         assert_eq!(ax.session.pending_text, "after-tool-2");
         assert_eq!(ax.session.answer_replace_count, 1);
+        assert!(ax.session.answer_replace_count <= ANSWER_REPLACE_BUDGET);
+    }
+
+    // ── chat/cancel-resync: draft capture on cancellation ─────────────────
+
+    // @spec chat/cancel-resync Draft capture on cancellation: Thrash trip captures the kept draft
+    #[test]
+    fn thrash_trip_captures_the_kept_draft() {
+        let mut ax = streaming_session();
+        // GIVEN a streaming turn whose in-flight answer draft is non-empty.
+        thrash_replaces(&mut ax.session, ANSWER_REPLACE_BUDGET);
+        let kept = format!("body-{ANSWER_REPLACE_BUDGET}");
+        assert_eq!(ax.session.pending_text, kept);
+
+        // WHEN the answer-thrash budget trips and the turn is cancelled
+        // (mirrors the main path: trip settle before cancelling the agent).
+        apply_reasoning_content_delta(&mut ax.session, "think again");
+        apply_answer_content_delta(&mut ax.session, "over-budget rewrite");
+        assert!(ax.session.answer_thrash_tripped);
+        on_answer_thrash_trip(&mut ax.session);
+
+        // THEN the session's unsynced draft equals the kept draft.
+        assert_eq!(ax.session.unsynced_draft.as_deref(), Some(kept.as_str()));
+    }
+
+    // @spec chat/cancel-resync Draft capture on cancellation: User cancel captures the in-flight draft
+    #[test]
+    fn user_cancel_captures_the_in_flight_draft() {
+        let mut ax = streaming_session();
+        // GIVEN a streaming turn whose in-flight answer draft is non-empty.
+        apply_answer_content_delta(&mut ax.session, "half-written reply");
+        assert_eq!(ax.session.pending_text, "half-written reply");
+
+        // WHEN the user cancels the turn (mirrors the CancelPressed arm,
+        // which captures before signalling the agent handle).
+        capture_unsynced_draft(&mut ax.session);
+
+        // THEN the session's unsynced draft equals that draft.
+        assert_eq!(
+            ax.session.unsynced_draft.as_deref(),
+            Some("half-written reply")
+        );
+    }
+
+    // @spec chat/cancel-resync Draft capture on cancellation: Cancellation with no in-flight draft records nothing
+    #[test]
+    fn cancellation_with_no_in_flight_draft_records_nothing() {
+        let mut ax = streaming_session();
+        // GIVEN a streaming turn whose answer text was committed at a tool
+        // boundary AND no answer text has streamed since.
+        apply_answer_content_delta(&mut ax.session, "committed before tools");
+        flush_all_pending(&mut ax.session);
+        assert!(ax.session.pending_text.is_empty());
+
+        // WHEN the turn is cancelled.
+        capture_unsynced_draft(&mut ax.session);
+
+        // THEN the session has no unsynced draft.
+        assert_eq!(ax.session.unsynced_draft, None);
+    }
+
+    // @spec chat/cancel-resync Draft capture on cancellation: Deltas arriving after cancel are part of the captured draft
+    #[test]
+    fn deltas_arriving_after_cancel_are_part_of_the_captured_draft() {
+        let mut ax = streaming_session();
+        // GIVEN a streaming turn cancelled by the user with a non-empty
+        // in-flight answer draft (capture at cancel press).
+        apply_answer_content_delta(&mut ax.session, "first half");
+        capture_unsynced_draft(&mut ax.session);
+        ax.cancel_in_flight = true;
+
+        // WHEN further answer deltas arrive before the turn ends (the
+        // TurnComplete handler re-captures while cancel is in flight).
+        apply_answer_content_delta(&mut ax.session, " and late tail");
+        if ax.cancel_in_flight {
+            capture_unsynced_draft(&mut ax.session);
+            ax.cancel_in_flight = false;
+        }
+
+        // THEN the session's unsynced draft includes those deltas.
+        assert_eq!(
+            ax.session.unsynced_draft.as_deref(),
+            Some("first half and late tail")
+        );
+    }
+
+    // ── chat/cancel-resync: resync reminder on next send ──────────────────
+
+    // @spec chat/cancel-resync Resync reminder on next send: The next send carries the draft after the user's text
+    #[test]
+    fn next_send_carries_the_draft_after_the_users_text() {
+        let mut ax = streaming_session();
+        // GIVEN a session holding an unsynced draft.
+        ax.session.unsynced_draft = Some("outline gate preview".into());
+
+        // WHEN a prompt is sent on that session (mirrors send_prompt_text).
+        let prompt = apply_resync_reminder("confirm".into(), &mut ax.session);
+
+        // THEN the outgoing prompt begins with the user's text AND the
+        // unsynced draft follows it.
+        assert!(
+            prompt.starts_with("confirm"),
+            "user text must stay first: {prompt}"
+        );
+        let user_pos = prompt.find("confirm").unwrap();
+        let draft_pos = prompt
+            .find("outline gate preview")
+            .expect("draft must ride the prompt");
+        assert!(draft_pos > user_pos);
+    }
+
+    // @spec chat/cancel-resync Resync reminder on next send: The reminder rides only one send
+    #[test]
+    fn reminder_rides_only_one_send() {
+        let mut ax = streaming_session();
+        // GIVEN a session holding an unsynced draft.
+        ax.session.unsynced_draft = Some("outline gate preview".into());
+
+        // WHEN two prompts are sent in sequence on that session.
+        let first = apply_resync_reminder("confirm".into(), &mut ax.session);
+        let second = apply_resync_reminder("next message".into(), &mut ax.session);
+
+        // THEN only the first outgoing prompt carries the draft.
+        assert!(first.contains("outline gate preview"));
+        assert_eq!(second, "next message");
+        assert_eq!(ax.session.unsynced_draft, None);
+    }
+
+    // @spec chat/cancel-resync Resync reminder on next send: A recovery resend carrying transcript history clears the draft without a reminder
+    #[test]
+    fn recovery_resend_clears_the_draft_without_a_reminder() {
+        let mut ax = streaming_session();
+        // GIVEN a session holding an unsynced draft, whose transcript keeps
+        // that draft as a committed assistant message.
+        ax.session.messages.push(ChatMessage {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text("kept outline draft".into())],
+            timestamp: String::new(),
+            is_priming: false,
+        });
+        ax.session.messages.push(ChatMessage {
+            role: Role::User,
+            content: vec![ContentBlock::Text("confirm".into())],
+            timestamp: String::new(),
+            is_priming: false,
+        });
+        ax.session.unsynced_draft = Some("kept outline draft".into());
+
+        // WHEN a recovery send carries the transcript history in its prompt.
+        let history_end = ax.session.messages.len() - 1;
+        let prompt = build_recovery_prompt(&mut ax.session, history_end, "confirm");
+
+        // THEN the session afterward holds no unsynced draft AND the
+        // recovery prompt carries no resync reminder (the history preamble
+        // already carries the kept draft).
+        assert_eq!(ax.session.unsynced_draft, None);
+        assert!(!prompt.contains("<system-reminder>"));
+        assert!(prompt.contains("kept outline draft"));
     }
 
     // ── chat/stream-ui: settled + live editor refresh ─────────────────────
@@ -1694,10 +2414,7 @@ mod tests {
     fn plan_editor_refresh_suffix_and_reshape() {
         let a = vec!["hello".into()];
         let b = vec!["hello".into(), "world".into()];
-        assert_eq!(
-            plan_editor_refresh(&a, &a),
-            EditorRefreshKind::Reuse
-        );
+        assert_eq!(plan_editor_refresh(&a, &a), EditorRefreshKind::Reuse);
         assert_eq!(
             plan_editor_refresh(&a, &b),
             EditorRefreshKind::InPlace { dirty_from: 1 }
@@ -1749,7 +2466,10 @@ mod tests {
             ax.chat_editors[user_idx].highlight_version, user_version,
             "settled user block must keep its editor (version) across live-answer growth"
         );
-        assert_eq!(ax.chat_blocks[user_idx].lines, vec!["user asks".to_string()]);
+        assert_eq!(
+            ax.chat_blocks[user_idx].lines,
+            vec!["user asks".to_string()]
+        );
     }
 
     // @spec chat/stream-ui Settled and live editor refresh: Suffix-growing live answer refreshes in place
@@ -1785,8 +2505,7 @@ mod tests {
         );
         let lines = &ax.chat_editors[ans_idx].lines;
         assert!(
-            lines.iter().any(|l| l.contains("line two"))
-                || lines.join("\n").contains("line two"),
+            lines.iter().any(|l| l.contains("line two")) || lines.join("\n").contains("line two"),
             "live answer must include suffix: {lines:?}"
         );
         let _ = v_before;
@@ -1858,6 +2577,623 @@ mod tests {
                 .collect::<Vec<_>>()
         );
     }
+
+    // @spec chat/fast-response Freeform while awaiting: Freeform submit completes the pending choice as a custom answer
+    #[test]
+    fn freeform_submit_completes_the_pending_choice_as_a_custom_answer() {
+        use crate::chat_store::{ContentBlock, Role};
+        use crate::fast_response::{self, FastResponseSource};
+        use crate::scope::ScopeKind;
+        use duckchat::UserChoiceAnswer;
+
+        // GIVEN awaiting a user choice with freeform text and a question
+        let mut ax = AgentSession::new("foo".into(), ScopeKind::Change);
+        ax.is_awaiting_user = true;
+        ax.fast_response = fast_response::from_user_choice(
+            42,
+            Some("Ship it?".into()),
+            [("opt-a".into(), "Alpha".into())],
+        );
+        let plan = plan_freeform_while_awaiting(true, &ax.fast_response.source, "ship later")
+            .expect("freeform while awaiting plans a custom answer");
+        assert_eq!(plan.correlation_id, Some(42));
+        assert_eq!(plan.text, "ship later");
+        let answer = UserChoiceAnswer::Custom {
+            text: plan.text.clone(),
+        };
+        assert!(matches!(
+            &answer,
+            UserChoiceAnswer::Custom { text } if text == "ship later"
+        ));
+        assert!(!matches!(answer, UserChoiceAnswer::Cancelled));
+
+        // Product settle path (wire answer is separate; no handle in this unit test).
+        settle_user_choice_transcript(&mut ax, plan.text.clone());
+
+        // THEN host Q + freeform answer; not an ordinary Text user turn alone.
+        assert!(matches!(
+            ax.session.messages[0].content.as_slice(),
+            [ContentBlock::UserChoiceQuestion { text }] if text == "Question: Ship it?"
+        ));
+        assert!(matches!(
+            ax.session.messages[1].content.as_slice(),
+            [ContentBlock::UserChoiceAnswer { text }] if text == "ship later"
+        ));
+        assert!(!ax.session.messages.iter().any(|m| {
+            m.role == Role::User
+                && m.content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Text(t) if t == "ship later"))
+        }));
+        assert!(!ax.is_awaiting_user);
+
+        // Not awaiting → ordinary streaming path (no freeform plan).
+        let source = FastResponseSource::UserChoice {
+            correlation_id: 42,
+            prompt: None,
+        };
+        assert!(plan_freeform_while_awaiting(false, &source, "hi").is_none());
+        // Empty freeform → no plan.
+        assert!(plan_freeform_while_awaiting(true, &source, "  ").is_none());
+    }
+
+    // @spec chat/fast-response Question activation: Option activation answers in-band and commits host question and answer
+    #[test]
+    fn option_activation_answers_in_band_and_commits_host_question_and_answer() {
+        use crate::chat_store::{ContentBlock, Role};
+        use crate::fast_response::{self, FastResponsePick};
+        use crate::scope::ScopeKind;
+
+        let hl = SyntaxHighlighter::new();
+        let mut ax = AgentSession::new("foo".into(), ScopeKind::Change);
+        ax.is_awaiting_user = true;
+        ax.fast_response = fast_response::from_user_choice(
+            7,
+            Some("Pick one?".into()),
+            [
+                ("opt-a".into(), "Alpha".into()),
+                ("opt-b".into(), "Beta".into()),
+            ],
+        );
+
+        // WHEN the first option is activated (no agent handle → wire is no-op)
+        activate_fast_response(
+            &mut ax,
+            FastResponsePick::Option { id: "opt-a".into() },
+            &hl,
+        );
+
+        // THEN host Q + answer label (no hotkey); no ordinary Text user turn for the pick
+        assert_eq!(ax.session.messages.len(), 2);
+        assert_eq!(ax.session.messages[0].role, Role::Assistant);
+        assert!(matches!(
+            ax.session.messages[0].content.as_slice(),
+            [ContentBlock::UserChoiceQuestion { text }] if text == "Question: Pick one?"
+        ));
+        assert_eq!(ax.session.messages[1].role, Role::User);
+        assert!(matches!(
+            ax.session.messages[1].content.as_slice(),
+            [ContentBlock::UserChoiceAnswer { text }] if text == "Alpha"
+        ));
+        assert!(!ax.session.messages.iter().any(|m| {
+            m.content.iter().any(|b| {
+                matches!(b, ContentBlock::Text(t) if t.contains('⌘') || t == "Alpha" || t == "opt-a")
+            })
+        }));
+        assert!(!ax.is_awaiting_user);
+    }
+
+    // @spec chat/fast-response Settled choice transcript: Settle with a prompt commits question then answer without a hotkey
+    #[test]
+    fn settle_with_a_prompt_commits_question_then_answer_without_a_hotkey() {
+        use crate::chat_store::ContentBlock;
+        use crate::fast_response;
+        use crate::scope::ScopeKind;
+
+        let mut ax = AgentSession::new("foo".into(), ScopeKind::Change);
+        ax.is_awaiting_user = true;
+        ax.fast_response = fast_response::from_user_choice(
+            1,
+            Some("Ship later or now?".into()),
+            [("later".into(), "Later".into())],
+        );
+
+        settle_user_choice_transcript(&mut ax, "Later".into());
+
+        assert_eq!(ax.session.messages.len(), 2);
+        assert!(matches!(
+            ax.session.messages[0].content.as_slice(),
+            [ContentBlock::UserChoiceQuestion { text }] if text == "Question: Ship later or now?"
+        ));
+        assert!(matches!(
+            ax.session.messages[1].content.as_slice(),
+            [ContentBlock::UserChoiceAnswer { text }] if text == "Later" && !text.contains('⌘')
+        ));
+        assert!(!ax.is_awaiting_user);
+    }
+
+    // @spec chat/fast-response Settled choice transcript: Settle without a prompt commits answer only
+    #[test]
+    fn settle_without_a_prompt_commits_answer_only() {
+        use crate::chat_store::ContentBlock;
+        use crate::fast_response;
+        use crate::scope::ScopeKind;
+
+        let mut ax = AgentSession::new("foo".into(), ScopeKind::Change);
+        ax.is_awaiting_user = true;
+        ax.fast_response = fast_response::from_user_choice(1, None, [("a".into(), "Alpha".into())]);
+
+        settle_user_choice_transcript(&mut ax, "Alpha".into());
+
+        assert_eq!(ax.session.messages.len(), 1);
+        assert!(matches!(
+            ax.session.messages[0].content.as_slice(),
+            [ContentBlock::UserChoiceAnswer { text }] if text == "Alpha"
+        ));
+        assert!(!ax.session.messages.iter().any(|m| {
+            m.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::UserChoiceQuestion { .. }))
+        }));
+    }
+
+    // @spec chat/fast-response Settled choice transcript: Cancel commits no choice blocks
+    #[test]
+    fn cancel_commits_no_choice_blocks() {
+        use crate::chat_store::ContentBlock;
+        use crate::fast_response;
+        use crate::scope::ScopeKind;
+
+        let mut ax = AgentSession::new("foo".into(), ScopeKind::Change);
+        ax.is_awaiting_user = true;
+        ax.fast_response = fast_response::from_user_choice(
+            1,
+            Some("Ship it?".into()),
+            [("yes".into(), "Yes".into())],
+        );
+        let before = ax.session.messages.len();
+
+        // Cancel path: clear shell only (no settle).
+        clear_user_choice_shell(&mut ax);
+
+        assert_eq!(ax.session.messages.len(), before);
+        assert!(!ax.session.messages.iter().any(|m| {
+            m.content.iter().any(|b| {
+                matches!(
+                    b,
+                    ContentBlock::UserChoiceQuestion { .. } | ContentBlock::UserChoiceAnswer { .. }
+                )
+            })
+        }));
+        assert!(!ax.is_awaiting_user);
+    }
+
+    /// Option activation discards typed freeform so it is not left for a later send.
+    #[test]
+    fn option_activation_clears_typed_composer_text() {
+        use crate::chat_store::ContentBlock;
+        use crate::fast_response::{self, FastResponsePick, FastResponseSource};
+        use crate::scope::ScopeKind;
+
+        let hl = SyntaxHighlighter::new();
+        let mut ax = AgentSession::new("foo".into(), ScopeKind::Change);
+        ax.is_awaiting_user = true;
+        ax.fast_response =
+            fast_response::from_user_choice(7, None, [("opt-a".into(), "Alpha".into())]);
+        ax.chat_input = EditorState::new("partial freeform");
+        assert!(!ax.chat_input.text().trim().is_empty());
+
+        activate_fast_response(
+            &mut ax,
+            FastResponsePick::Option { id: "opt-a".into() },
+            &hl,
+        );
+
+        assert!(
+            ax.chat_input.text().trim().is_empty(),
+            "typed freeform must be cleared on chip pick"
+        );
+        assert!(!ax.is_awaiting_user);
+        assert!(matches!(ax.fast_response.source, FastResponseSource::None));
+        // Host answer chip is committed; ordinary Text user turn is not.
+        assert!(ax.session.messages.iter().any(|m| {
+            m.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::UserChoiceAnswer { text } if text == "Alpha"))
+        }));
+        assert!(!ax.session.messages.iter().any(|m| {
+            m.content.iter().any(
+                |b| matches!(b, ContentBlock::Text(t) if t == "Alpha" || t == "partial freeform"),
+            )
+        }));
+    }
+
+    // ── viewer-style style flip rematerialize (Hybrid C editor content) ───
+
+    /// Cold load must stamp effective style before first materialize (review 03 / step 08).
+    #[test]
+    fn cold_load_stamps_focus_before_materialize() {
+        use crate::config::ViewerStyle;
+
+        let src = "\
+## Motivation
+
+Why.
+
+> **next**
+>
+> `confirm`
+";
+        let mut ax = AgentSession::new("cold-load".into(), ScopeKind::Change);
+        ax.session.messages.push(ChatMessage {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text(src.into())],
+            timestamp: String::new(),
+            is_priming: false,
+        });
+        // Simulate ensure_sessions load path: stamp effective Focus, then materialize.
+        assert_eq!(ax.viewer_style, ViewerStyle::Classic);
+        stamp_viewer_style_for_load(&mut ax, ViewerStyle::Focus);
+        assert_eq!(ax.viewer_style, ViewerStyle::Focus);
+        let hl = SyntaxHighlighter::new();
+        materialize_chat_ui(&mut ax, &hl);
+
+        let ans_idx = ax
+            .chat_blocks
+            .iter()
+            .position(|b| b.kind == BlockKind::Assistant)
+            .expect("answer block");
+        let lines: Vec<String> = ax.chat_editors[ans_idx].lines.iter().cloned().collect();
+        assert!(
+            lines.iter().any(|l| l.contains("**next**")),
+            "cold-load Focus editor must include trailing next: {lines:?}"
+        );
+        assert!(
+            lines.iter().all(|l| !l.starts_with("## ")),
+            "cold-load Focus open-region editor must not include H2: {lines:?}"
+        );
+    }
+
+    /// Focus↔Classic must rebuild editor lines immediately (review 02 / step 07).
+    #[test]
+    fn apply_viewer_style_rebuilds_hybrid_editor_content() {
+        use crate::config::ViewerStyle;
+
+        let src = "\
+## Motivation
+
+Why.
+
+> **write**
+>
+> path
+
+preview body
+
+> **next**
+>
+> `confirm`
+";
+        let mut ax = AgentSession::new("style-flip".into(), ScopeKind::Change);
+        ax.session.messages.push(ChatMessage {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text(src.into())],
+            timestamp: String::new(),
+            is_priming: false,
+        });
+        let hl = SyntaxHighlighter::new();
+
+        // Classic: full Answer body in the editor.
+        ax.viewer_style = ViewerStyle::Classic;
+        materialize_chat_ui(&mut ax, &hl);
+        let ans_idx = ax
+            .chat_blocks
+            .iter()
+            .position(|b| b.kind == BlockKind::Assistant)
+            .expect("answer block");
+        let classic_lines: Vec<String> = ax.chat_editors[ans_idx].lines.iter().cloned().collect();
+        assert!(
+            classic_lines.iter().any(|l| l.starts_with("## ")),
+            "classic editor must include foldable body: {classic_lines:?}"
+        );
+        assert!(
+            classic_lines.iter().any(|l| l.contains("**next**")),
+            "classic editor must include trailing next: {classic_lines:?}"
+        );
+
+        // Classic → Focus: open-region lines only.
+        apply_viewer_style(&mut ax, ViewerStyle::Focus, &hl);
+        assert_eq!(ax.viewer_style, ViewerStyle::Focus);
+        let focus_lines: Vec<String> = ax.chat_editors[ans_idx].lines.iter().cloned().collect();
+        assert!(
+            focus_lines.iter().any(|l| l.contains("**next**")),
+            "focus open-region editor must include trailing next: {focus_lines:?}"
+        );
+        assert!(
+            focus_lines.iter().all(|l| !l.starts_with("## ")),
+            "focus open-region editor must not include foldable H2: {focus_lines:?}"
+        );
+
+        // Focus → Classic: full body restored without unrelated rematerialize.
+        apply_viewer_style(&mut ax, ViewerStyle::Classic, &hl);
+        assert_eq!(ax.viewer_style, ViewerStyle::Classic);
+        assert!(ax.focus_folds.is_empty(), "leaving Focus clears fold state");
+        let restored: Vec<String> = ax.chat_editors[ans_idx].lines.iter().cloned().collect();
+        assert!(
+            restored.iter().any(|l| l.starts_with("## ")),
+            "classic after style flip must restore full body: {restored:?}"
+        );
+        assert_eq!(
+            restored.len(),
+            classic_lines.len(),
+            "restored classic editor line count should match first classic materialize"
+        );
+    }
+
+    // ── layout/content-chat-split ─────────────────────────────────────────
+
+    // @spec layout/content-chat-split Uncustomized equal width: Default half of free space
+    #[test]
+    fn default_half_of_free_space() {
+        // GIVEN an uncustomized panel + window with free space large enough for half > min
+        let window_w = theme::DEFAULT_WINDOW_WIDTH;
+        let free = free_content_chat_width(window_w);
+        assert!(
+            free / 2.0 > interaction_toggle::MIN_PANEL_WIDTH,
+            "fixture window must allow a half above min"
+        );
+        // WHEN the interaction column width is resolved
+        let width = equal_interaction_width(window_w);
+        // THEN width equals half of free space
+        assert_eq!(width, free / 2.0);
+        let ix = InteractionState::default();
+        assert!(!ix.width_customized);
+        assert_eq!(ix.width, equal_interaction_width(window_w));
+    }
+
+    // @spec layout/content-chat-split Uncustomized equal width: Resize rebalances to half free space
+    #[test]
+    fn resize_rebalances_to_half_free_space() {
+        // GIVEN an uncustomized panel
+        let mut ix = InteractionState::default();
+        assert!(!ix.width_customized);
+        // WHEN the window width changes to a new size still above min half
+        let new_w = 1600.0;
+        rebalance_uncustomized(&mut ix, new_w);
+        // THEN width equals half free for the new window
+        assert_eq!(ix.width, equal_interaction_width(new_w));
+        assert_eq!(ix.width, free_content_chat_width(new_w) / 2.0);
+    }
+
+    // @spec layout/content-chat-split Uncustomized equal width: Half floors at minimum panel width
+    #[test]
+    fn half_floors_at_minimum_panel_width() {
+        // GIVEN free space less than twice the minimum panel width
+        // free = W - SIDEBAR - 1 - LIST - list_handle - chat_handle; want free < 2 * MIN
+        let fixed = theme::SIDEBAR_WIDTH
+            + 1.0
+            + theme::LIST_COLUMN_WIDTH
+            + crate::widget::list_resize::HANDLE_WIDTH
+            + interaction_toggle::HANDLE_WIDTH;
+        let window_w = fixed + interaction_toggle::MIN_PANEL_WIDTH; // free = MIN < 2*MIN
+        assert!(free_content_chat_width(window_w) < 2.0 * interaction_toggle::MIN_PANEL_WIDTH);
+        // WHEN width is resolved
+        let width = equal_interaction_width(window_w);
+        // THEN width equals the minimum panel width
+        assert_eq!(width, interaction_toggle::MIN_PANEL_WIDTH);
+    }
+
+    // @spec layout/content-chat-split Uncustomized equal width: Half may exceed the old fixed max width
+    #[test]
+    fn half_may_exceed_the_old_fixed_max_width() {
+        // GIVEN free space more than twice 800
+        let fixed = theme::SIDEBAR_WIDTH
+            + 1.0
+            + theme::LIST_COLUMN_WIDTH
+            + crate::widget::list_resize::HANDLE_WIDTH
+            + interaction_toggle::HANDLE_WIDTH;
+        let window_w = fixed + 1601.0; // free > 1600 → half > 800
+        assert!(free_content_chat_width(window_w) > 1600.0);
+        // WHEN width is resolved
+        let width = equal_interaction_width(window_w);
+        // THEN half free and > 800
+        assert_eq!(width, free_content_chat_width(window_w) / 2.0);
+        assert!(width > 800.0);
+    }
+
+    // @spec layout/content-chat-split Grip customization: First grip width change locks absolute width
+    #[test]
+    fn first_grip_width_change_locks_absolute_width() {
+        // GIVEN an uncustomized panel
+        let mut ix = InteractionState::default();
+        assert!(!ix.width_customized);
+        let hl = SyntaxHighlighter::new();
+        // WHEN the grip sets an absolute width
+        let chosen = 350.0;
+        update(
+            &mut ix,
+            Msg::Handle(interaction_toggle::HandleMsg::SetWidth(chosen)),
+            &hl,
+            false,
+        );
+        // THEN customized with that absolute width
+        assert!(ix.width_customized);
+        assert_eq!(ix.width, chosen);
+        assert!(!ix.content_collapsed);
+    }
+
+    // @spec layout/content-chat-split Grip customization: Resize after lock keeps absolute width
+    #[test]
+    fn resize_after_lock_keeps_absolute_width() {
+        // GIVEN a customized panel with remembered absolute width
+        let mut ix = InteractionState::default();
+        let hl = SyntaxHighlighter::new();
+        let locked = 420.0;
+        update(
+            &mut ix,
+            Msg::Handle(interaction_toggle::HandleMsg::SetWidth(locked)),
+            &hl,
+            false,
+        );
+        assert!(ix.width_customized);
+        // WHEN window width changes
+        rebalance_uncustomized(&mut ix, 1800.0);
+        // THEN absolute width is kept
+        assert_eq!(ix.width, locked);
+    }
+
+    // @spec layout/content-chat-split Content-hidden fill: Interaction column fills when content column is hidden
+    #[test]
+    fn interaction_column_fills_when_content_column_is_hidden() {
+        // GIVEN a visible interaction panel with a remembered split width
+        let remembered = 400.0;
+        // AND the content column is not shown
+        // WHEN the three-column area is laid out
+        let size = interaction_column_size(false, remembered);
+        // THEN the interaction column fills remaining width rather than fixed equal-split
+        assert_eq!(size, InteractionColumnSize::Fill);
+        // Contrast: with content shown, the remembered width is fixed
+        assert_eq!(
+            interaction_column_size(true, remembered),
+            InteractionColumnSize::Fixed(remembered)
+        );
+    }
+
+    // @spec layout/content-chat-split Content-hidden fill: No open tabs hides content column
+    #[test]
+    fn no_open_tabs_hides_content_column() {
+        // GIVEN a three-column area with no open tabs and content not collapsed
+        let has_tabs = false;
+        let content_collapsed = false;
+        // WHEN layout visibility is resolved
+        let show = show_content_column(has_tabs, content_collapsed);
+        // THEN content is not shown and interaction fills
+        assert!(!show);
+        assert_eq!(
+            interaction_column_size(show, 400.0),
+            InteractionColumnSize::Fill
+        );
+    }
+
+    // @spec layout/content-chat-split Content-hidden fill: Opening a tab restores content column
+    #[test]
+    fn opening_a_tab_restores_content_column() {
+        // GIVEN content hidden because there are no open tabs
+        assert!(!show_content_column(false, false));
+        // WHEN a list selection opens a tab (has_tabs becomes true)
+        let show = show_content_column(true, false);
+        // THEN content is shown and interaction uses fixed width
+        assert!(show);
+        let remembered = 437.0;
+        assert_eq!(
+            interaction_column_size(show, remembered),
+            InteractionColumnSize::Fixed(remembered)
+        );
+    }
+
+    // @spec layout/content-chat-split Grip customization: Open/close and content collapse do not lock
+    #[test]
+    fn open_close_and_content_collapse_do_not_lock() {
+        // GIVEN an uncustomized panel
+        let mut ix = InteractionState::default();
+        let hl = SyntaxHighlighter::new();
+        let start_w = ix.width;
+        // WHEN closed and opened again
+        update(
+            &mut ix,
+            Msg::Handle(interaction_toggle::HandleMsg::Toggle),
+            &hl,
+            false,
+        );
+        assert!(ix.visible);
+        update(
+            &mut ix,
+            Msg::Handle(interaction_toggle::HandleMsg::Toggle),
+            &hl,
+            false,
+        );
+        assert!(!ix.visible);
+        update(
+            &mut ix,
+            Msg::Handle(interaction_toggle::HandleMsg::Toggle),
+            &hl,
+            false,
+        );
+        // AND content collapsed and restored without a grip width change
+        update(
+            &mut ix,
+            Msg::Handle(interaction_toggle::HandleMsg::SetCollapsed(true)),
+            &hl,
+            false,
+        );
+        assert!(ix.content_collapsed);
+        update(
+            &mut ix,
+            Msg::Handle(interaction_toggle::HandleMsg::SetCollapsed(false)),
+            &hl,
+            false,
+        );
+        assert!(!ix.content_collapsed);
+        // THEN still uncustomized and equal width for current (default) window
+        assert!(!ix.width_customized);
+        rebalance_uncustomized(&mut ix, theme::DEFAULT_WINDOW_WIDTH);
+        assert_eq!(
+            ix.width,
+            equal_interaction_width(theme::DEFAULT_WINDOW_WIDTH)
+        );
+        assert_eq!(ix.width, start_w);
+    }
+
+    // @spec layout/content-chat-split Uncustomized equal width: Panel created for a known window starts at half free space
+    #[test]
+    fn panel_created_for_a_known_window_starts_at_half_free_space() {
+        // GIVEN a window width with free space large enough for half > min
+        // AND that width is not the fixed default window size
+        let window_w = 1800.0;
+        assert_ne!(window_w, theme::DEFAULT_WINDOW_WIDTH);
+        let free = free_content_chat_width(window_w);
+        assert!(
+            free / 2.0 > interaction_toggle::MIN_PANEL_WIDTH,
+            "fixture window must allow a half above min"
+        );
+        // WHEN a new uncustomized panel is constructed for that window
+        let ix = InteractionState::for_window(window_w);
+        // THEN width equals half of free space for that window
+        assert!(!ix.width_customized);
+        assert_eq!(ix.width, equal_interaction_width(window_w));
+        assert_eq!(ix.width, free / 2.0);
+        // Contrast: Default is still tied to DEFAULT_WINDOW_WIDTH
+        assert_eq!(
+            InteractionState::default().width,
+            equal_interaction_width(theme::DEFAULT_WINDOW_WIDTH)
+        );
+    }
+
+    // @spec layout/content-chat-split Uncustomized equal width: Programmatic open rebalances to half free space
+    #[test]
+    fn programmatic_open_rebalances_to_half_free_space() {
+        // GIVEN an uncustomized panel whose width was set for a different window
+        let mut ix = InteractionState::for_window(theme::DEFAULT_WINDOW_WIDTH);
+        assert!(!ix.width_customized);
+        assert!(!ix.visible);
+        let stale = ix.width;
+        // AND content is shown (force-show path keeps equal fixed width, not fill)
+        // AND current window free space allows half above min
+        let current_w = 1800.0;
+        assert_ne!(
+            equal_interaction_width(current_w),
+            stale,
+            "fixture must differ from default half"
+        );
+        assert!(free_content_chat_width(current_w) / 2.0 > interaction_toggle::MIN_PANEL_WIDTH);
+        // WHEN the panel is force-shown without a door open
+        show_panel(&mut ix, current_w);
+        // THEN width equals half free for the current window and stays uncustomized
+        assert!(ix.visible);
+        assert!(!ix.width_customized);
+        assert_eq!(ix.width, equal_interaction_width(current_w));
+        assert_eq!(ix.width, free_content_chat_width(current_w) / 2.0);
+    }
 }
 
 // ── Shared messages ─────────────────────────────────────────────────────────
@@ -1916,6 +3252,8 @@ pub fn update(
             }
             interaction_toggle::HandleMsg::SetWidth(w) => {
                 state.width = w;
+                // First grip drag locks absolute width for the rest of the session.
+                state.width_customized = true;
                 // A width drag means the content column is showing again.
                 state.content_collapsed = false;
             }
@@ -1948,12 +3286,7 @@ pub fn update(
             }
         }
         Msg::AgentChat(chat_msg) => {
-            handle_agent_chat(
-                state,
-                chat_msg,
-                highlighter,
-                agent_input_hints,
-            );
+            handle_agent_chat(state, chat_msg, highlighter, agent_input_hints);
         }
         Msg::TerminalScroll => {
             if let Some(tt) = state.active_terminal_mut() {
@@ -1982,7 +3315,7 @@ fn handle_agent_chat(
     state: &mut InteractionState,
     msg: agent_chat::Msg,
     highlighter: &SyntaxHighlighter,
-    agent_input_hints: bool,
+    _agent_input_hints: bool,
 ) {
     let Some(ax) = state.active_mut() else { return };
     match msg {
@@ -2120,23 +3453,50 @@ fn handle_agent_chat(
                 }
             }
         }
-        agent_chat::Msg::SendObviousAction(text) => {
-            // Obvious chrome only — never the oneshot default-prompt list.
-            // Chips pass the resolved action string; re-check visibility so a
-            // stale click while typing/streaming is a no-op.
+        agent_chat::Msg::ToggleFocusSection { block_idx, key } => {
+            let folds = ax.focus_folds.entry(block_idx).or_default();
+            crate::focus_answer::toggle_section_fold(folds, &key);
+        }
+        agent_chat::Msg::ActivateFastResponse(pick) => {
+            // Fast response only — never the oneshot default-prompt list.
+            // Re-check visibility so a stale click while typing is a no-op.
             let input_empty = ax.chat_input.text().trim().is_empty();
-            if crate::obvious_bubble::chrome_visible(
+            if !crate::fast_response::visible(
                 ax.session.is_streaming,
+                ax.is_awaiting_user,
                 input_empty,
-                &ax.obvious_chrome,
+                &ax.fast_response,
             ) {
-                dispatch_user_submit(ax, text, highlighter);
+                // no-op
+            } else {
+                activate_fast_response(ax, pick, highlighter);
             }
+        }
+        agent_chat::Msg::PhasePillSend(text) => {
+            submit_phase_pill_text(ax, text, highlighter);
         }
         agent_chat::Msg::SendPressed => {
             let typed = ax.chat_input.text().trim().to_string();
 
-            if ax.session.is_streaming {
+            // Awaiting a structured choice: freeform submit is a custom answer
+            // on the parked question (in-band), not cancel + next user turn.
+            if let Some(plan) =
+                plan_freeform_while_awaiting(ax.is_awaiting_user, &ax.fast_response.source, &typed)
+            {
+                let answer_text = plan.text.clone();
+                if let Some(correlation_id) = plan.correlation_id
+                    && let Some(handle) = ax.agent_handle.as_ref()
+                {
+                    handle.answer_user_choice(
+                        correlation_id,
+                        duckchat::UserChoiceAnswer::Custom { text: plan.text },
+                    );
+                }
+                settle_user_choice_transcript(ax, answer_text);
+                ax.chat_input = EditorState::new("");
+                rehighlight_input(&mut ax.chat_input, highlighter);
+                ax.chat_completion.visible = false;
+            } else if ax.session.is_streaming {
                 if !typed.is_empty() {
                     // Streaming + text in input → stage/append to queue,
                     // clear input. Never interrupts.
@@ -2151,9 +3511,9 @@ fn handle_agent_chat(
                 } else if ax.queue_editor.is_some() {
                     // Streaming + empty input + queue present → interrupt.
                     // The queue will auto-flush when TurnComplete arrives.
-                    if let Some(handle) = &ax.agent_handle {
-                        handle.cancel();
-                    }
+                    // Same cancel path as CancelPressed: disarm pilot so the
+                    // cancelled completion cannot pilot-auto-send.
+                    cancel_streaming_main_turn(ax);
                 }
                 // Streaming + empty input + no queue → no-op.
             } else {
@@ -2198,27 +3558,11 @@ fn handle_agent_chat(
             // working and signal focus for the follow-up focus task.
             ax.chat_input_focused = true;
         }
-        agent_chat::Msg::SendOneshotSuggestion => {
-            // Empty Cmd-Enter: send armed oneshot when ready; else no-op.
-            // Never used for next actions (those own plain Enter).
-            if !ax.chat_input.text().trim().is_empty() {
-                return;
-            }
-            let prompts = ax.session_oneshot_prompts(agent_input_hints);
-            let Some(text) = crate::default_prompts::oneshot_cmd_submit_text(
-                ax.default_prompts_pending,
-                ax.session.is_streaming,
-                agent_input_hints,
-                &prompts,
-            ) else {
-                return;
-            };
-            dispatch_user_submit(ax, text, highlighter);
-        }
         agent_chat::Msg::CancelPressed => {
-            if let Some(handle) = &ax.agent_handle {
-                handle.cancel();
-            }
+            // Capture draft, cancel agent, disarm pilot (build-pilot).
+            cancel_streaming_main_turn(ax);
+            // Cancel also completes a parked choice as cancelled (handle side).
+            clear_user_choice_shell(ax);
             // Drop staged follow-up so post-`TurnComplete` cannot dispatch
             // the original message after the user backed out of priming.
             clear_priming_followup(ax);
@@ -2274,21 +3618,13 @@ fn handle_agent_chat(
                 ax.stick_to_bottom = false;
             }
 
-            // Bottom-pin pad for obvious chrome (when content > viewport so
+            // Bottom-pin pad for fast response (when content > viewport so
             // on_scroll fires). Short content is measured via ChromeLayout.
-            recompute_chrome_top_pad(
-                ax,
-                bounds.height,
-                content.height,
-            );
+            recompute_fast_response_top_pad(ax, bounds.height, content.height);
 
             // Re-engaging stick while pure-content dirtiness was deferred
             // (user was reading history): paint the live answer now.
-            if ax.stick_to_bottom
-                && !was_stuck
-                && ax.chat_ui_dirty
-                && ax.session.is_streaming
-            {
+            if ax.stick_to_bottom && !was_stuck && ax.chat_ui_dirty && ax.session.is_streaming {
                 materialize_chat_ui(ax, highlighter);
             }
         }
@@ -2298,42 +3634,37 @@ fn handle_agent_chat(
         } => {
             // Operation-based measure — works even when content fits the
             // viewport and iced suppresses on_scroll.
-            recompute_chrome_top_pad(ax, viewport_h, content_h);
+            recompute_fast_response_top_pad(ax, viewport_h, content_h);
         }
     }
 
     // When chrome is hidden (typing, streaming, empty chrome), drop the pad
     // so the next show measures from a clean baseline.
     let input_empty = ax.chat_input.text().trim().is_empty();
-    if !crate::obvious_bubble::chrome_visible(
+    if !crate::fast_response::visible(
         ax.session.is_streaming,
+        ax.is_awaiting_user,
         input_empty,
-        &ax.obvious_chrome,
+        &ax.fast_response,
     ) {
-        ax.chrome_top_pad = 0.0;
+        ax.fast_response_top_pad = 0.0;
     }
 }
 
-/// Recompute `chrome_top_pad` from scroll/measure bounds. Zero when chrome
-/// is not visible so the next show starts clean.
-fn recompute_chrome_top_pad(
-    ax: &mut AgentSession,
-    viewport_h: f32,
-    content_h: f32,
-) {
+/// Recompute `fast_response_top_pad` from scroll/measure bounds. Zero when chips
+/// are not visible so the next show starts clean.
+fn recompute_fast_response_top_pad(ax: &mut AgentSession, viewport_h: f32, content_h: f32) {
     let input_empty = ax.chat_input.text().trim().is_empty();
-    if crate::obvious_bubble::chrome_visible(
+    if crate::fast_response::visible(
         ax.session.is_streaming,
+        ax.is_awaiting_user,
         input_empty,
-        &ax.obvious_chrome,
+        &ax.fast_response,
     ) {
-        ax.chrome_top_pad = crate::obvious_bubble::chrome_bottom_pad(
-            viewport_h,
-            content_h,
-            ax.chrome_top_pad,
-        );
+        ax.fast_response_top_pad =
+            crate::fast_response::bottom_pad(viewport_h, content_h, ax.fast_response_top_pad);
     } else {
-        ax.chrome_top_pad = 0.0;
+        ax.fast_response_top_pad = 0.0;
     }
 }
 
@@ -2380,6 +3711,28 @@ pub fn set_tentative_from_tab(ax: &mut AgentSession, editor: &EditorState, displ
 
 /// Build a read-only queue editor with markdown highlighting applied so the
 /// queue pill reads like a regular chat message.
+/// Submit phase-pill activation text: send when idle, queue while streaming
+/// (same policy as ordinary submit with typed text while streaming).
+pub(crate) fn submit_phase_pill_text(
+    ax: &mut AgentSession,
+    text: String,
+    highlighter: &SyntaxHighlighter,
+) {
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return;
+    }
+    if ax.session.is_streaming {
+        let combined = match ax.queue_editor.as_ref() {
+            Some(q) => format!("{}\n\n{}", q.text(), text),
+            None => text,
+        };
+        ax.queue_editor = Some(make_queue_editor(&combined, highlighter));
+    } else {
+        dispatch_user_submit(ax, text, highlighter);
+    }
+}
+
 fn make_queue_editor(text: &str, highlighter: &SyntaxHighlighter) -> EditorState {
     let mut editor = EditorState::new(text);
     let syntax = highlighter.find_syntax("md");
@@ -2393,6 +3746,24 @@ fn make_queue_editor(text: &str, highlighter: &SyntaxHighlighter) -> EditorState
 /// history, so re-priming would repeat it.
 fn should_prime(resumable_session_id: Option<&str>, has_prior_messages: bool) -> bool {
     resumable_session_id.is_none() && !has_prior_messages
+}
+
+/// Build orientation input for an agent session, detecting a non-empty inputs
+/// ledger under the project root when the scope is a change.
+fn session_scope_for_ax(
+    ax: &AgentSession,
+    project_root: Option<&std::path::Path>,
+) -> crate::scope::SessionScope {
+    let has_inputs_ledger = ax.scope_kind == crate::scope::ScopeKind::Change
+        && project_root.is_some_and(|root| {
+            crate::inputs_ledger::inputs_ledger_is_present(root, &ax.session.scope)
+        });
+    crate::scope::SessionScope {
+        kind: ax.scope_kind,
+        scope_key: ax.session.scope.clone(),
+        change_facts: ax.scope_facts.clone(),
+        has_inputs_ledger,
+    }
 }
 
 /// Assemble the first-turn priming body from the available orientation parts:
@@ -2436,6 +3807,8 @@ pub fn recover_from_lost_session(ax: &mut AgentSession, highlighter: &SyntaxHigh
     use crate::chat_store::{ContentBlock, Role};
     use duckchat::{ContextHook, TurnRequest};
 
+    // Always drop the dead resume id first — even when we cannot re-dispatch
+    // (missing model) so a later send does not keep calling session/load.
     ax.session.agent_session_id = None;
     ax.session.session_harness = None;
     ax.priming_in_flight = false;
@@ -2447,21 +3820,35 @@ pub fn recover_from_lost_session(ax: &mut AgentSession, highlighter: &SyntaxHigh
         handle.clear_session_id();
     }
 
-    // Last non-priming user message is the turn that failed mid-resume.
-    let Some((last_idx, text)) = ax.session.messages.iter().enumerate().rev().find_map(|(i, m)| {
-        if m.role != Role::User || m.is_priming {
-            return None;
-        }
-        m.content.iter().find_map(|b| match b {
-            ContentBlock::Text(t) if !t.is_empty() => Some((i, t.clone())),
-            _ => None,
-        })
-    }) else {
+    // Same gate as send: do not re-dispatch with a missing model.
+    if !main_chat_turn_allowed(&ax.effective_model()) {
         ax.session.is_streaming = false;
-        if let Some(handle) = ax.agent_handle.as_ref()
-            && let Err(e) = crate::chat_store::save_session(&ax.session, Some(handle.working_dir()))
-        {
-            tracing::error!("failed to persist cleared session id: {e}");
+        materialize_chat_ui(ax, highlighter);
+        return;
+    }
+
+    // Last non-priming user message is the turn that failed mid-resume.
+    let Some((last_idx, text)) = ax
+        .session
+        .messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(i, m)| {
+            if m.role != Role::User || m.is_priming {
+                return None;
+            }
+            m.content.iter().find_map(|b| match b {
+                ContentBlock::Text(t) if !t.is_empty() => Some((i, t.clone())),
+                _ => None,
+            })
+        })
+    else {
+        ax.session.is_streaming = false;
+        if let Some(root) = ax.agent_handle.as_ref().map(|h| h.working_dir().to_path_buf()) {
+            if !ax.mark_driven_and_persist(Some(root.as_path())) {
+                tracing::error!("failed to persist cleared session id");
+            }
         }
         materialize_chat_ui(ax, highlighter);
         return;
@@ -2471,28 +3858,26 @@ pub fn recover_from_lost_session(ax: &mut AgentSession, highlighter: &SyntaxHigh
     // Local system messages never needed an agent turn — do not re-dispatch.
     let Some(agent_text) = crate::slash_commands::agent_prompt_for_recovery(&text) else {
         ax.session.is_streaming = false;
-        if let Some(handle) = ax.agent_handle.as_ref()
-            && let Err(e) = crate::chat_store::save_session(&ax.session, Some(handle.working_dir()))
-        {
-            tracing::error!("failed to persist cleared session id: {e}");
+        if let Some(root) = ax.agent_handle.as_ref().map(|h| h.working_dir().to_path_buf()) {
+            if !ax.mark_driven_and_persist(Some(root.as_path())) {
+                tracing::error!("failed to persist cleared session id");
+            }
         }
         materialize_chat_ui(ax, highlighter);
         return;
     };
+    let prompt = build_recovery_prompt(&mut ax.session, last_idx, &agent_text);
 
-    let history = &ax.session.messages[..last_idx];
-    let prompt = if history.is_empty() {
-        agent_text.clone()
-    } else {
-        build_history_preamble(history) + &agent_text
+    let Some(handle) = ax.agent_handle.as_ref() else {
+        ax.session.is_streaming = false;
+        materialize_chat_ui(ax, highlighter);
+        return;
     };
+    let resume_root = handle.working_dir().to_path_buf();
+    let handle = handle.clone();
 
     let mut system_additions = Vec::new();
-    let scope = crate::scope::SessionScope {
-        kind: ax.scope_kind,
-        scope_key: ax.session.scope.clone(),
-        change_facts: ax.scope_facts.clone(),
-    };
+    let scope = session_scope_for_ax(ax, Some(resume_root.as_path()));
     if let Some(out) = crate::scope::CurrentScopeHook.compute(&scope) {
         system_additions.push(out.text);
     }
@@ -2506,32 +3891,22 @@ pub fn recover_from_lost_session(ax: &mut AgentSession, highlighter: &SyntaxHigh
         ax.session.last_seeded_description = Some(desc.clone());
     }
 
-    let Some(handle) = ax.agent_handle.as_ref() else {
-        ax.session.is_streaming = false;
-        materialize_chat_ui(ax, highlighter);
-        return;
-    };
-
     ax.session.is_streaming = true;
     ax.session.pending_text.clear();
     ax.session.pending_reasoning.clear();
     reset_answer_thrash(&mut ax.session);
-    if let Err(e) = crate::chat_store::save_session(&ax.session, Some(handle.working_dir())) {
-        tracing::error!("failed to persist session after resume loss: {e}");
+    ax.cancel_in_flight = false;
+    if !ax.mark_driven_and_persist(Some(resume_root.as_path())) {
+        tracing::error!("failed to persist session after resume loss");
     }
     if ax.stick_to_bottom {
         ax.pending_snap_to_bottom = true;
     }
 
-    let mut req = TurnRequest::new(prompt, handle.working_dir().to_path_buf());
+    let mut req = TurnRequest::new(prompt, resume_root);
     req.system_additions = system_additions;
-    req.model = Some(
-        resolve_turn_model(
-            ax.session.selected_model.as_ref(),
-            ax.project_model_default.as_ref(),
-        )
-        .model,
-    );
+    // Preferred cascade model id (send gate blocks when not available).
+    req.model = ax.preferred_model().map(|m| m.model);
     // Attachments already went out with the failed attempt (or were empty).
     // Don't re-take from input — leave as empty for the recovery turn.
     handle.send_turn(req);
@@ -2541,6 +3916,180 @@ pub fn recover_from_lost_session(ax: &mut AgentSession, highlighter: &SyntaxHigh
         scope = %ax.session.scope,
         "re-dispatched last user turn after lost agent session"
     );
+}
+
+/// Activate a fast-response pick. Live user choice answers in-band via the
+/// agent handle and commits host Q→A transcript blocks. Oneshot hints send the
+/// option text as a normal user turn. Clears typed composer text when answering
+/// a user choice so a partial custom answer is not left for a later send.
+pub fn activate_fast_response(
+    ax: &mut AgentSession,
+    pick: crate::fast_response::FastResponsePick,
+    highlighter: &SyntaxHighlighter,
+) {
+    use crate::fast_response::{FastResponsePick, FastResponseSource};
+    use duckchat::UserChoiceAnswer;
+
+    let source = ax.fast_response.source.clone();
+    match source {
+        FastResponseSource::UserChoice {
+            correlation_id,
+            prompt: _,
+        } => {
+            let FastResponsePick::Option { id } = pick;
+            let label = ax
+                .fast_response
+                .options
+                .iter()
+                .find(|o| o.id == id)
+                .map(|o| o.label.clone())
+                .unwrap_or_else(|| id.clone());
+            // Custom freeform is handled by freeform submit path, not chip pick.
+            if let Some(handle) = ax.agent_handle.as_ref() {
+                handle.answer_user_choice(
+                    correlation_id,
+                    UserChoiceAnswer::Selected { option_id: id },
+                );
+            }
+            settle_user_choice_transcript(ax, label);
+            // Discard partial freeform typed while chips were still visible.
+            ax.chat_input = EditorState::new("");
+            rehighlight_input(&mut ax.chat_input, highlighter);
+            ax.chat_completion.visible = false;
+        }
+        FastResponseSource::OneshotHints => {
+            let FastResponsePick::Option { id: text } = pick;
+            ax.agent_default_prompts.clear();
+            ax.default_prompts_pending = false;
+            ax.fast_response = crate::fast_response::clear();
+            ax.fast_response_top_pad = 0.0;
+            send_prompt_text(ax, text, highlighter);
+        }
+        FastResponseSource::None => {
+            // No live source — nothing to activate (shell should be empty).
+        }
+    }
+}
+
+/// Derive the fast-response shell from settled oneshot replies when eligible.
+/// Leaves a parked user-choice fill alone. Otherwise fills from oneshot or
+/// clears the shell.
+pub fn sync_oneshot_chips(ax: &mut AgentSession, agent_input_hints: bool) {
+    use crate::fast_response::{self, FastResponseSource};
+
+    if ax.is_awaiting_user
+        || matches!(
+            ax.fast_response.source,
+            FastResponseSource::UserChoice { .. }
+        )
+    {
+        return;
+    }
+
+    let prompts = ax.session_oneshot_prompts(agent_input_hints);
+    if crate::default_prompts::oneshot_chips_allowed(
+        ax.session.is_streaming,
+        ax.is_awaiting_user,
+        ax.next_actions.len(),
+        agent_input_hints,
+        prompts.len(),
+    ) {
+        ax.fast_response = fast_response::from_oneshot_hints(prompts);
+    } else {
+        ax.fast_response = fast_response::clear();
+        ax.fast_response_top_pad = 0.0;
+    }
+}
+
+/// Drop fast-response fill and awaiting flag after answer or turn end.
+/// Does not commit host question/answer transcript blocks (cancel path).
+pub fn clear_user_choice_shell(ax: &mut AgentSession) {
+    ax.fast_response = crate::fast_response::clear();
+    ax.is_awaiting_user = false;
+    ax.fast_response_top_pad = 0.0;
+}
+
+/// Commit host question/answer transcript blocks for a settled choice, then
+/// clear the shell. Caller performs the in-band wire answer separately.
+/// Empty/missing prompt omits the question message; answer is always appended.
+pub fn settle_user_choice_transcript(ax: &mut AgentSession, answer_text: String) {
+    use crate::chat_store::{ChatMessage, ContentBlock, Role};
+    use crate::fast_response::FastResponseSource;
+
+    let prompt = match &ax.fast_response.source {
+        FastResponseSource::UserChoice { prompt, .. } => prompt.clone(),
+        _ => None,
+    };
+    let question = prompt
+        .as_deref()
+        .map(crate::fast_response::format_user_choice_question_text)
+        .filter(|s| !s.is_empty());
+
+    if let Some(text) = question {
+        ax.session.messages.push(ChatMessage {
+            role: Role::Assistant,
+            content: vec![ContentBlock::UserChoiceQuestion { text }],
+            timestamp: String::new(),
+            is_priming: false,
+        });
+    }
+
+    ax.session.messages.push(ChatMessage {
+        role: Role::User,
+        content: vec![ContentBlock::UserChoiceAnswer { text: answer_text }],
+        timestamp: String::new(),
+        is_priming: false,
+    });
+
+    ax.needs_flush = true;
+    ax.chat_ui_dirty = true;
+    clear_user_choice_shell(ax);
+}
+
+/// Planned freeform submit while a mid-turn choice is pending (custom answer).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreeformWhileAwaitingPlan {
+    /// Correlation id for the parked choice, when a live choice is parked.
+    pub correlation_id: Option<u64>,
+    /// Freeform text used as the custom answer payload.
+    pub text: String,
+}
+
+/// When awaiting a user choice with non-empty freeform text, plan a custom
+/// answer (in-band). Not cancel/skip and not interrupt-queue-only.
+pub fn plan_freeform_while_awaiting(
+    is_awaiting_user: bool,
+    source: &crate::fast_response::FastResponseSource,
+    typed: &str,
+) -> Option<FreeformWhileAwaitingPlan> {
+    let typed = typed.trim();
+    if !is_awaiting_user || typed.is_empty() {
+        return None;
+    }
+    let correlation_id = match source {
+        crate::fast_response::FastResponseSource::UserChoice { correlation_id, .. } => {
+            Some(*correlation_id)
+        }
+        crate::fast_response::FastResponseSource::None
+        | crate::fast_response::FastResponseSource::OneshotHints => None,
+    };
+    Some(FreeformWhileAwaitingPlan {
+        correlation_id,
+        text: typed.to_string(),
+    })
+}
+
+/// Fill shell from a mid-turn user-choice event (options + prompt; no cancel chip).
+pub fn apply_user_choice_request(
+    ax: &mut AgentSession,
+    correlation_id: u64,
+    prompt: Option<String>,
+    options: Vec<(String, String)>,
+    _allow_cancel: bool,
+) {
+    // UI ignores allow_cancel — shell has no cancel chip; esc/freeform cancel on wire.
+    ax.fast_response = crate::fast_response::from_user_choice(correlation_id, prompt, options);
+    ax.is_awaiting_user = true;
 }
 
 /// Route a user submit: local system commands (`/help`) or agent turns
@@ -2554,15 +4103,40 @@ pub fn dispatch_user_submit(
         crate::slash_commands::SubmitSlash::LocalHelp => {
             run_system_help(ax, highlighter);
         }
+        crate::slash_commands::SubmitSlash::LocalBuildPilot { mode, args } => {
+            run_build_pilot_submit(ax, mode, &args, highlighter);
+        }
         crate::slash_commands::SubmitSlash::Agent { display, prompt } => {
             send_agent_turn(ax, display, prompt, highlighter);
         }
     }
 }
 
+/// Arm build pilot when the scope has a kick head, then send the rewritten
+/// `/ds-*` (or lifecycle head) turn. No-ops without arming on caps/codex/etc.
+///
+/// Pilot is armed only if the kick agent turn actually starts (atomic arm+kick).
+pub fn run_build_pilot_submit(
+    ax: &mut AgentSession,
+    mode: crate::slash_commands::BuildPilotMode,
+    args: &str,
+    highlighter: &SyntaxHighlighter,
+) {
+    let head = ax.lifecycle_bootstrap().map(|s| s.to_string());
+    let Some(kick) = crate::build_pilot::kick_text(head.as_deref(), args) else {
+        return;
+    };
+    // User bubble and agent prompt are both the rewritten kick — not `/build-*`.
+    // Arm only after send commits so a no-op send cannot leave pilot Armed.
+    if send_agent_turn(ax, kick.clone(), kick, highlighter) {
+        ax.pilot = crate::build_pilot::PilotState::Armed(mode);
+    }
+}
+
 /// Compatibility entry: treat `text` as both user-bubble and agent prompt after
 /// slash routing (same as [`dispatch_user_submit`]).
 pub fn send_prompt_text(ax: &mut AgentSession, text: String, highlighter: &SyntaxHighlighter) {
+    ax.mark_driven();
     dispatch_user_submit(ax, text, highlighter);
 }
 
@@ -2572,11 +4146,7 @@ pub fn run_system_help(ax: &mut AgentSession, highlighter: &SyntaxHighlighter) {
 
     ax.clear_agent_default_prompts();
 
-    let harness = resolve_turn_model(
-        ax.session.selected_model.as_ref(),
-        ax.project_model_default.as_ref(),
-    )
-    .harness;
+    let harness = ax.effective_harness();
     let body = crate::slash_commands::build_system_help_body(
         &ax.chat_commands,
         Some(harness.as_str()),
@@ -2603,8 +4173,8 @@ pub fn run_system_help(ax: &mut AgentSession, highlighter: &SyntaxHighlighter) {
         .agent_handle
         .as_ref()
         .map(|h| h.working_dir().to_path_buf());
-    if let Err(e) = crate::chat_store::save_session(&ax.session, root.as_deref()) {
-        tracing::error!("failed to persist chat session on system help: {e}");
+    if !ax.mark_driven_and_persist(root.as_deref()) {
+        tracing::error!("failed to persist chat session on system help");
     }
 
     if ax.stick_to_bottom {
@@ -2619,20 +4189,46 @@ pub fn run_system_help(ax: &mut AgentSession, highlighter: &SyntaxHighlighter) {
 
 /// Send an agent turn. `display` is stored as the user message; `prompt` is what
 /// the harness receives (may differ when the user used `//` escape).
+///
+/// Returns `true` when a turn was started (handle received a send), `false`
+/// when the call no-ops (blocked model, no handle, stack gate, etc.).
 fn send_agent_turn(
     ax: &mut AgentSession,
     display: String,
     prompt_text: String,
     highlighter: &SyntaxHighlighter,
-) {
+) -> bool {
     use duckchat::{ContextHook, TurnRequest};
+
+    // Stack require-base-merged: block agent turns until base is on Main.
+    if let Some(base) = ax.send_block_reason.clone() {
+        use crate::chat_store::{ChatMessage, ContentBlock, Role};
+        ax.session.messages.push(ChatMessage {
+            role: Role::System,
+            content: vec![ContentBlock::Text(format!(
+                "Blocked: merge `{base}` into Main before working on this stacked scope \
+                 (require base merged is on)."
+            ))],
+            timestamp: String::new(),
+            is_priming: false,
+        });
+        materialize_chat_ui(ax, highlighter);
+        return false;
+    }
+
+    // No substitute model: Missing / Unconfigured block main-chat send.
+    if !main_chat_turn_allowed(&ax.effective_model()) {
+        return false;
+    }
 
     // Stale agent defaults must not outlive a new turn.
     ax.clear_agent_default_prompts();
 
-    let Some(handle) = &ax.agent_handle else {
-        return;
+    let Some(handle) = ax.agent_handle.as_ref() else {
+        return false;
     };
+    let send_root = handle.working_dir().to_path_buf();
+    let handle = handle.clone();
 
     // First-turn orientation priming.
     //
@@ -2657,13 +4253,9 @@ fn send_agent_turn(
         // non-empty for any fresh session — we now prime even in projects
         // without an `AGENTS.md`.
         let agents_md = crate::scope::AgentsMarkdownHook
-            .compute(&handle.working_dir().to_path_buf())
+            .compute(&send_root)
             .map(|o| o.text);
-        let scope = crate::scope::SessionScope {
-            kind: ax.scope_kind,
-            scope_key: ax.session.scope.clone(),
-            change_facts: ax.scope_facts.clone(),
-        };
+        let scope = session_scope_for_ax(ax, Some(send_root.as_path()));
         let scope_blurb = crate::scope::CurrentScopeHook.compute(&scope).map(|o| o.text);
         let vcs_instructions = ax.vcs_workflow.standing_instructions();
         let priming_text = assemble_priming_body(
@@ -2689,20 +4281,12 @@ fn send_agent_turn(
         // Stash the original user-facing text so follow-up re-parses `//` escape.
         ax.pending_followup_prompt = Some(display);
 
-        let mut req = TurnRequest::new(priming_text, handle.working_dir().to_path_buf());
+        let mut req = TurnRequest::new(priming_text, send_root.clone());
         // All orientation now rides the message body above; `system_additions`
         // (the dropped `--append-system-prompt` channel) stays at its empty
         // default.
-        // Per-chat pin wins; otherwise the project default, otherwise the
-        // built-in default (grok-4.5). Prime on the same model so the resumed
-        // session stays consistent.
-        req.model = Some(
-            resolve_turn_model(
-                ax.session.selected_model.as_ref(),
-                ax.project_model_default.as_ref(),
-            )
-            .model,
-        );
+        // Same cascade as main send so priming stays on the preferred model.
+        req.model = ax.preferred_model().map(|m| m.model);
         // Selection / image attachments and idea-description blurb all
         // belong to the user's intended turn — leave them on `ax` so the
         // follow-up dispatch picks them up.
@@ -2712,7 +4296,7 @@ fn send_agent_turn(
         rehighlight_input(&mut ax.chat_input, highlighter);
         ax.chat_completion.visible = false;
         materialize_chat_ui(ax, highlighter);
-        return;
+        return true;
     }
 
     // Fallback: if we have prior messages but no Claude session to `--resume`,
@@ -2730,11 +4314,7 @@ fn send_agent_turn(
     // we're in. Subsequent turns ride `--resume` and skip this.
     let mut system_additions = Vec::new();
     if ax.resumable_session_id().is_none() {
-        let scope = crate::scope::SessionScope {
-            kind: ax.scope_kind,
-            scope_key: ax.session.scope.clone(),
-            change_facts: ax.scope_facts.clone(),
-        };
+        let scope = session_scope_for_ax(ax, Some(send_root.as_path()));
         if let Some(out) = crate::scope::CurrentScopeHook.compute(&scope) {
             system_additions.push(out.text);
         }
@@ -2784,6 +4364,13 @@ fn send_agent_turn(
         ax.session.last_seeded_description = Some(desc.clone());
     }
 
+    // Resync a cancelled turn's kept draft: the agent runtime never recorded
+    // that reply, so carry it once as agent-facing context after the user's
+    // text. Clears the draft; the save below persists the clear so a resend
+    // cannot replay a stale reminder. The transcript keeps only the user's
+    // text.
+    let prompt = apply_resync_reminder(prompt, &mut ax.session);
+
     ax.session.messages.push(crate::chat_store::ChatMessage {
         role: crate::chat_store::Role::User,
         content: vec![crate::chat_store::ContentBlock::Text(display)],
@@ -2794,15 +4381,18 @@ fn send_agent_turn(
     ax.session.pending_text.clear();
     ax.session.pending_reasoning.clear();
     reset_answer_thrash(&mut ax.session);
+    // A new turn is starting — a stale cancel flag must not make this turn's
+    // completed draft look cancelled at its TurnComplete.
+    ax.cancel_in_flight = false;
     // Persist the transcript the moment the user turn is added, not just on
     // `TurnComplete`. Otherwise closing the app mid-turn drops the in-flight
     // message: the only prior checkpoint is the last completed turn, and on a
     // fresh session that's the synthetic priming turn — so the whole real
     // conversation is lost while the resumable `agent_session_id` survives.
-    // `handle.working_dir()` is the project root the agent was spawned with,
+    // `send_root` is the project root the agent was spawned with,
     // which is exactly the `project_root` every other save/load site uses.
-    if let Err(e) = crate::chat_store::save_session(&ax.session, Some(handle.working_dir())) {
-        tracing::error!("failed to persist chat session on send: {e}");
+    if !ax.mark_driven_and_persist(Some(send_root.as_path())) {
+        tracing::error!("failed to persist chat session on send");
     }
     // The user's message just grew the transcript. If they were stuck to the
     // bottom we want them to see it land there immediately — without this
@@ -2811,18 +4401,10 @@ fn send_agent_turn(
         ax.pending_snap_to_bottom = true;
     }
 
-    let mut req = TurnRequest::new(prompt, handle.working_dir().to_path_buf());
+    let mut req = TurnRequest::new(prompt, send_root);
     req.system_additions = system_additions;
-    // Per-chat pin wins; otherwise the project default, otherwise the built-in
-    // default (grok-4.5). On a resumed session this model overrides the
-    // session's baked-in model for this turn.
-    req.model = Some(
-        resolve_turn_model(
-            ax.session.selected_model.as_ref(),
-            ax.project_model_default.as_ref(),
-        )
-        .model,
-    );
+    // Preferred cascade model id (send gate blocks when not available).
+    req.model = ax.preferred_model().map(|m| m.model);
     req.attachments = std::mem::take(&mut ax.input_attachments);
     handle.send_turn(req);
 
@@ -2833,6 +4415,7 @@ fn send_agent_turn(
     // Pinned attachments persist across messages until Cmd-R clears them.
     ax.selection_tentative = None;
     materialize_chat_ui(ax, highlighter);
+    true
 }
 
 /// Re-run markdown syntax highlighting on the chat input.
@@ -2841,28 +4424,86 @@ fn rehighlight_input(input: &mut EditorState, highlighter: &SyntaxHighlighter) {
     input.highlight_spans = Some(highlighter.highlight_lines(&input.lines, syntax));
 }
 
-/// The built-in default model — used when neither a per-chat pin nor a project
-/// default is set. See the `harness/selection` capability.
-pub(crate) fn builtin_default_model() -> ModelRef {
-    ModelRef::new("grok", "grok-4.5")
+/// Outcome of resolving the model for a turn: preferred cascade + catalog check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EffectiveModel {
+    Available(ModelRef),
+    /// Cascade produced a preferred choice that is not in the process catalog.
+    Missing {
+        preferred: ModelRef,
+    },
+    /// No pin, no project override, no global.
+    Unconfigured,
 }
 
-/// Resolve the model for a turn from the three-step cascade, most specific
-/// first: a per-chat `pin`, then the `project_default`, then the built-in
-/// default (grok-4.5). The first level that is set wins.
-pub(crate) fn resolve_turn_model(
+impl EffectiveModel {
+    pub(crate) fn is_available(&self) -> bool {
+        matches!(self, Self::Available(_))
+    }
+
+    /// Model ref to use when starting a turn, if available.
+    pub(crate) fn available_ref(&self) -> Option<&ModelRef> {
+        match self {
+            Self::Available(m) => Some(m),
+            _ => None,
+        }
+    }
+}
+
+/// Whether a new main-chat turn may start. Missing / Unconfigured must not
+/// invent a substitute model.
+pub(crate) fn main_chat_turn_allowed(effective: &EffectiveModel) -> bool {
+    effective.is_available()
+}
+
+/// Preferred model from the three-step cascade, most specific first.
+pub(crate) fn preferred_turn_model(
     pin: Option<&ModelRef>,
     project_default: Option<&ModelRef>,
-) -> ModelRef {
-    pin.or(project_default)
-        .cloned()
-        .unwrap_or_else(builtin_default_model)
+    global_default: Option<&ModelRef>,
+) -> Option<ModelRef> {
+    pin.or(project_default).or(global_default).cloned()
+}
+
+/// Whether `model` is present in the process model catalog.
+pub(crate) fn model_in_process_catalog(model: &ModelRef) -> bool {
+    crate::agent::available_models()
+        .iter()
+        .any(|m| m.harness == model.harness && m.id == model.model)
+}
+
+/// Resolve availability of a preferred model against the process catalog.
+pub(crate) fn resolve_effective_model(
+    preferred: Option<&ModelRef>,
+    in_catalog: impl Fn(&ModelRef) -> bool,
+) -> EffectiveModel {
+    match preferred {
+        Some(m) if in_catalog(m) => EffectiveModel::Available(m.clone()),
+        Some(m) => EffectiveModel::Missing {
+            preferred: m.clone(),
+        },
+        None => EffectiveModel::Unconfigured,
+    }
 }
 
 /// Render prior chat history as a text preamble for the agent. Used when we
 /// don't have a Claude `--resume` session id but need to hand the agent
 /// context from earlier turns. Returns a block ending with a separator; the
 /// caller appends the new user message after it.
+/// Build the lost-session recovery prompt: the transcript history rides the
+/// prompt as a preamble, so any kept draft is already carried as a committed
+/// message — clear the unsynced draft rather than adding a duplicate resync
+/// reminder.
+pub fn build_recovery_prompt(session: &mut ChatSession, history_end: usize, text: &str) -> String {
+    session.unsynced_draft = None;
+    let history = &session.messages[..history_end];
+    if history.is_empty() {
+        text.to_string()
+    } else {
+        build_history_preamble(history) + text
+    }
+}
+
 fn build_history_preamble(messages: &[crate::chat_store::ChatMessage]) -> String {
     use crate::chat_store::{ContentBlock, Role};
 
@@ -2893,6 +4534,16 @@ fn build_history_preamble(messages: &[crate::chat_store::ChatMessage]) -> String
                 }
                 ContentBlock::ToolResult { name, .. } => {
                     out.push_str(&format!("[tool result: {name}]\n\n"));
+                }
+                ContentBlock::UserChoiceQuestion { text } => {
+                    out.push_str("[Question] ");
+                    out.push_str(text);
+                    out.push_str("\n\n");
+                }
+                ContentBlock::UserChoiceAnswer { text } => {
+                    out.push_str("[Answer] ");
+                    out.push_str(text);
+                    out.push_str("\n\n");
                 }
             }
         }
@@ -3029,31 +4680,29 @@ pub fn rebuild_chat_editor(ax: &mut AgentSession, highlighter: &SyntaxHighlighte
 
     let mut new_editors = Vec::with_capacity(new_blocks.len());
     for (i, block) in new_blocks.iter().enumerate() {
-        if i < ax.chat_editors.len() && i < ax.chat_blocks.len() {
-            let plan = plan_editor_refresh(&ax.chat_blocks[i].lines, &block.lines);
+        // Classic / live / passthrough: full Answer body. Focus sectioned:
+        // open-region lines only so the open-region TextEdit can reuse the
+        // block editor (Hybrid C). Expanded sections read from block.lines.
+        let desired = agent_chat::answer_editor_desired_lines(block, ax.viewer_style);
+        if i < ax.chat_editors.len() {
+            let plan = plan_editor_refresh(&ax.chat_editors[i].lines, &desired);
             match plan {
                 EditorRefreshKind::Reuse => {
-                    let existing =
-                        std::mem::replace(&mut ax.chat_editors[i], EditorState::new(""));
+                    let existing = std::mem::replace(&mut ax.chat_editors[i], EditorState::new(""));
                     new_editors.push(existing);
                 }
                 EditorRefreshKind::InPlace { dirty_from } => {
                     let mut existing =
                         std::mem::replace(&mut ax.chat_editors[i], EditorState::new(""));
-                    refresh_editor_in_place(
-                        &mut existing,
-                        &block.lines,
-                        dirty_from,
-                        highlighter,
-                    );
+                    refresh_editor_in_place(&mut existing, &desired, dirty_from, highlighter);
                     new_editors.push(existing);
                 }
                 EditorRefreshKind::FullRebuild => {
-                    new_editors.push(make_highlighted_editor(&block.lines, highlighter));
+                    new_editors.push(make_highlighted_editor(&desired, highlighter));
                 }
             }
         } else {
-            new_editors.push(make_highlighted_editor(&block.lines, highlighter));
+            new_editors.push(make_highlighted_editor(&desired, highlighter));
         }
         // Answer blocks: tint meta-card lines after lines are finalized.
         if block.kind == crate::widget::text_edit::BlockKind::Assistant
@@ -3061,7 +4710,24 @@ pub fn rebuild_chat_editor(ax: &mut AgentSession, highlighter: &SyntaxHighlighte
         {
             apply_meta_card_line_backgrounds(ed);
         }
+        // Sync Focus section fold keys for settled Focus-layout Answers.
+        if ax.viewer_style == crate::config::ViewerStyle::Focus
+            && block.kind == crate::widget::text_edit::BlockKind::Assistant
+            && !block.is_live
+        {
+            let source = block.lines.join("\n");
+            if let agent_chat::AnswerBodyPresentation::FocusSectioned { sections, .. } =
+                agent_chat::answer_body_presentation(ax.viewer_style, block.is_live, &source)
+            {
+                let folds = ax.focus_folds.entry(i).or_default();
+                crate::focus_answer::sync_section_folds(folds, &sections);
+            } else {
+                ax.focus_folds.remove(&i);
+            }
+        }
     }
+    // Drop fold maps for removed block indices.
+    ax.focus_folds.retain(|&idx, _| idx < new_blocks.len());
 
     ax.chat_editors = new_editors;
     ax.chat_blocks = new_blocks;
@@ -3071,6 +4737,38 @@ pub fn rebuild_chat_editor(ax: &mut AgentSession, highlighter: &SyntaxHighlighte
 pub fn materialize_chat_ui(ax: &mut AgentSession, highlighter: &SyntaxHighlighter) {
     rebuild_chat_editor(ax, highlighter);
     ax.chat_ui_dirty = false;
+}
+
+/// Stamp effective viewer style and rematerialize when it changes.
+///
+/// Hybrid C editor content depends on style (`answer_editor_desired_lines`).
+/// View layout reads config each frame; without a rebuild here, Focus→Classic
+/// can leave a truncated open-region editor on the Classic path until some
+/// unrelated materialize.
+pub fn apply_viewer_style(
+    ax: &mut AgentSession,
+    style: crate::config::ViewerStyle,
+    highlighter: &SyntaxHighlighter,
+) {
+    if ax.viewer_style == style {
+        return;
+    }
+    ax.viewer_style = style;
+    if style != crate::config::ViewerStyle::Focus {
+        ax.focus_folds.clear();
+    }
+    materialize_chat_ui(ax, highlighter);
+}
+
+/// Apply effective viewer style to every session in an interaction panel.
+pub fn apply_viewer_style_to_sessions(
+    ix: &mut InteractionState,
+    style: crate::config::ViewerStyle,
+    highlighter: &SyntaxHighlighter,
+) {
+    for ax in &mut ix.sessions {
+        apply_viewer_style(ax, style, highlighter);
+    }
 }
 
 /// Flush pending reasoning into a committed assistant message (no-op if empty).
@@ -3106,8 +4804,8 @@ pub fn flush_all_pending(session: &mut ChatSession) {
 }
 
 /// Max answer-after-thought replacements allowed before thrash cancel.
-/// Trip when `answer_replace_count` exceeds this (third replace).
-pub const ANSWER_REPLACE_BUDGET: u32 = 2;
+/// Trip when `answer_replace_count` would exceed this (first disallowed replace).
+pub const ANSWER_REPLACE_BUDGET: u32 = 1;
 
 /// User-visible stop notice when the thrash budget trips (not a second answer).
 pub const ANSWER_THRASH_STOP_NOTICE: &str =
@@ -3126,9 +4824,63 @@ pub fn clear_priming_followup(ax: &mut AgentSession) {
     ax.pending_followup_prompt = None;
 }
 
+/// User cancel of the main streaming turn: capture in-flight draft, mark
+/// cancel-in-flight, disarm build pilot, and signal the agent handle.
+///
+/// Pilot must be off before `TurnComplete` so a cancelled hop cannot
+/// auto-send rank-1 next (`chat/build-pilot` Disarm controls).
+pub fn cancel_streaming_main_turn(ax: &mut AgentSession) {
+    capture_unsynced_draft(&mut ax.session);
+    ax.cancel_in_flight = true;
+    ax.pilot = crate::build_pilot::PilotState::Off;
+    if let Some(handle) = &ax.agent_handle {
+        handle.cancel();
+    }
+}
+
+/// Answer-thrash budget trip: keep last draft + stop notice, then cancel the
+/// main turn the same way for pilot purposes (disarm + cancel_in_flight).
+pub fn thrash_cancel_main_turn(ax: &mut AgentSession) {
+    on_answer_thrash_trip(&mut ax.session);
+    ax.cancel_in_flight = true;
+    ax.pilot = crate::build_pilot::PilotState::Off;
+    if let Some(handle) = &ax.agent_handle {
+        handle.cancel();
+    }
+    clear_priming_followup(ax);
+}
+
+/// Stash the in-flight answer draft at cancellation (user cancel or thrash
+/// trip) so the next send can resync it to the agent. Text already committed
+/// at tool boundaries is recorded by the agent runtime and is not captured;
+/// an empty draft leaves the session's unsynced draft untouched.
+pub fn capture_unsynced_draft(session: &mut ChatSession) {
+    if !session.pending_text.is_empty() {
+        session.unsynced_draft = Some(session.pending_text.clone());
+    }
+}
+
+/// Carry a cancelled turn's kept draft into the outgoing prompt as a
+/// system-reminder appended **after** the user's text (front-inlining breaks
+/// slash-command parsing, and `system_additions` only takes effect on a
+/// session's first turn). Takes — and thus clears — the session's unsynced
+/// draft, so the reminder rides exactly one send. No-op without a draft.
+pub fn apply_resync_reminder(prompt: String, session: &mut ChatSession) -> String {
+    let Some(draft) = session.unsynced_draft.take() else {
+        return prompt;
+    };
+    format!(
+        "{prompt}\n\n<system-reminder>\nYour previous reply was interrupted and \
+         your runtime never recorded it, but the user saw it in full. Treat the \
+         reply below as one you already sent — the user's message above responds \
+         to it. Do not respond to this block itself.\n\n{draft}\n</system-reminder>"
+    )
+}
+
 /// Commit the last draft and append the thrash stop notice. Call once when
 /// the budget first trips (before cancelling the agent).
 pub fn on_answer_thrash_trip(session: &mut ChatSession) {
+    capture_unsynced_draft(session);
     flush_all_pending(session);
     session.messages.push(ChatMessage {
         role: Role::System,
@@ -3202,7 +4954,8 @@ pub fn should_materialize_chat_ui(
         | AgentEvent::TurnComplete
         | AgentEvent::Error(_)
         | AgentEvent::ProcessExited
-        | AgentEvent::SessionNotFound => true,
+        | AgentEvent::SessionNotFound
+        | AgentEvent::UserChoiceRequest { .. } => true,
         AgentEvent::ContentDelta { .. } | AgentEvent::ReasoningDelta { .. } => !is_streaming,
         AgentEvent::Ready(_)
         | AgentEvent::CommandsAvailable(_)
@@ -3229,6 +4982,27 @@ pub fn should_materialize_on_stream_tick(
     stick_to_bottom: bool,
 ) -> bool {
     is_streaming && chat_ui_dirty && stick_to_bottom
+}
+
+/// Whether this session needs the 10 Hz stream UI tick subscription.
+///
+/// Active agent work (`is_streaming` and not awaiting a user choice) needs
+/// the tick for the streaming indicator and pure-content materialize.
+/// Mid-turn await only needs the tick when deferred pure-content materialize
+/// is still owed on stick-to-bottom — idle await does not keep the pump.
+pub fn session_needs_stream_tick(
+    is_streaming: bool,
+    is_awaiting_user: bool,
+    chat_ui_dirty: bool,
+    stick_to_bottom: bool,
+) -> bool {
+    if !is_streaming {
+        return false;
+    }
+    if !is_awaiting_user {
+        return true;
+    }
+    should_materialize_on_stream_tick(is_streaming, chat_ui_dirty, stick_to_bottom)
 }
 
 fn handle_chat_action_on(editor: &mut EditorState, action: crate::widget::text_edit::EditorAction) {
@@ -3302,49 +5076,51 @@ pub fn handle_agent_chat_key(
         return AgentChatKeyResult::Dispatch(agent_chat::Msg::CycleNextAction(delta));
     }
 
-    // Obvious chrome hotkeys — only when chrome is visible (idle + empty input).
+    // Fast response hotkeys — only when chrome is visible (idle + empty input).
     // Plain Enter stays on empty-submit (list only) via TextEdit `on_submit`.
+    // No ⌘⌫ cancel chip; esc / freeform-while-awaiting cancel on the wire.
     if mods.command() && !mods.shift() && !mods.alt() {
         let input_empty = ax.chat_input.text().trim().is_empty();
-        // ⌘↩ no longer resolves chrome actions (next-card / oneshot own enter paths).
-        // ⌘⌫ → cancel when set
-        if *key == keyboard::Key::Named(Named::Backspace)
-            && let Some(text) = crate::obvious_bubble::resolve_cmd_backspace_when_visible(
-                ax.session.is_streaming,
-                input_empty,
-                &ax.obvious_chrome,
-            )
-        {
-            return AgentChatKeyResult::Dispatch(agent_chat::Msg::SendObviousAction(text));
-        }
-        // ⌘1…⌘9 → lifecycle[n]
+        // ⌘1…⌘9 → option[n]
         if let keyboard::Key::Character(c) = key
             && c.len() == 1
         {
             let ch = c.chars().next().unwrap_or('\0');
             if ch.is_ascii_digit() && ch != '0' {
                 let digit = ch.to_digit(10).unwrap_or(0) as u8;
-                if let Some(text) = crate::obvious_bubble::resolve_cmd_digit_when_visible(
+                if let Some(pick) = crate::fast_response::resolve_cmd_digit_when_visible(
                     ax.session.is_streaming,
+                    ax.is_awaiting_user,
                     input_empty,
-                    &ax.obvious_chrome,
+                    &ax.fast_response,
                     digit,
                 ) {
-                    return AgentChatKeyResult::Dispatch(agent_chat::Msg::SendObviousAction(
-                        text,
+                    return AgentChatKeyResult::Dispatch(agent_chat::Msg::ActivateFastResponse(
+                        pick,
                     ));
                 }
             }
         }
     }
 
-    // Esc-Esc to cancel streaming.
-    if *key == keyboard::Key::Named(Named::Escape) && ax.session.is_streaming {
-        ax.esc_count += 1;
-        if ax.esc_count >= 2 {
-            return AgentChatKeyResult::Dispatch(agent_chat::Msg::CancelPressed);
+    // Esc-Esc: cancel streaming if any; always disarm an armed build pilot.
+    if *key == keyboard::Key::Named(Named::Escape) {
+        let streaming = ax.session.is_streaming;
+        let armed = ax.pilot.is_armed();
+        if streaming || armed {
+            ax.esc_count += 1;
+            if ax.esc_count >= 2 {
+                ax.esc_count = 0;
+                if armed {
+                    ax.pilot = crate::build_pilot::PilotState::Off;
+                }
+                if streaming {
+                    return AgentChatKeyResult::Dispatch(agent_chat::Msg::CancelPressed);
+                }
+                return AgentChatKeyResult::Handled;
+            }
+            return AgentChatKeyResult::Handled;
         }
-        return AgentChatKeyResult::Handled;
     }
 
     // Reset esc counter on any non-Esc key.
@@ -3420,19 +5196,22 @@ pub fn update_with_side_effects(
     project_root: Option<&std::path::Path>,
     highlighter: &SyntaxHighlighter,
     agent_input_hints: bool,
+    window_w: f32,
     vcs_workflow: crate::config::VcsWorkflow,
+    viewer_style: crate::config::ViewerStyle,
 ) {
     // Stamp VCS workflow before any submit so first-turn priming sees the
-    // current Settings value.
+    // current Settings value. Viewer style: rematerialize on change so Hybrid
+    // C editor lines match the new style immediately (not only on next dirty).
     if let Some(ax) = state.active_mut() {
         ax.vcs_workflow = vcs_workflow;
     }
-    update(
-        state,
-        msg,
-        highlighter,
-        agent_input_hints,
-    );
+    apply_viewer_style_to_sessions(state, viewer_style, highlighter);
+    let just_opened = update(state, msg, highlighter, agent_input_hints);
+    // Uncustomized panels rebalance to half free space when the door opens.
+    if just_opened {
+        rebalance_uncustomized(state, window_w);
+    }
 
     // Persist a just-changed per-chat model selection. Done here (not in
     // `handle_agent_chat`) because this is the layer that has `project_root`.
@@ -3440,7 +5219,7 @@ pub fn update_with_side_effects(
         && ax.model_dirty
     {
         ax.model_dirty = false;
-        let _ = crate::chat_store::save_session(&ax.session, project_root);
+        let _ = ax.mark_driven_and_persist(project_root);
     }
 
     if state.visible && state.active_tab == ActiveTab::Chat {
@@ -3451,6 +5230,7 @@ pub fn update_with_side_effects(
             scope_kind,
             project_root,
             highlighter,
+            viewer_style,
         );
     }
 
@@ -3541,6 +5321,9 @@ pub fn adjust_active_after_remove(active: ActiveTab, removed_idx: usize) -> Acti
 /// `scope` is the on-disk key (directory name); `scope_label` is the
 /// human-readable label shown in the session dropdown (may differ — e.g. an
 /// exploration's display_name vs. its stable id).
+///
+/// `viewer_style` is the effective chat Answer style: stamped before first
+/// materialize so Hybrid C editor content matches the view on cold load.
 pub fn ensure_sessions_with_label(
     state: &mut InteractionState,
     scope: &str,
@@ -3548,6 +5331,7 @@ pub fn ensure_sessions_with_label(
     scope_kind: ScopeKind,
     project_root: Option<&std::path::Path>,
     highlighter: &SyntaxHighlighter,
+    viewer_style: crate::config::ViewerStyle,
 ) {
     if !state.sessions.is_empty() {
         return;
@@ -3555,11 +5339,15 @@ pub fn ensure_sessions_with_label(
     let loaded = crate::chat_store::load_sessions_for(scope, project_root);
     if loaded.is_empty() {
         let mut ax = AgentSession::new(scope.to_string(), scope_kind);
+        stamp_viewer_style_for_load(&mut ax, viewer_style);
         reconcile_display_names(std::slice::from_mut(&mut ax), scope_label);
         state.sessions.push(ax);
     } else {
         for session in loaded {
             let mut ax = AgentSession::from_session(session, scope_kind);
+            // Stamp before first materialize (review 03): default Classic stamp
+            // would leave full-body editors under Focus layout on first paint.
+            stamp_viewer_style_for_load(&mut ax, viewer_style);
             materialize_chat_ui(&mut ax, highlighter);
             state.sessions.push(ax);
         }
@@ -3570,13 +5358,29 @@ pub fn ensure_sessions_with_label(
     state.active_session = 0;
 }
 
+/// Set effective viewer style on a newly loaded or created session (no rebuild).
+fn stamp_viewer_style_for_load(
+    ax: &mut AgentSession,
+    style: crate::config::ViewerStyle,
+) {
+    ax.viewer_style = style;
+    if style != crate::config::ViewerStyle::Focus {
+        ax.focus_folds.clear();
+    }
+}
+
 /// Persist a single session, folding any in-flight `pending_text` /
 /// `pending_reasoning` into trailing assistant messages so streamed content
 /// survives a crash even though it hasn't been committed to `messages` yet.
 /// Reasoning is folded first (as `ContentBlock::Reasoning`), then answer text
 /// (as `ContentBlock::Text`). The in-memory session is left untouched — a
-/// clone is persisted. Returns whether the write succeeded.
-pub fn persist_session_snapshot(session: &ChatSession, project_root: Option<&Path>) -> bool {
+/// clone is persisted. Returns whether the write succeeded. Displayed-only
+/// sessions are not written (`chat/session-sharing`).
+pub fn persist_session_snapshot(
+    session: &ChatSession,
+    drive_role: duckcore::session_sharing::DriveRole,
+    project_root: Option<&Path>,
+) -> bool {
     let mut snapshot = session.clone();
     if !snapshot.pending_reasoning.is_empty() {
         let text = std::mem::take(&mut snapshot.pending_reasoning);
@@ -3596,16 +5400,17 @@ pub fn persist_session_snapshot(session: &ChatSession, project_root: Option<&Pat
             is_priming: false,
         });
     }
-    crate::chat_store::save_session(&snapshot, project_root).is_ok()
+    matches!(
+        duckcore::session_sharing::persist_driven(&snapshot, drive_role, project_root),
+        duckcore::session_sharing::PersistOutcome::Written
+    )
 }
 
-/// Flush-before-mutate: persist every session an interaction holds before its
-/// in-memory state is migrated, replaced, or dropped. This is the guarantee
-/// that makes an in-flight turn impossible to lose to a promotion or scope
-/// migration, regardless of attribution.
+/// Flush-before-mutate: persist every **driven** session an interaction holds
+/// before its in-memory state is migrated, replaced, or dropped.
 pub fn flush_sessions(ix: &InteractionState, project_root: Option<&Path>) {
     for ax in &ix.sessions {
-        persist_session_snapshot(&ax.session, project_root);
+        persist_session_snapshot(&ax.session, ax.drive_role, project_root);
     }
 }
 
@@ -3615,8 +5420,86 @@ pub fn flush_sessions(ix: &InteractionState, project_root: Option<&Path>) {
 /// window.
 pub fn flush_dirty_sessions(ix: &mut InteractionState, project_root: Option<&Path>) {
     for ax in ix.sessions.iter_mut() {
-        if ax.needs_flush && persist_session_snapshot(&ax.session, project_root) {
-            ax.needs_flush = false;
+        if ax.needs_flush {
+            // Streaming dirty implies this process is driving the turn.
+            ax.mark_driven();
+            if persist_session_snapshot(&ax.session, ax.drive_role, project_root) {
+                ax.needs_flush = false;
+            }
+        }
+    }
+}
+
+/// Apply an external session-file event to this interaction's sessions.
+///
+/// In-flight local turns are shielded. Reloaded sessions keep their UI shell
+/// (drive role stays displayed for pure reloads) and re-materialize later.
+pub fn apply_external_session_event(
+    ix: &mut InteractionState,
+    event: &duckcore::session_sharing::ExternalSessionEvent,
+    project_root: Option<&Path>,
+    highlighter: &SyntaxHighlighter,
+) -> duckcore::session_sharing::ApplyResult {
+    use duckcore::session_sharing::{ApplyResult, ExternalSessionEvent, is_in_flight};
+
+    let (scope, session_id) = match event {
+        ExternalSessionEvent::Modified { scope, session_id }
+        | ExternalSessionEvent::Removed { scope, session_id } => (scope.as_str(), session_id.as_str()),
+    };
+
+    let idx = ix
+        .sessions
+        .iter()
+        .position(|ax| ax.session.scope == scope && ax.session.id == session_id);
+    let Some(idx) = idx else {
+        return ApplyResult::NotPresent;
+    };
+
+    if is_in_flight(&ix.sessions[idx].session) {
+        return ApplyResult::IgnoredInFlight;
+    }
+
+    match event {
+        ExternalSessionEvent::Removed { .. } => {
+            let was_active = ix.active_session == idx;
+            ix.sessions.remove(idx);
+            if ix.sessions.is_empty() {
+                ix.active_session = 0;
+            } else if was_active {
+                ix.active_session = idx.min(ix.sessions.len() - 1);
+            } else if ix.active_session > idx {
+                ix.active_session -= 1;
+            }
+            ApplyResult::Removed
+        }
+        ExternalSessionEvent::Modified { .. } => {
+            let loaded = crate::chat_store::load_sessions_for(scope, project_root)
+                .into_iter()
+                .find(|s| s.id == session_id);
+            match loaded {
+                Some(session) => {
+                    let ax = &mut ix.sessions[idx];
+                    ax.session = session;
+                    // External content — we are displaying, not driving this write.
+                    ax.drive_role = duckcore::session_sharing::DriveRole::Displayed;
+                    ax.needs_flush = false;
+                    ax.chat_ui_dirty = true;
+                    materialize_chat_ui(ax, highlighter);
+                    ApplyResult::Reloaded
+                }
+                None => {
+                    let was_active = ix.active_session == idx;
+                    ix.sessions.remove(idx);
+                    if ix.sessions.is_empty() {
+                        ix.active_session = 0;
+                    } else if was_active {
+                        ix.active_session = idx.min(ix.sessions.len() - 1);
+                    } else if ix.active_session > idx {
+                        ix.active_session -= 1;
+                    }
+                    ApplyResult::Removed
+                }
+            }
         }
     }
 }
@@ -3645,7 +5528,7 @@ pub fn merge_sessions(into: &mut InteractionState, incoming: Vec<AgentSession>, 
         }
     }
     into.sessions
-        .sort_by(|a, b| b.session.created_at_nanos.cmp(&a.session.created_at_nanos));
+        .sort_by_key(|s| std::cmp::Reverse(s.session.created_at_nanos));
     if let Some(id) = active_id
         && let Some(idx) = into.find_session_index(&id)
     {
@@ -3705,7 +5588,10 @@ pub fn view_column<'a, M: 'a + Clone>(
         Option<crate::widget::text_edit::HighlightRange>,
     )>,
     find_toolbar: Option<Element<'a, M>>,
-    agent_input_hints: bool,
+    _agent_input_hints: bool,
+    phase_display: Option<crate::area::change::PhaseDisplay>,
+    // Effective Answer viewer style (already resolved from config).
+    viewer_style: crate::config::ViewerStyle,
 ) -> Element<'a, M> {
     use iced::widget::column;
 
@@ -3713,6 +5599,7 @@ pub fn view_column<'a, M: 'a + Clone>(
 
     let content: Element<'a, M> = match state.active_tab {
         ActiveTab::Terminal(i) => {
+            let _ = phase_display;
             if let Some(tt) = state.terminals.get(i) {
                 let w = wrap.clone();
                 crate::widget::terminal::view_terminal(&tt.state).map(move |ev| match ev {
@@ -3731,29 +5618,38 @@ pub fn view_column<'a, M: 'a + Clone>(
         ActiveTab::Chat => {
             if let Some(ax) = state.active() {
                 let model_choices = agent_chat::chat_model_choices();
-                // The selector always reflects the concrete model the next turn
-                // will run (pin → project default → built-in), never a "Default"
-                // placeholder. The same effective model drives the meter's
-                // denominator (its own context window, not a stream value).
-                let effective_model = resolve_turn_model(
-                    ax.session.selected_model.as_ref(),
-                    ax.project_model_default.as_ref(),
-                );
-                let selected_model =
-                    agent_chat::selected_model_choice(&model_choices, Some(&effective_model));
+                // Selector shows the available preferred model, or Missing when
+                // the cascade has no catalog match. Meter uses the available
+                // model's window only.
+                let effective = ax.effective_model();
+                let selected_model = match &effective {
+                    EffectiveModel::Available(m) => {
+                        agent_chat::selected_model_choice(&model_choices, Some(m))
+                    }
+                    EffectiveModel::Missing { preferred } => {
+                        agent_chat::missing_closed_model_choice(Some(preferred))
+                    }
+                    EffectiveModel::Unconfigured => agent_chat::missing_closed_model_choice(None),
+                };
+                let context_max = effective
+                    .available_ref()
+                    .and_then(agent_chat::model_context_window);
                 let status = agent_chat::StatusInfo {
                     is_streaming: ax.session.is_streaming,
+                    is_awaiting_user: ax.is_awaiting_user,
                     esc_count: ax.esc_count,
                     model_choices,
                     selected_model,
-                    // Continuation when a session id for this harness survives;
-                    // otherwise the next turn opens fresh and re-sends history.
-                    will_resume: ax.resumable_session_id().is_some(),
+                    // Foreign/stored-but-unresumable id (e.g. harness switch).
+                    // Unbound first bind and post-recovery clear stay false.
+                    unresumable_stored_session: agent_chat::unresumable_stored_session(
+                        ax.session.agent_session_id.is_some(),
+                        ax.resumable_session_id().is_some(),
+                    ),
                     context_tokens: ax.agent_input_tokens + ax.agent_output_tokens,
-                    context_max: agent_chat::model_context_window(&effective_model),
+                    context_max,
                 };
                 let w = wrap.clone();
-                let oneshot_prompts = ax.session_oneshot_prompts(agent_input_hints);
                 let next_action_idx = crate::default_prompts::clamp_active_index(
                     ax.next_actions.len(),
                     ax.next_action_idx,
@@ -3770,13 +5666,15 @@ pub fn view_column<'a, M: 'a + Clone>(
                     status,
                     &ax.next_actions,
                     next_action_idx,
-                    oneshot_prompts,
-                    ax.default_prompts_pending,
-                    &ax.obvious_chrome,
-                    ax.chrome_top_pad,
+                    &ax.fast_response,
+                    ax.fast_response_top_pad,
                     &ax.selection_pinned,
                     ax.selection_tentative.as_ref(),
                     block_highlights,
+                    phase_display,
+                    ax.pilot.plaque_label(),
+                    viewer_style,
+                    &ax.focus_folds,
                 )
                 .map(move |m| w(Msg::AgentChat(m)));
 

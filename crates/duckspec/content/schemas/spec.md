@@ -1,8 +1,8 @@
 # Spec schema
 
-A capability spec is the **behavior contract**: requirements and scenarios for
-what the system must do. Scenarios marked `test: code` are a standing commitment
-to automated verification.
+A capability spec is concise technical documentation backed by tests: cohesive
+normative requirements completely describe the important behavior, while a
+minimal set of scenarios provides executable proof of its distinct outcomes.
 
 ## Structure
 
@@ -58,66 +58,45 @@ test. `ds audit` resolves them; wrapped comments are invisible. `ds sync`
 stamps resolved `path:line` onto markers under top-level `caps/` (bookkeeping -
 do not hand-edit those paths).
 
+**Deltas and merges.** Bodies authored under a delta and the merged result after
+apply still must satisfy this schema. Delta shape (markers, ops) is
+`ds schema spec-delta` — not restated here.
+
 ## Quality
 
-**Requirements**
-
-- Use normative language precisely. SHALL means mandatory, SHOULD means
-  recommended, MAY means optional. Do not write SHALL when you mean SHOULD.
-- Each requirement covers one coherent behavioral concern. If its scenarios
-  test unrelated things, split it.
-- Normative prose stands on its own - scenarios illustrate, they do not replace
-  the prose.
-- Requirements describe **system behavior observers can care about**, not
-  module placement, dependency graphs, or "does not call X." Those stay in
-  `design.md` unless the public contract *is* a stability surface.
-
-**Scenarios**
-
-- **Falsifiability.** A scenario's THEN must be something a realistic-but-broken
-  implementation could get wrong. If you cannot picture an implementation that
-  would fail it - other than complete nonsense - the scenario is not encoding a
-  contract; it is restating an identity. A getter returning what was set, a
-  default value equaling the default, a method named toggle toggling - all pass
-  "observable" but fail falsifiability. Drop them.
-- **Outcome, not branch.** Scenarios are derived from the requirement, not the
-  implementation. If you could not list them without first reading the code,
-  they are mirroring it. A pure refactor that preserves observable behavior must
-  not change the scenario list. Group by outcomes callers can observe; if two
-  code paths converge on the same observable outcome, they are one scenario
-  (parameterize GIVEN if the entry conditions differ).
-- **Declarative, not procedural.** Describe what the system does, not how a user
-  clicks through it. "WHEN the user submits the form" not "WHEN the user types
-  their email, then tabs to password, then clicks submit."
-- **GIVEN establishes state, not actions.** "GIVEN an authenticated user" not
-  "GIVEN the user has logged in."
-- **WHEN is a single trigger.** If you need multiple independent WHENs, you
-  probably have two scenarios.
-- **THEN is an observable outcome.** Not implementation details, internal state,
-  private fields, enum variants, function names, or which branch ran. Restate in
-  caller-observable terms - return value, side effect, persisted state, emitted
-  event, response code. Prefer the **caller-meaningful** outcome; name storage
-  only when durability or location *is* the contract. "THEN the session is
-  invalidated" not "THEN the expire_session branch is taken" - and not "THEN the
-  sessions table row is deleted" unless the table itself is the public contract.
-- **Fewer, better.** Each scenario covers a distinct observable outcome, not a
-  distinct code path. If two scenarios differ only trivially, merge them.
-  Redundant scenarios are maintenance debt.
-- **Every `test: code` is a commitment.** Only mark scenarios that genuinely need
-  automated verification. Visual checks, deployment concerns, and
-  documentation-only behaviors should use `manual:` or `skip:`.
-- **Name scenarios by what is distinctive.** "Valid credentials" and "Invalid
-  password" are good. "Test case 1" and "Happy path" are not.
-
-**Two self-tests before committing a scenario list**
-
-- **Refactor test.** If the implementation were rewritten - lookup table instead
-  of if/else, polymorphism instead of switch, early returns instead of nesting -
-  would these scenarios still describe the same behavior? If no, they are
-  mirroring the code, not the contract.
-- **Stranger test.** Could someone who has never seen the code write this
-  scenario list from the requirement prose alone? If no, the scenarios are
-  leaking the implementation.
+- **Complete, not exhaustive.** Normative prose describes every important
+  behavior the capability owns. Important means a stable observable rule whose
+  violation materially changes correctness, safety, data, interoperability, or
+  user experience - not every input, branch, or implementation detail.
+- **Cohesive whole.** Requirements form the shortest clear contract for the
+  capability. Merge overlap, remove stale or misplaced behavior, and reorganize
+  existing content when that improves the complete file.
+- **Minimal requirement prose.** Every requirement has a concise normative
+  summary of the high-level contract. It provides the umbrella rule or
+  relationship that makes the scenarios cohesive; it never previews,
+  enumerates, or paraphrases the scenarios beneath it.
+- **Normative precision.** SHALL / MUST / SHOULD / MAY mean what they say.
+  Concrete cases and distinct outcomes belong in scenarios rather than being
+  repeated in requirement prose.
+- **One concern per requirement.** Split unrelated behavior, but do not invent
+  requirements merely to hold scenarios.
+- **Scenarios earn tests.** Each scenario pins a distinct important outcome,
+  boundary, policy, state transition, compatibility promise, or integration
+  seam. Variations with the same meaningful outcome belong in one parameterized
+  test, not duplicate scenarios.
+- **Tests inform the contract.** Existing tests may reveal stable intentional
+  behavior missing from the spec. Helper and implementation tests need not
+  become scenarios; important behavioral tests should have a natural spec
+  owner.
+- **Lean GWT.** Use only the state needed to understand the trigger and only
+  independently important observable outcomes. GIVEN is state, WHEN is one
+  trigger, and THEN is the result. Omit setup narration, SHALL in clauses, and
+  restatements of the requirement.
+- **Observer-facing.** Returns, persisted state, events, responses, and visible
+  recovery are contract material. Private fields, module placement, function
+  names, and branches belong to implementation or design.
+- **Distinctive names.** Name the outcome that differentiates the scenario;
+  avoid "Happy path", "Test 1", and sentence-length restatements.
 
 Body markdown follows `style` (load only if not already in context).
 
@@ -140,17 +119,17 @@ measured from the last request (not from login time).
 
 > test: code
 
-### Scenario: Session expires after inactivity
+### Scenario: Idle session expires
 
 - **GIVEN** an authenticated user
-- **AND** their last request was more than 30 minutes ago
+- **AND** 30 minutes have passed without activity
 - **WHEN** the user makes a new request
-- **THEN** the response is 401
-- **AND** the session token is invalidated server-side
+- **THEN** the request is rejected as unauthenticated
+- **AND** the session is invalidated
 
 ### Scenario: Activity resets the timer
 
 - **GIVEN** an authenticated user
-- **WHEN** the user makes a request at minute 29
+- **WHEN** the user makes a request before the idle timeout
 - **THEN** the session remains valid for another 30 minutes
 ```

@@ -1,9 +1,10 @@
 //! Grok agent harness.
 //!
 //! Thin provider over the shared [`crate::acp`] client. Builds a native
-//! `grok --no-ask-user agent --always-approve stdio` [`AgentLaunch`] (login-shell
-//! wrap) and opens shared main/oneshot runtimes. Model discovery, attach
-//! encoding helpers, and title/reply prompts stay harness-local.
+//! `grok agent --always-approve stdio` [`AgentLaunch`] (login-shell wrap) and
+//! opens shared main/oneshot runtimes. Structured questions are enabled; tool
+//! execution stays auto-approved. Model discovery, attach encoding helpers, and
+//! title/reply prompts stay harness-local.
 
 mod spawn;
 
@@ -25,9 +26,9 @@ use crate::title::{build_title_prompt, clean_title};
 /// Stable harness id shared by every model this provider owns.
 const HARNESS: &str = "grok";
 
-/// Preferred model for the one-shot `title_summary` call — grok's cheapest,
-/// fastest. Falls back to any other advertised model when absent (see
-/// [`pick_title_model`]).
+/// Default preferred oneshot model (title summary / reply suggest) when present
+/// in the advertised catalog. Falls back to another available model when absent
+/// (see [`pick_title_model`]).
 const TITLE_MODEL: &str = "grok-composer-2.5-fast";
 
 /// [`Provider`] over the `grok` CLI. Models and their context windows are
@@ -127,16 +128,22 @@ impl Provider for GrokProvider {
         Box::new(AcpMainRuntime::new(self.launch.clone(), working_dir))
     }
 
-    fn open_oneshot_runtime(&self, working_dir: &Path) -> Box<dyn OneshotRuntime> {
+    fn open_oneshot_runtime(
+        &self,
+        working_dir: &Path,
+        preferred_model: Option<String>,
+    ) -> Box<dyn OneshotRuntime> {
+        // Host preferred when set; otherwise advertise-side default needles.
         Box::new(AcpOneshotRuntime::with_preferred_model(
             self.launch.clone(),
             working_dir,
-            Some(TITLE_MODEL.to_string()),
+            preferred_model,
         ))
     }
 
     async fn title_summary(&self, req: TitleRequest, working_dir: &Path) -> Result<String, Error> {
-        let mut rt = self.open_oneshot_runtime(working_dir);
+        // TITLE_MODEL needle matches full ids via pick_oneshot_model substring.
+        let mut rt = self.open_oneshot_runtime(working_dir, Some(TITLE_MODEL.to_string()));
         let raw = rt
             .prompt(OneshotKind::Title, build_title_prompt(&req))
             .await?;
@@ -152,7 +159,7 @@ impl Provider for GrokProvider {
             return Ok(Vec::new());
         }
 
-        let mut rt = self.open_oneshot_runtime(working_dir);
+        let mut rt = self.open_oneshot_runtime(working_dir, Some(TITLE_MODEL.to_string()));
         let body = build_reply_suggest_prompt(&req);
         let text = format!("{REPLY_SUGGEST_INSTRUCTION}\n\n{body}");
         let raw = rt.prompt(OneshotKind::ReplySuggest, text).await?;
@@ -161,29 +168,51 @@ impl Provider for GrokProvider {
 }
 
 /// Build the native Grok ACP agent launch: login-shell wrap of
-/// `grok --no-ask-user agent --always-approve stdio`.
+/// `grok agent --always-approve stdio`.
 ///
-/// Flags live on the launch (final argv). The shared client does not append them.
+/// Structured questions are enabled (no `--no-ask-user`). Tool execution is still
+/// auto-approved via `--always-approve`. Flags live on the launch (final argv);
+/// the shared client does not append them.
 pub fn grok_agent_launch() -> AgentLaunch {
     AgentLaunch::new(|| {
         let mut cmd = spawn::grok_command();
-        cmd.arg("--no-ask-user")
-            .arg("agent")
-            .arg("--always-approve")
-            .arg("stdio");
+        cmd.arg("agent").arg("--always-approve").arg("stdio");
         cmd
     })
 }
 
 /// Map a handshake-advertised model onto a neutral [`ModelInfo`], tagging it
-/// with the grok harness and carrying its context window.
+/// with the grok harness and carrying its context window and display name.
 fn to_model_info(m: crate::acp::AcpModel) -> ModelInfo {
     ModelInfo {
         harness: HARNESS.to_string(),
-        id: m.id,
-        display: m.name,
+        id: m.id.clone(),
+        display: humanize_display(&m.id, &m.name),
         context_window: m.context_window,
     }
+}
+
+/// Prefer a human advertised name; otherwise light-prettify the bare id.
+fn humanize_display(id: &str, advertised: &str) -> String {
+    let advertised = advertised.trim();
+    if !advertised.is_empty() && advertised != id {
+        return advertised.to_string();
+    }
+    id.split(['-', '_'])
+        .filter(|s| !s.is_empty())
+        .map(|part| {
+            if part.chars().all(|c| c.is_ascii_digit() || c == '.') {
+                part.to_string()
+            } else {
+                let mut c = part.chars();
+                match c.next() {
+                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                    None => String::new(),
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
@@ -256,7 +285,8 @@ mod tests {
     #[test]
     fn resolved_image_attachment_is_sent_as_acp_image_block() {
         let mut req = TurnRequest::new("see [clip.png](attach:a1)", std::env::temp_dir());
-        req.attachments.insert("a1".to_string(), img_att("clip.png"));
+        req.attachments
+            .insert("a1".to_string(), img_att("clip.png"));
 
         let blocks = assemble_content(&req);
         let image = blocks
@@ -275,11 +305,9 @@ mod tests {
     /// @spec harness/grok Prompt attachments: Surrounding text is preserved as text blocks
     #[test]
     fn surrounding_text_is_preserved_as_text_blocks() {
-        let mut req = TurnRequest::new(
-            "before [clip.png](attach:a1) after",
-            std::env::temp_dir(),
-        );
-        req.attachments.insert("a1".to_string(), img_att("clip.png"));
+        let mut req = TurnRequest::new("before [clip.png](attach:a1) after", std::env::temp_dir());
+        req.attachments
+            .insert("a1".to_string(), img_att("clip.png"));
 
         let blocks = assemble_content(&req);
         assert_eq!(blocks.len(), 3);
@@ -337,11 +365,40 @@ mod tests {
         assert_eq!(listed[0].context_window, Some(256_000));
     }
 
+    /// @spec harness/grok Model discovery: Each listed model carries a display name
+    #[test]
+    fn each_listed_model_carries_a_display_name() {
+        // GIVEN a grok handshake advertising its available models
+        let handshake = vec![
+            AcpModel {
+                id: "grok-4.5".into(),
+                name: "Grok 4.5".into(),
+                context_window: Some(256_000),
+            },
+            AcpModel {
+                id: "grok-composer-2.5-fast".into(),
+                name: "grok-composer-2.5-fast".into(), // bare id → humanize
+                context_window: Some(128_000),
+            },
+        ];
+
+        // WHEN the harness lists models
+        let listed: Vec<ModelInfo> = handshake.into_iter().map(to_model_info).collect();
+
+        // THEN each returned model carries a non-empty display name
+        assert!(listed.iter().all(|m| !m.display.is_empty()));
+        assert_eq!(listed[0].display, "Grok 4.5");
+        assert_eq!(listed[1].display, "Grok Composer 2.5 Fast");
+    }
+
     /// @spec harness/grok Model discovery: Title model falls back when the preferred fast model is absent
     #[test]
     fn title_model_falls_back_when_preferred_absent() {
         // Preferred fast model absent → selects another available model.
-        let without_fast = vec![model("grok-4.5", Some(256_000)), model("grok-3", Some(131_072))];
+        let without_fast = vec![
+            model("grok-4.5", Some(256_000)),
+            model("grok-3", Some(131_072)),
+        ];
         assert_eq!(pick_title_model(&without_fast).as_deref(), Some("grok-4.5"));
 
         // When present, it is preferred.
@@ -392,7 +449,9 @@ mod tests {
             "launch must invoke the native grok binary: {args:?}"
         );
         assert!(
-            !args.iter().any(|a| a.contains("duckchat-claude") || a.contains("grok-proxy")),
+            !args
+                .iter()
+                .any(|a| a.contains("duckchat-claude") || a.contains("grok-proxy")),
             "must not route through an intermediate Grok-only ACP proxy: {args:?}"
         );
         // Agent stdio mode flags on the final argv (client does not add them).
@@ -400,8 +459,105 @@ mod tests {
         let after: Vec<&str> = args[grok_pos + 1..].iter().map(String::as_str).collect();
         assert_eq!(
             after,
-            ["--no-ask-user", "agent", "--always-approve", "stdio"],
+            ["agent", "--always-approve", "stdio"],
             "native grok ACP agent argv after binary"
         );
+    }
+
+    fn grok_argv_after_binary() -> Vec<String> {
+        let cmd = grok_agent_launch().command();
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let grok_pos = args.iter().position(|a| a == "grok").expect("grok in argv");
+        args[grok_pos + 1..].to_vec()
+    }
+
+    // @spec harness/grok Structured questions enabled: Main launch does not pass no-ask-user
+    #[test]
+    fn main_launch_does_not_pass_no_ask_user() {
+        let after = grok_argv_after_binary();
+        assert!(
+            !after.iter().any(|a| a == "--no-ask-user"),
+            "main launch must allow structured questions: {after:?}"
+        );
+    }
+
+    // @spec harness/grok Structured questions enabled: Main launch still auto-approves tool execution
+    #[test]
+    fn main_launch_still_auto_approves_tool_execution() {
+        let after = grok_argv_after_binary();
+        assert!(
+            after.iter().any(|a| a == "--always-approve"),
+            "main launch must keep always-approve: {after:?}"
+        );
+    }
+
+    // @spec harness/grok Question wire mapping: An ask-user extension request is exposed as a host user choice
+    #[test]
+    fn an_ask_user_extension_request_is_exposed_as_a_host_user_choice() {
+        // Live capture method name (leading underscore) and unprefixed alias.
+        assert!(crate::acp::turn_ask_user::is_ask_user_method(
+            crate::acp::turn_ask_user::ASK_USER_METHOD
+        ));
+        assert!(crate::acp::turn_ask_user::is_ask_user_method(
+            crate::acp::turn_ask_user::ASK_USER_METHOD_ALIAS
+        ));
+        assert!(!crate::acp::turn_ask_user::is_ask_user_method(
+            "session/request_permission"
+        ));
+
+        // Decode path used by AcpTurn when classifying ask-user methods.
+        let params = json!({
+            "sessionId": "s1",
+            "toolCallId": "tc1",
+            "mode": "single",
+            "questions": [{
+                "question": "Ship?",
+                "options": [
+                    { "label": "Yes", "description": "go" },
+                    { "label": "No", "description": "hold" }
+                ]
+            }]
+        });
+        let (prompt, options) = crate::acp::turn_ask_user::decode_options(&params);
+        assert_eq!(prompt.as_deref(), Some("Ship?"));
+        assert_eq!(options.len(), 2);
+        assert_eq!(options[0].label, "Yes");
+        assert_eq!(options[1].id, "No"); // id defaults to label
+    }
+
+    // @spec harness/grok Question wire mapping: A host selection completes with an accepted questionnaire response
+    #[test]
+    fn a_host_selection_completes_with_an_accepted_questionnaire_response() {
+        let result = crate::acp::turn_ask_user::encode_selected("Ship?", "Yes");
+        // Live-proven flat outcome tag (not externally tagged Accepted).
+        assert_eq!(result["outcome"], "accepted", "result={result}");
+        assert_eq!(result["answers"]["Ship?"], "Yes");
+        assert!(result["partial_answers"].is_null());
+    }
+
+    // @spec harness/grok Question wire mapping: A host cancel completes with a skip-interview response
+    #[test]
+    fn a_host_cancel_completes_with_a_skip_interview_response() {
+        let result = crate::acp::turn_ask_user::encode_cancelled();
+        assert_eq!(
+            result["outcome"], "skip_interview",
+            "cancel must be skip_interview: {result}"
+        );
+        assert!(result.get("answers").is_none());
+    }
+
+    // @spec harness/grok Question wire mapping: Host custom freeform answer completes with an accepted free-text answer
+    #[test]
+    fn host_custom_freeform_answer_completes_with_an_accepted_free_text_answer() {
+        let free = "something else";
+        let result = crate::acp::turn_ask_user::encode_selected("Ship?", free);
+        assert_eq!(result["outcome"], "accepted", "result={result}");
+        assert_eq!(result["answers"]["Ship?"], free);
+        assert!(result["partial_answers"].is_null());
+        assert_ne!(result["outcome"], "skip_interview");
     }
 }

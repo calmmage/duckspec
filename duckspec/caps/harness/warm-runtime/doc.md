@@ -18,7 +18,8 @@ always go through the handle.
         title summary + reply suggestions
         one request at a time
         fresh logical session every call (N=1)
-        each call budgeted (10s wall-clock); over-budget fails to the caller
+        each call bounded by the oneshot call budget (30s wall-clock today);
+        over-budget fails to the caller
         any failure or timeout cold-resets oneshot heat before the next call
 ```
 
@@ -40,11 +41,12 @@ conversation, so earlier suggestion prompts do not accumulate as context. Isolat
 about logical session, not necessarily killing a process: a harness may keep a child warm
 and open a new session between successful calls.
 
-Each oneshot call is also wall-clock bounded: ensure-hot plus prompt for that call must
-finish within ten seconds or the call fails to the caller. Title and reply each get a full
-ten-second budget; they still serialize on the shared path. After any oneshot failure —
-including timeout — oneshot process heat is cold-reset so a later oneshot on the same
-handle can run without waiting on a wedged prior call.
+Each oneshot call is also wall-clock bounded by the **oneshot call budget** (ensure-hot
+plus prompt for that call). The current budget is thirty seconds; title and reply each get
+a full budget per call and still serialize on the shared path. Scenarios and recovery
+rules refer to the budget by name so the duration can change without rewriting them. After
+any oneshot failure — including timeout — oneshot process heat is cold-reset so a later
+oneshot on the same handle can run without waiting on a wedged prior call.
 
 ## Cold-capable harnesses
 

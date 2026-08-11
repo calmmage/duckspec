@@ -39,8 +39,7 @@ pub fn resolve_claude_acp_binary() -> Result<PathBuf, Error> {
 /// spawn with a typed error (same class as a missing `grok`).
 pub fn claude_acp_launch() -> AgentLaunch {
     AgentLaunch::new(|| {
-        let path = resolve_claude_acp_binary()
-            .unwrap_or_else(|_| PathBuf::from(CLAUDE_ACP_BIN));
+        let path = resolve_claude_acp_binary().unwrap_or_else(|_| PathBuf::from(CLAUDE_ACP_BIN));
         tokio::process::Command::new(path)
     })
 }
@@ -167,12 +166,13 @@ mod tests {
     /// @spec harness/claude Agent binary discovery: A missing agent binary fails the turn with a typed error
     #[tokio::test]
     async fn missing_agent_binary_fails_turn_with_typed_error() {
-        let _guard = ENV_LOCK.lock().unwrap();
-
-        // No env override, no sibling, no PATH hit → resolve fails with Spawn.
-        let err = resolve_with(None, Some(Path::new("/no/such/duckboard")), |_| None)
-            .unwrap_err();
-        assert!(matches!(err, Error::Spawn(_)), "got {err:?}");
+        {
+            let _guard = ENV_LOCK.lock().unwrap();
+            // No env override, no sibling, no PATH hit → resolve fails with Spawn.
+            let err =
+                resolve_with(None, Some(Path::new("/no/such/duckboard")), |_| None).unwrap_err();
+            assert!(matches!(err, Error::Spawn(_)), "got {err:?}");
+        }
 
         // A turn that tries to spawn a non-existent agent fails the same way
         // (typed error, no panic) — same operator class as a missing grok.
@@ -182,7 +182,14 @@ mod tests {
         let mut runtime = crate::acp::AcpMainRuntime::new(launch, &std::env::temp_dir());
         let (tx, _rx) = mpsc::channel(8);
         let req = TurnRequest::new("hello", std::env::temp_dir());
-        let outcome = runtime.run_turn(req, tx, CancelToken::new()).await;
+        let outcome = runtime
+            .run_turn(
+                req,
+                tx,
+                CancelToken::new(),
+                crate::event::PendingUserChoices::shared(),
+            )
+            .await;
         assert!(
             matches!(outcome, Err(Error::Spawn(_))),
             "expected Spawn error, got {outcome:?}"

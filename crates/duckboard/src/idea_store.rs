@@ -87,12 +87,194 @@ impl IdeaState {
     ];
 }
 
+/// Exclusive boost mark on an idea. Unknown YAML values load as [`IdeaMark::None`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IdeaMark {
+    #[default]
+    None,
+    Star,
+    Hot,
+    Cool,
+}
+
+impl IdeaMark {
+    pub fn as_str(self) -> Option<&'static str> {
+        match self {
+            IdeaMark::None => None,
+            IdeaMark::Star => Some("star"),
+            IdeaMark::Hot => Some("hot"),
+            IdeaMark::Cool => Some("cool"),
+        }
+    }
+
+    fn from_yaml_str(s: &str) -> Self {
+        match s {
+            "star" => IdeaMark::Star,
+            "hot" => IdeaMark::Hot,
+            "cool" => IdeaMark::Cool,
+            "none" | "" => IdeaMark::None,
+            _ => IdeaMark::None,
+        }
+    }
+}
+
+impl Serialize for IdeaMark {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self.as_str() {
+            Some(s) => serializer.serialize_str(s),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for IdeaMark {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Accept string, null, or missing (via #[serde(default)] on the field).
+        // Unknown strings map to None so hand-edited YAML never bricks load.
+        let value = Option::<serde_yaml::Value>::deserialize(deserializer)?;
+        Ok(match value {
+            None | Some(serde_yaml::Value::Null) => IdeaMark::None,
+            Some(serde_yaml::Value::String(s)) => IdeaMark::from_yaml_str(&s),
+            Some(_) => IdeaMark::None,
+        })
+    }
+}
+
+fn mark_is_none(m: &IdeaMark) -> bool {
+    matches!(m, IdeaMark::None)
+}
+
+/// Advance exclusive mark: none → star → hot → cool → none.
+pub fn cycle_mark(m: IdeaMark) -> IdeaMark {
+    match m {
+        IdeaMark::None => IdeaMark::Star,
+        IdeaMark::Star => IdeaMark::Hot,
+        IdeaMark::Hot => IdeaMark::Cool,
+        IdeaMark::Cool => IdeaMark::None,
+    }
+}
+
+/// Set mark and maintain star pin time: record/refresh on star, clear otherwise.
+pub fn apply_mark(fm: &mut Frontmatter, next: IdeaMark, now: OffsetDateTime) {
+    fm.mark = next;
+    fm.favored_at = match next {
+        IdeaMark::Star => Some(iso8601_local(now)),
+        _ => None,
+    };
+}
+
+/// Link key for CHANGE-list rows that may inherit an idea mark.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueueLinkKey {
+    Change(String),
+    Exploration(String),
+}
+
+/// Idea linked to a change folder name, if any.
+pub fn idea_for_change<'a>(ideas: &'a [Idea], name: &str) -> Option<&'a Idea> {
+    ideas
+        .iter()
+        .find(|i| i.frontmatter.change.as_deref() == Some(name))
+}
+
+/// Idea linked to an exploration id, if any.
+pub fn idea_for_exploration<'a>(ideas: &'a [Idea], id: &str) -> Option<&'a Idea> {
+    ideas
+        .iter()
+        .find(|i| i.frontmatter.exploration.as_deref() == Some(id))
+}
+
+/// Projected mark for a change row (none when unlinked).
+pub fn mark_for_change(ideas: &[Idea], change_name: &str) -> IdeaMark {
+    idea_for_change(ideas, change_name)
+        .map(|i| i.frontmatter.mark)
+        .unwrap_or(IdeaMark::None)
+}
+
+/// Projected mark for an exploration row (none when unlinked).
+pub fn mark_for_exploration(ideas: &[Idea], exploration_id: &str) -> IdeaMark {
+    idea_for_exploration(ideas, exploration_id)
+        .map(|i| i.frontmatter.mark)
+        .unwrap_or(IdeaMark::None)
+}
+
+/// Projected mark for a queue link key.
+pub fn mark_for_link(ideas: &[Idea], key: &QueueLinkKey) -> IdeaMark {
+    match key {
+        QueueLinkKey::Change(name) => mark_for_change(ideas, name),
+        QueueLinkKey::Exploration(id) => mark_for_exploration(ideas, id),
+    }
+}
+
+/// Cycle the mark on the idea linked to `key`. Returns `true` if a linked idea
+/// was updated in memory. Unlinked keys are a pure no-op (no idea is created).
+pub fn cycle_mark_for_link(ideas: &mut [Idea], key: &QueueLinkKey, now: OffsetDateTime) -> bool {
+    let idea = match key {
+        QueueLinkKey::Change(name) => ideas
+            .iter_mut()
+            .find(|i| i.frontmatter.change.as_deref() == Some(name.as_str())),
+        QueueLinkKey::Exploration(id) => ideas
+            .iter_mut()
+            .find(|i| i.frontmatter.exploration.as_deref() == Some(id.as_str())),
+    };
+    let Some(idea) = idea else {
+        return false;
+    };
+    let next = cycle_mark(idea.frontmatter.mark);
+    apply_mark(&mut idea.frontmatter, next, now);
+    true
+}
+
+/// Cycle mark for a link and persist when a linked idea exists. Returns whether
+/// an idea was updated. Unlinked keys leave storage and the idea list unchanged.
+pub fn cycle_and_save_mark_for_link(
+    ideas: &mut [Idea],
+    key: &QueueLinkKey,
+    project_root: Option<&Path>,
+) -> bool {
+    let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
+    if !cycle_mark_for_link(ideas, key, now) {
+        return false;
+    }
+    // Re-find after cycle to save (path may be empty for unsaved tests).
+    let idea = match key {
+        QueueLinkKey::Change(name) => ideas
+            .iter_mut()
+            .find(|i| i.frontmatter.change.as_deref() == Some(name.as_str())),
+        QueueLinkKey::Exploration(id) => ideas
+            .iter_mut()
+            .find(|i| i.frontmatter.exploration.as_deref() == Some(id.as_str())),
+    };
+    let Some(idea) = idea else {
+        return false;
+    };
+    if idea.abs_path.as_os_str().is_empty() || !idea.abs_path.exists() {
+        // In-memory only (e.g. unit tests without a file yet).
+        return true;
+    }
+    let body = read_body(&idea.abs_path).unwrap_or_default();
+    if let Err(e) = save_idea(idea, &body, project_root) {
+        tracing::warn!("failed to save idea after mark cycle: {e}");
+    }
+    true
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Frontmatter {
     pub title: String,
     pub created: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "mark_is_none")]
+    pub mark: IdeaMark,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub favored_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exploration: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -482,11 +664,189 @@ pub fn new_idea() -> Idea {
             title: fallback_title(),
             created: iso8601_local(now),
             tags: Vec::new(),
+            mark: IdeaMark::None,
+            favored_at: None,
             exploration: None,
             change: None,
             archived: None,
         },
     }
+}
+
+/// Target for first-tag idea minting from a CHANGE-list row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MintTarget {
+    Exploration { id: String, display_name: String },
+    Change { name: String },
+}
+
+/// Prettify a change folder slug for an idea title: kebab segments → spaced
+/// words with the first character of each segment uppercased.
+pub fn prettify_change_slug(name: &str) -> String {
+    name.split('-')
+        .filter(|s| !s.is_empty())
+        .map(|seg| {
+            let mut chars = seg.chars();
+            match chars.next() {
+                None => String::new(),
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Create and persist a linked idea for `target`. Optional `first_tag` seeds
+/// the tag list when non-empty; mark-only mint may pass `None` or `""`.
+/// If a linked idea already exists, returns its path without creating another.
+/// Does not set `Exploration.idea_path` — callers update that when the target
+/// is an exploration.
+pub fn mint_linked_idea(
+    ideas: &mut Vec<Idea>,
+    target: MintTarget,
+    first_tag: Option<&str>,
+    project_root: Option<&Path>,
+) -> anyhow::Result<PathBuf> {
+    let tag = first_tag
+        .map(|t| t.trim().trim_start_matches('#').trim())
+        .filter(|t| !t.is_empty())
+        .map(str::to_string);
+
+    match &target {
+        MintTarget::Exploration { id, .. } => {
+            if let Some(idea) = idea_for_exploration(ideas, id) {
+                return Ok(idea.abs_path.clone());
+            }
+        }
+        MintTarget::Change { name } => {
+            if let Some(idea) = idea_for_change(ideas, name) {
+                return Ok(idea.abs_path.clone());
+            }
+        }
+    }
+
+    let mut idea = new_idea();
+    match &target {
+        MintTarget::Exploration { id, display_name } => {
+            idea.state = IdeaState::Exploration;
+            idea.frontmatter.title = display_name.clone();
+            idea.frontmatter.exploration = Some(id.clone());
+        }
+        MintTarget::Change { name } => {
+            idea.state = IdeaState::Change;
+            idea.frontmatter.title = prettify_change_slug(name);
+            idea.frontmatter.change = Some(name.clone());
+        }
+    }
+    idea.frontmatter.tags = tag.into_iter().collect();
+    let body = format!("# {}\n", idea.frontmatter.title);
+    save_idea(&mut idea, &body, project_root)?;
+    let path = idea.abs_path.clone();
+    ideas.push(idea);
+    Ok(path)
+}
+
+/// Ensure a linked idea exists for `target` (create with no tags if missing).
+pub fn ensure_linked_idea(
+    ideas: &mut Vec<Idea>,
+    target: MintTarget,
+    project_root: Option<&Path>,
+) -> anyhow::Result<PathBuf> {
+    mint_linked_idea(ideas, target, None, project_root)
+}
+
+/// Cycle mark on the idea for `target`, creating and linking the idea first
+/// when none exists (mark-click mint). Returns whether the mark was updated.
+pub fn cycle_mark_for_target(
+    ideas: &mut Vec<Idea>,
+    target: MintTarget,
+    project_root: Option<&Path>,
+) -> anyhow::Result<bool> {
+    ensure_linked_idea(ideas, target.clone(), project_root)?;
+    let key = match &target {
+        MintTarget::Exploration { id, .. } => QueueLinkKey::Exploration(id.clone()),
+        MintTarget::Change { name } => QueueLinkKey::Change(name.clone()),
+    };
+    Ok(cycle_and_save_mark_for_link(ideas, &key, project_root))
+}
+
+/// Apply a tag to a mint target: mint a linked idea when none exists, otherwise
+/// append the tag on the existing idea. Returns `(idea_path, minted)`.
+pub fn apply_tag_to_link(
+    ideas: &mut Vec<Idea>,
+    target: MintTarget,
+    tag: &str,
+    project_root: Option<&Path>,
+) -> anyhow::Result<(PathBuf, bool)> {
+    let cleaned = tag.trim().trim_start_matches('#').trim().to_string();
+    if cleaned.is_empty() {
+        anyhow::bail!("empty tag");
+    }
+
+    let already_linked = match &target {
+        MintTarget::Exploration { id, .. } => idea_for_exploration(ideas, id).is_some(),
+        MintTarget::Change { name } => idea_for_change(ideas, name).is_some(),
+    };
+
+    if !already_linked {
+        let path = mint_linked_idea(ideas, target, Some(&cleaned), project_root)?;
+        return Ok((path, true));
+    }
+
+    let idea = match &target {
+        MintTarget::Exploration { id, .. } => ideas
+            .iter_mut()
+            .find(|i| i.frontmatter.exploration.as_deref() == Some(id.as_str())),
+        MintTarget::Change { name } => ideas
+            .iter_mut()
+            .find(|i| i.frontmatter.change.as_deref() == Some(name.as_str())),
+    };
+    let Some(idea) = idea else {
+        anyhow::bail!("linked idea missing after lookup");
+    };
+    if !idea.frontmatter.tags.iter().any(|t| t == &cleaned) {
+        idea.frontmatter.tags.push(cleaned);
+    }
+    let body = if !idea.abs_path.as_os_str().is_empty() && idea.abs_path.exists() {
+        read_body(&idea.abs_path).unwrap_or_else(|_| format!("# {}\n", idea.frontmatter.title))
+    } else {
+        format!("# {}\n", idea.frontmatter.title)
+    };
+    save_idea(idea, &body, project_root)?;
+    Ok((idea.abs_path.clone(), false))
+}
+
+/// Tag an exploration row: mint+link on first tag, then keep `idea_path` in sync.
+pub fn apply_tag_to_exploration(
+    ideas: &mut Vec<Idea>,
+    exp: &mut crate::chat_store::Exploration,
+    tag: &str,
+    project_root: Option<&Path>,
+) -> anyhow::Result<(PathBuf, bool)> {
+    let target = MintTarget::Exploration {
+        id: exp.id.clone(),
+        display_name: exp.display_name.clone(),
+    };
+    let (path, minted) = apply_tag_to_link(ideas, target, tag, project_root)?;
+    exp.idea_path = Some(path.display().to_string());
+    Ok((path, minted))
+}
+
+/// Tag a change row: mint on first tag when unlinked.
+pub fn apply_tag_to_change(
+    ideas: &mut Vec<Idea>,
+    change_name: &str,
+    tag: &str,
+    project_root: Option<&Path>,
+) -> anyhow::Result<(PathBuf, bool)> {
+    apply_tag_to_link(
+        ideas,
+        MintTarget::Change {
+            name: change_name.to_string(),
+        },
+        tag,
+        project_root,
+    )
 }
 
 pub fn delete_idea(idea: &Idea, project_root: Option<&Path>) {
@@ -640,6 +1000,8 @@ mod tests {
             title: "Test".into(),
             created: "2026-04-25T14:32:00+02:00".into(),
             tags: vec![],
+            mark: IdeaMark::None,
+            favored_at: None,
             exploration: None,
             change: None,
             archived: None,
@@ -663,6 +1025,8 @@ mod tests {
             title: "Fix overflow".into(),
             created: "2026-04-25T14:32:00+02:00".into(),
             tags: vec!["parser/spec".into(), "performance".into()],
+            mark: IdeaMark::Hot,
+            favored_at: None,
             exploration: Some("exploration-1714082400000".into()),
             change: Some("2026-04-25-01-fix-parser-overflow".into()),
             archived: Some(ArchiveKind::ViaChange),
@@ -683,7 +1047,318 @@ mod tests {
             Some("2026-04-25-01-fix-parser-overflow")
         );
         assert!(matches!(parsed_fm.archived, Some(ArchiveKind::ViaChange)));
+        assert_eq!(parsed_fm.mark, IdeaMark::Hot);
         assert_eq!(parsed_body, body);
+    }
+
+    // @spec ideas/marks Exclusive mark on the idea: Mark cycles through none, star, hot, cool
+    #[test]
+    fn mark_cycles_through_none_star_hot_cool() {
+        let mut m = IdeaMark::None;
+        m = cycle_mark(m);
+        assert_eq!(m, IdeaMark::Star);
+        m = cycle_mark(m);
+        assert_eq!(m, IdeaMark::Hot);
+        m = cycle_mark(m);
+        assert_eq!(m, IdeaMark::Cool);
+        m = cycle_mark(m);
+        assert_eq!(m, IdeaMark::None);
+    }
+
+    // @spec ideas/marks Exclusive mark on the idea: Mark persists across idea reload
+    #[test]
+    fn mark_persists_across_idea_reload() {
+        let fm = Frontmatter {
+            title: "Hot idea".into(),
+            created: "2026-04-25T14:32:00+02:00".into(),
+            mark: IdeaMark::Hot,
+            ..Default::default()
+        };
+        let raw = serialize_file_contents(&fm, "# Hot idea\n").unwrap();
+        let (parsed, _) = parse_file_contents(&raw);
+        assert_eq!(parsed.mark, IdeaMark::Hot);
+    }
+
+    // @spec ideas/marks Exclusive mark on the idea: Unknown stored mark loads as none
+    #[test]
+    fn unknown_stored_mark_loads_as_none() {
+        let raw = "---\ntitle: X\ncreated: 2026-01-01T00:00:00+00:00\nmark: bogon\n---\n# X\n";
+        let (fm, _) = parse_file_contents(raw);
+        assert_eq!(fm.mark, IdeaMark::None);
+    }
+
+    // @spec ideas/marks Star pin time: Entering star records a pin time
+    #[test]
+    fn entering_star_records_a_pin_time() {
+        let mut fm = Frontmatter {
+            title: "A".into(),
+            created: "2026-01-01T00:00:00+00:00".into(),
+            ..Default::default()
+        };
+        assert!(fm.favored_at.is_none());
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        apply_mark(&mut fm, IdeaMark::Star, now);
+        assert_eq!(fm.mark, IdeaMark::Star);
+        assert!(fm.favored_at.is_some());
+    }
+
+    // @spec ideas/marks Star pin time: Leaving star clears pin time
+    #[test]
+    fn leaving_star_clears_pin_time() {
+        let mut fm = Frontmatter {
+            title: "A".into(),
+            created: "2026-01-01T00:00:00+00:00".into(),
+            ..Default::default()
+        };
+        let t0 = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        apply_mark(&mut fm, IdeaMark::Star, t0);
+        assert!(fm.favored_at.is_some());
+        apply_mark(&mut fm, IdeaMark::Hot, t0);
+        assert_eq!(fm.mark, IdeaMark::Hot);
+        assert!(fm.favored_at.is_none());
+    }
+
+    // @spec ideas/marks Star pin time: Re-entering star refreshes pin time
+    #[test]
+    fn re_entering_star_refreshes_pin_time() {
+        let mut fm = Frontmatter {
+            title: "A".into(),
+            created: "2026-01-01T00:00:00+00:00".into(),
+            ..Default::default()
+        };
+        let t0 = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let t1 = OffsetDateTime::from_unix_timestamp(1_700_000_100).unwrap();
+        apply_mark(&mut fm, IdeaMark::Star, t0);
+        let first = fm.favored_at.clone().expect("pin time");
+        apply_mark(&mut fm, IdeaMark::None, t0);
+        apply_mark(&mut fm, IdeaMark::Star, t1);
+        let second = fm.favored_at.expect("refreshed pin time");
+        assert_ne!(first, second);
+        assert!(second > first);
+    }
+
+    fn sample_idea(mark: IdeaMark, change: Option<&str>, exploration: Option<&str>) -> Idea {
+        Idea {
+            abs_path: PathBuf::new(),
+            state: if change.is_some() {
+                IdeaState::Change
+            } else if exploration.is_some() {
+                IdeaState::Exploration
+            } else {
+                IdeaState::Inbox
+            },
+            primary_tag_path: vec![],
+            frontmatter: Frontmatter {
+                title: "Linked".into(),
+                created: "2026-01-01T00:00:00+00:00".into(),
+                mark,
+                change: change.map(str::to_string),
+                exploration: exploration.map(str::to_string),
+                ..Default::default()
+            },
+        }
+    }
+
+    // @spec ideas/marks Linked rows inherit the idea mark: Change-linked row exposes the idea's mark
+    #[test]
+    fn change_linked_row_exposes_the_ideas_mark() {
+        let ideas = vec![sample_idea(
+            IdeaMark::Cool,
+            Some("list-marks-tags-sort"),
+            None,
+        )];
+        assert_eq!(
+            mark_for_change(&ideas, "list-marks-tags-sort"),
+            IdeaMark::Cool
+        );
+        assert_eq!(
+            mark_for_link(
+                &ideas,
+                &QueueLinkKey::Change("list-marks-tags-sort".into())
+            ),
+            IdeaMark::Cool
+        );
+    }
+
+    // @spec ideas/marks Linked rows inherit the idea mark: Exploration-linked row exposes the idea's mark
+    #[test]
+    fn exploration_linked_row_exposes_the_ideas_mark() {
+        let ideas = vec![sample_idea(
+            IdeaMark::Star,
+            None,
+            Some("exploration-1"),
+        )];
+        assert_eq!(
+            mark_for_exploration(&ideas, "exploration-1"),
+            IdeaMark::Star
+        );
+    }
+
+    // @spec ideas/marks Linked rows inherit the idea mark: Unlinked row has no mark until mark cycle mints
+    #[test]
+    fn unlinked_row_has_no_mark_until_mark_cycle_mints() {
+        let mut ideas: Vec<Idea> = vec![];
+        let key = QueueLinkKey::Exploration("exploration-orphan".into());
+        assert_eq!(mark_for_link(&ideas, &key), IdeaMark::None);
+        // Low-level cycle without mint target still no-ops (no display name / target).
+        assert!(!cycle_and_save_mark_for_link(&mut ideas, &key, None));
+        assert!(ideas.is_empty());
+    }
+
+    #[test]
+    fn cycle_and_save_updates_linked_idea_in_memory() {
+        let mut ideas = vec![sample_idea(IdeaMark::None, Some("ch"), None)];
+        let key = QueueLinkKey::Change("ch".into());
+        assert!(cycle_and_save_mark_for_link(&mut ideas, &key, None));
+        assert_eq!(mark_for_change(&ideas, "ch"), IdeaMark::Star);
+    }
+
+    #[test]
+    fn prettify_change_slug_title_cases_kebab() {
+        assert_eq!(
+            prettify_change_slug("list-marks-tags-sort"),
+            "List Marks Tags Sort"
+        );
+    }
+
+    // @spec ideas/first-tag-mint First tag on free exploration mints a linked idea: First tag creates exploration-state idea with display name title
+    // @spec ideas/first-tag-mint First tag on free exploration mints a linked idea: Exploration record points at the new idea
+    // @spec ideas/first-tag-mint First tag on free exploration mints a linked idea: Linked exploration remains on the CHANGE list
+    #[test]
+    fn first_tag_on_free_exploration_mints_and_stays_on_change_list() {
+        let (dir, project) = temp_project();
+        let mut ideas = Vec::new();
+        let mut exp = crate::chat_store::Exploration::new(1);
+        exp.display_name = "Cloud agent options".into();
+        assert!(exp.is_on_live_list());
+        assert!(exp.idea_path.is_none());
+
+        let (_path, minted) = apply_tag_to_exploration(
+            &mut ideas,
+            &mut exp,
+            "ui",
+            project.project_root.as_deref(),
+        )
+        .expect("mint");
+        assert!(minted);
+        assert_eq!(ideas.len(), 1);
+        assert_eq!(ideas[0].state, IdeaState::Exploration);
+        assert_eq!(ideas[0].frontmatter.title, "Cloud agent options");
+        assert!(ideas[0].frontmatter.tags.iter().any(|t| t == "ui"));
+        assert_eq!(
+            ideas[0].frontmatter.exploration.as_deref(),
+            Some(exp.id.as_str())
+        );
+        assert!(exp.idea_path.is_some());
+        assert!(exp.is_on_live_list());
+        cleanup(dir);
+    }
+
+    // @spec ideas/first-tag-mint First tag on unlinked change mints a linked idea: First tag creates change-state idea with prettified-slug title
+    // @spec ideas/first-tag-mint First tag on unlinked change mints a linked idea: Idea links to the change name
+    #[test]
+    fn first_tag_on_unlinked_change_mints_prettified_linked_idea() {
+        let (dir, project) = temp_project();
+        let mut ideas = Vec::new();
+        let (_path, minted) = apply_tag_to_change(
+            &mut ideas,
+            "list-marks-tags-sort",
+            "queue",
+            project.project_root.as_deref(),
+        )
+        .expect("mint");
+        assert!(minted);
+        assert_eq!(ideas.len(), 1);
+        assert_eq!(ideas[0].state, IdeaState::Change);
+        assert_eq!(
+            ideas[0].frontmatter.title,
+            prettify_change_slug("list-marks-tags-sort")
+        );
+        assert!(ideas[0].frontmatter.tags.iter().any(|t| t == "queue"));
+        assert_eq!(
+            ideas[0].frontmatter.change.as_deref(),
+            Some("list-marks-tags-sort")
+        );
+        cleanup(dir);
+    }
+
+    // @spec ideas/first-tag-mint First tag on unlinked change mints a linked idea: Second tag on already-linked change does not mint another idea
+    #[test]
+    fn second_tag_on_already_linked_change_does_not_mint_another_idea() {
+        let (dir, project) = temp_project();
+        let mut ideas = Vec::new();
+        apply_tag_to_change(
+            &mut ideas,
+            "list-marks-tags-sort",
+            "queue",
+            project.project_root.as_deref(),
+        )
+        .unwrap();
+        let (_path, minted) = apply_tag_to_change(
+            &mut ideas,
+            "list-marks-tags-sort",
+            "ui",
+            project.project_root.as_deref(),
+        )
+        .unwrap();
+        assert!(!minted);
+        assert_eq!(ideas.len(), 1);
+        assert!(ideas[0].frontmatter.tags.iter().any(|t| t == "queue"));
+        assert!(ideas[0].frontmatter.tags.iter().any(|t| t == "ui"));
+        cleanup(dir);
+    }
+
+    // @spec ideas/first-tag-mint Chat message does not create an idea: First chat message alone does not mint an idea
+    #[test]
+    fn first_chat_message_alone_does_not_mint_an_idea() {
+        // Chat send has no mint call site; only apply_tag_* creates ideas.
+        let ideas: Vec<Idea> = Vec::new();
+        let exp = crate::chat_store::Exploration::new(1);
+        assert!(exp.idea_path.is_none());
+        assert!(idea_for_exploration(&ideas, &exp.id).is_none());
+        assert!(ideas.is_empty());
+    }
+
+    // @spec ideas/first-tag-mint First mark cycle mints when unlinked: Mark cycle on free exploration creates a linked idea
+    #[test]
+    fn mark_cycle_on_free_exploration_creates_a_linked_idea() {
+        let (dir, project) = temp_project();
+        let mut ideas: Vec<Idea> = Vec::new();
+        let mut exp = crate::chat_store::Exploration::new(1);
+        exp.display_name = "Cloud agent options".into();
+        let target = MintTarget::Exploration {
+            id: exp.id.clone(),
+            display_name: exp.display_name.clone(),
+        };
+        assert!(cycle_mark_for_target(&mut ideas, target, project.project_root.as_deref()).unwrap());
+        assert_eq!(ideas.len(), 1);
+        assert_eq!(ideas[0].state, IdeaState::Exploration);
+        assert_eq!(ideas[0].frontmatter.title, "Cloud agent options");
+        assert_eq!(ideas[0].frontmatter.mark, IdeaMark::Star);
+        assert!(ideas[0].frontmatter.tags.is_empty());
+        let path = ideas[0].abs_path.display().to_string();
+        exp.idea_path = Some(path);
+        assert!(exp.idea_path.is_some());
+        assert!(exp.is_on_live_list());
+        cleanup(dir);
+    }
+
+    #[test]
+    fn mark_cycle_on_unlinked_change_creates_a_linked_idea() {
+        let (dir, project) = temp_project();
+        let mut ideas: Vec<Idea> = Vec::new();
+        let target = MintTarget::Change {
+            name: "list-marks-tags-sort".into(),
+        };
+        assert!(cycle_mark_for_target(&mut ideas, target, project.project_root.as_deref()).unwrap());
+        assert_eq!(ideas.len(), 1);
+        assert_eq!(ideas[0].state, IdeaState::Change);
+        assert_eq!(ideas[0].frontmatter.mark, IdeaMark::Star);
+        assert_eq!(
+            ideas[0].frontmatter.change.as_deref(),
+            Some("list-marks-tags-sort")
+        );
+        cleanup(dir);
     }
 
     #[test]
@@ -720,6 +1395,8 @@ mod tests {
             title: "Test".into(),
             created: "2026-04-25T14:32:00+02:00".into(),
             tags: vec![],
+            mark: IdeaMark::None,
+            favored_at: None,
             exploration: None,
             change: None,
             archived: None,
@@ -753,6 +1430,8 @@ mod tests {
             title: "Big".into(),
             created: "2026-04-25T14:32:00+02:00".into(),
             tags: vec!["parser".into()],
+            mark: IdeaMark::None,
+            favored_at: None,
             exploration: None,
             change: None,
             archived: None,
@@ -783,6 +1462,7 @@ mod tests {
             cap_tree: vec![],
             steps: vec![],
             reviews: vec![],
+            shallow_mtime_nanos: None,
         }
     }
 

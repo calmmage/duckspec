@@ -10,15 +10,15 @@ re-derive it from project state.
 
 ## Scope kinds
 
-A session's scope is one of four kinds. The orientation it produces is tailored to the
-kind.
-
 ```
 kind          orientation content
 ────────────  ──────────────────────────────────────────────────────────────
 change        the change name, project-root path under duckspec/changes/,
-              its progress, its next stage, and a statement that
-              change-acting commands target this change by default
+              its progress, its next stage, a statement that
+              change-acting commands target this change by default, and —
+              when present — a pointer at duckspec/changes/{name}/inputs.md
+              for raw human inputs (re-ground; do not invent motivation;
+              do not rewrite that file)
 exploration   an early-stage brainstorming chat with no formal artifacts yet
 caps          the project's capability tree — points at duckspec/caps/ and
               duckspec/project.md
@@ -41,10 +41,15 @@ with several active changes never forces the agent to ask which one to act on.
 The orientation also reports where the change sits in its lifecycle: the suggested next
 stage and step progress.
 
+When `duckspec/changes/{name}/inputs.md` exists and is non-empty, the orientation also
+names that path and tells the agent to re-ground on those raw human inputs instead of
+inventing motivation, and not to rewrite the file. When the file is missing or empty,
+orientation says nothing about an inputs ledger.
+
 ## Lifecycle and next stage
 
 ```
-change state                                  suggested next stage (chrome[0])
+change state                                  suggested next stage (first option)
 ────────────────────────────────────────────  ────────────────────
 proposal only                                  design
 design, no specs                               spec
@@ -54,8 +59,8 @@ all steps complete (no reviews)                archive
 no open steps + review                         step
 ```
 
-Suggested next stage is the first option of the same lifecycle list obvious chrome uses.
-That full list also offers critique modes mid-steps and after completion:
+Suggested next stage is the first option of the review-aware lifecycle ladder. That full
+list also offers critique modes mid-steps and after completion:
 
 ```
 open steps:
@@ -68,9 +73,8 @@ no open steps + review:
   step, spec, review, followup, archive
 ```
 
-Presence of a review file does not remove `/ds-review` or `/ds-followup` from chrome; it
-selects the rework-aware arm when there are no open steps (first option `step`) and
-enables the Confirm/Reject gate where chrome composition requires it.
+Presence of a review file does not remove `/ds-review` or `/ds-followup` from the ladder;
+it selects the rework-aware arm when there are no open steps (first option `step`).
 
 ## Step progress
 
@@ -97,4 +101,4 @@ reviews, the orientation says nothing about a current review.
 The current review path is informational. Step progress counts are derived only from step
 completion. The suggested next stage follows the shared review-aware lifecycle, so a
 review may change next stage (for example all-complete with a review suggests step for
-rework, while archive, review, and followup remain available as later chrome options).
+rework, while archive, review, and followup remain available later on the ladder).

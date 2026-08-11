@@ -11,26 +11,37 @@ use iced::{Element, Event, Length, Subscription, Task};
 
 mod agent;
 mod area;
+mod build_pilot;
 mod chat_store;
+#[cfg(test)]
+mod chat_store_integration_tests;
+mod inputs_ledger;
 pub mod config;
+mod focus_answer;
+mod dashboard_digest;
 mod data;
 mod default_prompts;
-mod meta_card;
-mod obvious_bubble;
+mod fast_response;
 pub mod highlight;
 mod idea_format;
 mod idea_store;
 mod keybinds;
+mod queue_list;
+mod meta_card;
 mod path_env;
 mod path_link;
 mod scope;
 mod self_version;
+mod source_fingerprint;
 mod slash_commands;
 mod theme;
 mod title_hints;
 mod vcs;
 mod watcher;
 mod widget;
+// Step 01 surface; later session-worktrees steps wire activate/UI. Unit tests cover policy.
+#[allow(dead_code)]
+mod worktree;
 
 use area::Area;
 use area::interaction::{self, ActiveTab};
@@ -48,14 +59,14 @@ const KEY_CODEX: &str = "codex";
 pub(crate) struct State {
     pub(crate) active_area: Area,
     pub(crate) project: ProjectData,
-    config: config::Config,
+    pub(crate) config: config::Config,
     dashboard: area::dashboard::State,
-    ideas: area::ideas::State,
+    pub(crate) ideas: area::ideas::State,
     pub(crate) change: area::change::State,
     caps: area::caps::State,
     codex: area::codex::State,
     settings: area::settings::State,
-    file_finder: widget::file_finder::FileFinderState,
+    pub(crate) file_finder: widget::file_finder::FileFinderState,
     text_search: widget::text_search::TextSearchState,
     project_picker: widget::project_picker::ProjectPickerState,
     quick_idea: widget::quick_idea::QuickIdeaState,
@@ -104,6 +115,13 @@ pub(crate) struct State {
     /// (Caps | Codex | Change(name) | Exploration(id)). Survives area
     /// switches; the visible column reads from the active area's scope.
     pub(crate) interactions: HashMap<scope::Scope, interaction::InteractionState>,
+    /// Logical window width for equal content/chat free-space split.
+    /// Seeded from the default window size; updated on resize.
+    window_width: f32,
+    /// List column width in three-column areas. Session memory; grip-dragged.
+    list_column_width: f32,
+    /// Per-scope worktree placement and sidecar bindings for the open project.
+    worktree_bindings: worktree::BindingStore,
 }
 
 impl State {
@@ -123,11 +141,15 @@ impl State {
             recent = config.projects.recent.len(),
             "duckboard started with no project"
         );
+        let window_width = theme::DEFAULT_WINDOW_WIDTH;
         let mut interactions = HashMap::new();
-        interactions.insert(scope::Scope::Caps, interaction::InteractionState::default());
+        interactions.insert(
+            scope::Scope::Caps,
+            interaction::InteractionState::for_window(window_width),
+        );
         interactions.insert(
             scope::Scope::Codex,
-            interaction::InteractionState::default(),
+            interaction::InteractionState::for_window(window_width),
         );
         Self {
             active_area: Area::Dashboard,
@@ -156,6 +178,9 @@ impl State {
             cached_previews: HashMap::new(),
             cached_active: HashMap::new(),
             interactions,
+            window_width,
+            list_column_width: theme::LIST_COLUMN_WIDTH,
+            worktree_bindings: worktree::BindingStore::default(),
         }
     }
 
@@ -169,6 +194,29 @@ impl State {
         if self.stale.is_none() {
             self.stale_panel_open = false;
         }
+    }
+
+    /// Shared list prefs (sort key / pillows) for CHANGE and Ideas queues.
+    pub(crate) fn list_prefs(&self) -> &crate::queue_list::ListConfig {
+        &self.config.list
+    }
+
+    /// True when a modal or exploration rename owns navigation keys so shell
+    /// list-digit chords must not resolve.
+    pub(crate) fn navigation_keys_captured(&self) -> bool {
+        self.file_finder.visible
+            || self.text_search.visible
+            || self.project_picker.visible
+            || self.quick_idea.visible
+            || self.new_file.visible
+            || self.find_modal.visible
+            || self.change.renaming_exploration.is_some()
+    }
+
+    /// Blank app state for unit tests (no project open).
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        Self::new()
     }
 
     /// Switch to the project rooted at `path`. Rebuilds subordinate area
@@ -189,6 +237,11 @@ impl State {
         self.change = area::change::State::new(self.project.project_root.as_deref());
         if let Some(root) = &self.project.project_root {
             self.change.set_changed_files(vcs::changed_files(root));
+            let mut bindings = worktree::load_bindings(root);
+            worktree::reconcile_orphans(root, &mut bindings);
+            self.worktree_bindings = bindings;
+        } else {
+            self.worktree_bindings = worktree::BindingStore::default();
         }
         let mut caps_expanded = std::collections::HashSet::new();
         data::TreeNode::collect_parent_ids(&self.project.cap_tree, &mut caps_expanded);
@@ -207,14 +260,19 @@ impl State {
         self.cached_previews.clear();
         self.cached_active.clear();
         self.interactions.clear();
-        self.interactions
-            .insert(scope::Scope::Caps, interaction::InteractionState::default());
+        self.interactions.insert(
+            scope::Scope::Caps,
+            interaction::InteractionState::for_window(self.window_width),
+        );
         self.interactions.insert(
             scope::Scope::Codex,
-            interaction::InteractionState::default(),
+            interaction::InteractionState::for_window(self.window_width),
         );
         self.project.revalidate();
         self.active_area = Area::Dashboard;
+        self.dashboard.on_project_opened();
+        self.dashboard
+            .refresh_chat_activity(&self.project, &self.change.explorations);
         self.refresh_stale();
 
         self.config.projects.touch(&path);
@@ -425,6 +483,8 @@ enum Message {
     Settings(area::settings::Message),
     // System theme changed
     ThemeChanged(theme::ColorMode),
+    /// App-start model catalog refresh finished; re-read pickers / oneshot resolve.
+    ModelCatalogReady,
     // Animation tick for the streaming indicator; only fires while a session
     // is streaming (see `subscription`).
     StreamTick,
@@ -438,25 +498,39 @@ enum Message {
     // The window received a close request. We persist every session before
     // letting the window actually close (see `main`'s `exit_on_close_request`).
     WindowCloseRequested(iced::window::Id),
+    /// Logical window size changed — rebalance uncustomized interaction widths.
+    WindowResized(iced::Size),
+    /// List-column resize grip (session memory).
+    ListColumnWidth(f32),
 }
 
 // ── Update ───────────────────────────────────────────────────────────────────
 
-/// Stamp every chat session with the current project's default model
-/// (`ModelRef`). Cheap (a handful of sessions) and run once per update tick so
-/// a freshly-created session or a default just changed in Settings is reflected
-/// before the next send. `Config` and `project_root` live here on the global
-/// state; the interaction layer can't reach them, so it reads the stamped
-/// value off `AgentSession::project_model_default` instead.
+/// Stamp every chat session with the project override and global default.
+/// Cheap (a handful of sessions) and run once per update tick so a freshly
+/// created session or a default just changed in Settings is reflected before
+/// the next send. `Config` lives here on the global state; the interaction
+/// layer reads the stamped values off `AgentSession`.
+///
+/// Also re-seeds an unset global default when the process catalog has models
+/// (e.g. after Reset cleared config and ModelCatalogReady already fired).
 fn refresh_model_defaults(state: &mut State) {
-    let default = state
+    let catalog = agent::available_models();
+    if agent::seed_global_default_if_unset(&mut state.config, &catalog)
+        && let Err(e) = config::save(&state.config)
+    {
+        tracing::warn!("failed to persist re-seeded global default model: {e}");
+    }
+    let project = state
         .project
         .project_root
         .as_deref()
         .and_then(|root| state.config.project_model_default(root));
+    let global = state.config.default_model.clone();
     for ix in state.interactions.values_mut() {
         for ax in ix.sessions.iter_mut() {
-            ax.project_model_default = default.clone();
+            ax.project_model_default = project.clone();
+            ax.global_model_default = global.clone();
         }
     }
 }
@@ -491,7 +565,23 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     area::settings::Message::LoadFonts,
                 );
             }
-            return restore_chat_scroll(state);
+            // Chat scroll restore is owned by `update_with_scroll_preservation`
+            // (identity change without open/switch → Restore).
+            return Task::none();
+        }
+        Message::ModelCatalogReady => {
+            // Catalog was filled on a background task; this message forces a
+            // re-render and subscription rebuild so model/oneshot pickers and
+            // worker oneshot preferred ids re-resolve from the live catalog.
+            // Seed a concrete global default once when still unset.
+            let catalog = agent::available_models();
+            if agent::seed_global_default_if_unset(&mut state.config, &catalog)
+                && let Err(e) = config::save(&state.config)
+            {
+                tracing::warn!("failed to persist seeded global default model: {e}");
+            }
+            tracing::info!(models = catalog.len(), "model catalog ready");
+            return Task::none();
         }
         Message::Refresh => {
             let outcome = reload_and_reconcile(state);
@@ -891,10 +981,19 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             let mut vcs_state_changed = false;
             let mut root_manifest_changed = false;
             let mut highlight_tasks: Vec<Task<Message>> = Vec::new();
+            let mut session_events: Vec<duckcore::session_sharing::ExternalSessionEvent> =
+                Vec::new();
 
             for event in &events {
                 match event {
                     watcher::FileEvent::Modified(path) => {
+                        if let Some(ev) = duckcore::session_sharing::external_event_for_path(
+                            path,
+                            false,
+                            project_root.as_deref(),
+                        ) {
+                            session_events.push(ev);
+                        }
                         if let Some(root) = duckspec_root.as_deref() {
                             if let Ok(rel) = path.strip_prefix(root) {
                                 let id = rel.to_string_lossy().to_string();
@@ -920,6 +1019,13 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         }
                     }
                     watcher::FileEvent::Removed(path) => {
+                        if let Some(ev) = duckcore::session_sharing::external_event_for_path(
+                            path,
+                            true,
+                            project_root.as_deref(),
+                        ) {
+                            session_events.push(ev);
+                        }
                         if let Some(root) = duckspec_root.as_deref() {
                             if let Ok(rel) = path.strip_prefix(root) {
                                 let id = rel.to_string_lossy().to_string();
@@ -946,6 +1052,14 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         vcs_state_changed = true;
                     }
                 }
+            }
+
+            if !session_events.is_empty() {
+                apply_external_session_events(state, &session_events);
+                // External session files may change attention without a tree reload.
+                state
+                    .dashboard
+                    .refresh_chat_activity(&state.project, &state.change.explorations);
             }
 
             if root_manifest_changed {
@@ -1003,9 +1117,13 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         &state.project,
                         &state.highlighter,
                         state.config.chat.agent_input_hints,
-                state.config.vcs.workflow,
+                        state.window_width,
+                        state.config.vcs.workflow,
+                        state.config.chat.effective_viewer_style(),
                         );
-                    return restore_chat_scroll(state);
+                    // Scroll: open/switch → snap-to-latest in
+                    // `update_with_scroll_preservation`.
+                    return Task::none();
                 }
                 area::dashboard::Message::AddExploration => {
                     switch_area(state, Area::Change);
@@ -1017,9 +1135,12 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         &state.project,
                         &state.highlighter,
                         state.config.chat.agent_input_hints,
-                state.config.vcs.workflow,
+                        state.window_width,
+                        state.config.vcs.workflow,
+                        state.config.chat.effective_viewer_style(),
                         );
-                    return Task::batch([restore_chat_scroll(state), focus_chat_input()]);
+                    // Scroll: open/switch → snap-to-latest in wrapper.
+                    return focus_chat_input();
                 }
                 area::dashboard::Message::SelectAuditError {
                     change,
@@ -1037,7 +1158,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         &state.project,
                         &state.highlighter,
                         state.config.chat.agent_input_hints,
-                state.config.vcs.workflow,
+                        state.window_width,
+                        state.config.vcs.workflow,
+                        state.config.chat.effective_viewer_style(),
                         );
                     return restore_chat_scroll(state);
                 }
@@ -1062,10 +1185,105 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 area::dashboard::Message::DeleteRecentData(path) => {
                     state.delete_recent_data(path);
                 }
+                area::dashboard::Message::ToggleExpandChanges => {
+                    state.dashboard.expanded_changes = !state.dashboard.expanded_changes;
+                }
+                area::dashboard::Message::ToggleExpandExplorations => {
+                    state.dashboard.expanded_explorations =
+                        !state.dashboard.expanded_explorations;
+                }
+                area::dashboard::Message::ToggleArchivedOpen => {
+                    state.dashboard.archived_open = !state.dashboard.archived_open;
+                    if !state.dashboard.archived_open {
+                        state.dashboard.expanded_archived = false;
+                    }
+                }
+                area::dashboard::Message::ToggleExpandArchived => {
+                    state.dashboard.expanded_archived = !state.dashboard.expanded_archived;
+                }
             }
         }
         Message::Change(msg) => {
             match msg {
+                area::change::Message::CycleQueueMark(key) => {
+                    // Mark click mints a linked idea when the row has none yet.
+                    let project_root = state.project.project_root.as_deref();
+                    let target = match &key {
+                        idea_store::QueueLinkKey::Exploration(id) => {
+                            let Some(exp) =
+                                state.change.explorations.iter().find(|e| e.id == *id)
+                            else {
+                                return Task::none();
+                            };
+                            idea_store::MintTarget::Exploration {
+                                id: exp.id.clone(),
+                                display_name: exp.display_name.clone(),
+                            }
+                        }
+                        idea_store::QueueLinkKey::Change(name) => idea_store::MintTarget::Change {
+                            name: name.clone(),
+                        },
+                    };
+                    match idea_store::cycle_mark_for_target(
+                        &mut state.ideas.ideas,
+                        target,
+                        project_root,
+                    ) {
+                        Ok(_) => {
+                            if let idea_store::QueueLinkKey::Exploration(id) = &key {
+                                if let Some(path) =
+                                    idea_store::idea_for_exploration(&state.ideas.ideas, id)
+                                        .map(|i| i.abs_path.display().to_string())
+                                {
+                                    if let Some(exp) = state
+                                        .change
+                                        .explorations
+                                        .iter_mut()
+                                        .find(|e| e.id == *id)
+                                    {
+                                        exp.idea_path = Some(path);
+                                        crate::chat_store::save_explorations(
+                                            &state.change.explorations,
+                                            state.change.exploration_counter,
+                                            project_root,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => tracing::warn!("mark cycle failed: {e}"),
+                    }
+                    return Task::none();
+                }
+                area::change::Message::SetListSortKey(key) => {
+                    state.config.list.sort_key = key;
+                    state.change.sort_menu_open = false;
+                    if let Err(e) = config::save(&state.config) {
+                        tracing::warn!("failed to save list prefs: {e}");
+                    }
+                    return Task::none();
+                }
+                area::change::Message::ToggleListTypePillows => {
+                    state.config.list.show_type_pillows = !state.config.list.show_type_pillows;
+                    if let Err(e) = config::save(&state.config) {
+                        tracing::warn!("failed to save list prefs: {e}");
+                    }
+                    return Task::none();
+                }
+                area::change::Message::ToggleListPhasePillows => {
+                    // Short phase pills own list phase chrome when enabled.
+                    if state.config.ui.phase_pill_list {
+                        return Task::none();
+                    }
+                    state.config.list.show_phase_pillows = !state.config.list.show_phase_pillows;
+                    if let Err(e) = config::save(&state.config) {
+                        tracing::warn!("failed to save list prefs: {e}");
+                    }
+                    return Task::none();
+                }
+                area::change::Message::PhasePillSend { target, text } => {
+                    return handle_list_phase_pill_send(state, target, text);
+                }
                 area::change::Message::SelectChangedFile(path) => {
                     return open_diff_preview(state, Area::Change, &path);
                 }
@@ -1073,9 +1291,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     // Explorer rows open the working-tree file (a `file:`
                     // tab), unlike changed-files rows which open a diff —
                     // the section clicked expresses the intent.
-                    if let Some(root) = state.project.project_root.clone() {
+                    if let Some(root) = active_work_root(state) {
                         let rel = id.strip_prefix("file:").unwrap_or(&id);
-                        return open_path_in_tab(state, root.join(rel), None);
+                        let main = state
+                            .project
+                            .project_root
+                            .as_deref()
+                            .unwrap_or(root.as_path());
+                        let abs =
+                            worktree::resolve_under_work_root(&root, main, Path::new(rel));
+                        return open_path_in_tab(state, abs, None);
                     }
                 }
                 area::change::Message::OpenIdeaForChange(change_name) => {
@@ -1089,9 +1314,12 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                             &state.project,
                             &state.highlighter,
                             state.config.chat.agent_input_hints,
-                state.config.vcs.workflow,
+                            state.window_width,
+                            state.config.vcs.workflow,
+                        state.config.chat.effective_viewer_style(),
                             );
-                        return restore_chat_scroll(state);
+                        // Scroll: open/switch → snap-to-latest in wrapper.
+                        return Task::none();
                     }
                 }
                 area::change::Message::AddFile => {
@@ -1107,6 +1335,18 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 area::change::Message::RefreshExplorationTitle(exp_id) => {
                     return start_exploration_title_refresh(state, &exp_id);
                 }
+                area::change::Message::CyclePlacement(scope_key) => {
+                    return cycle_scope_placement(state, &scope_key);
+                }
+                area::change::Message::CycleStackBase(scope_key) => {
+                    return cycle_scope_stack_base(state, &scope_key);
+                }
+                area::change::Message::ToggleRequireBaseMerged(scope_key) => {
+                    return toggle_require_base_merged(state, &scope_key);
+                }
+                area::change::Message::MergeToMain(scope_key) => {
+                    return merge_scope_to_main(state, &scope_key);
+                }
                 msg => {
                     let toggled_files = matches!(
                         &msg,
@@ -1115,7 +1355,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     );
                     let needs_focus = matches!(msg, area::change::Message::AddExploration)
                         || is_chat_focus_msg(extract_change_interaction_msg(&msg));
-                    // Second click on a selected exploration opens rename.
+                    // Second click on a selected exploration, or the pencil
+                    // control, opens rename — focus the inline field after.
                     let focus_rename = matches!(
                         &msg,
                         area::change::Message::SelectChange(name)
@@ -1125,7 +1366,12 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                                     .explorations
                                     .iter()
                                     .any(|e| e.id == *name)
+                    ) || matches!(
+                        &msg,
+                        area::change::Message::StartRenameExploration(_)
                     );
+                    let selected_scope =
+                        matches!(&msg, area::change::Message::SelectChange(_));
                     area::change::update(
                         &mut state.change,
                         &mut state.tabs,
@@ -1134,8 +1380,22 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         &state.project,
                         &state.highlighter,
                         state.config.chat.agent_input_hints,
-                state.config.vcs.workflow,
+                        state.window_width,
+                        state.config.vcs.workflow,
+                        state.config.chat.effective_viewer_style(),
                         );
+                    if selected_scope {
+                        // Rebind Changed files / activate placement for the new focus.
+                        refresh_changed_files(state);
+                        // Explorer tree follows active root when already open.
+                        if state
+                            .change
+                            .expanded_sections
+                            .contains(area::change::FILES_SECTION)
+                        {
+                            refresh_project_files(state);
+                        }
+                    }
                     if focus_rename && state.change.renaming_exploration.is_some() {
                         return iced::widget::operation::focus(area::change::RENAME_INPUT_ID);
                     }
@@ -1158,7 +1418,11 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::Caps(msg) => {
             let needs_focus = is_chat_focus_msg(extract_caps_interaction_msg(&msg));
-            let ix = state.interactions.entry(scope::Scope::Caps).or_default();
+            let window_w = state.window_width;
+            let ix = state
+                .interactions
+                .entry(scope::Scope::Caps)
+                .or_insert_with(|| interaction::InteractionState::for_window(window_w));
             area::caps::update(
                 &mut state.caps,
                 &mut state.tabs,
@@ -1167,7 +1431,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 &state.project,
                 &state.highlighter,
                 state.config.chat.agent_input_hints,
+                state.window_width,
                 state.config.vcs.workflow,
+                        state.config.chat.effective_viewer_style(),
                 );
             if needs_focus {
                 return focus_chat_input();
@@ -1175,7 +1441,11 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
         }
         Message::Codex(msg) => {
             let needs_focus = is_chat_focus_msg(extract_codex_interaction_msg(&msg));
-            let ix = state.interactions.entry(scope::Scope::Codex).or_default();
+            let window_w = state.window_width;
+            let ix = state
+                .interactions
+                .entry(scope::Scope::Codex)
+                .or_insert_with(|| interaction::InteractionState::for_window(window_w));
             area::codex::update(
                 &mut state.codex,
                 &mut state.tabs,
@@ -1184,13 +1454,57 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 &state.project,
                 &state.highlighter,
                 state.config.chat.agent_input_hints,
+                state.window_width,
                 state.config.vcs.workflow,
+                        state.config.chat.effective_viewer_style(),
                 );
             if needs_focus {
                 return focus_chat_input();
             }
         }
         Message::Ideas(msg) => {
+            if let area::ideas::Message::CycleIdeaMark(ref path) = msg {
+                if let Some(idea) = state.ideas.ideas.iter_mut().find(|i| i.abs_path == *path) {
+                    let now = time::OffsetDateTime::now_local()
+                        .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+                    let next = idea_store::cycle_mark(idea.frontmatter.mark);
+                    idea_store::apply_mark(&mut idea.frontmatter, next, now);
+                    let body = idea_store::read_body(&idea.abs_path).unwrap_or_default();
+                    if let Err(e) = idea_store::save_idea(
+                        idea,
+                        &body,
+                        state.project.project_root.as_deref(),
+                    ) {
+                        tracing::warn!("failed to save idea after mark cycle: {e}");
+                    }
+                }
+                return Task::none();
+            }
+            if let area::ideas::Message::SetListSortKey(key) = msg {
+                state.config.list.sort_key = key;
+                state.ideas.sort_menu_open = false;
+                if let Err(e) = config::save(&state.config) {
+                    tracing::warn!("failed to save list prefs: {e}");
+                }
+                return Task::none();
+            }
+            if let area::ideas::Message::ToggleListTypePillows = msg {
+                state.config.list.show_type_pillows = !state.config.list.show_type_pillows;
+                if let Err(e) = config::save(&state.config) {
+                    tracing::warn!("failed to save list prefs: {e}");
+                }
+                return Task::none();
+            }
+            if let area::ideas::Message::ToggleListPhasePillows = msg {
+                if state.config.ui.phase_pill_list {
+                    return Task::none();
+                }
+                state.config.list.show_phase_pillows = !state.config.list.show_phase_pillows;
+                if let Err(e) = config::save(&state.config) {
+                    tracing::warn!("failed to save list prefs: {e}");
+                }
+                return Task::none();
+            }
             // Hard delete cascades to the attached exploration (if any). Run
             // the cascade BEFORE ideas::update so we can still look up the
             // idea's exploration id from frontmatter.
@@ -1254,15 +1568,18 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     &state.project,
                     &state.highlighter,
                     state.config.chat.agent_input_hints,
-                state.config.vcs.workflow,
+                    state.window_width,
+                    state.config.vcs.workflow,
+                        state.config.chat.effective_viewer_style(),
                     );
                 // SelectIdea spawns the exploration session with
                 // empty chrome; refresh so the chat input renders lifecycle
                 // chrome (mirrors ideas.rs).
                 let dirty = !state.change.changed_files.is_empty();
-                area::change::refresh_obvious_chrome(
+                area::change::refresh_fast_response(
                     &mut state.interactions,
                     &state.project,
+                    state.config.chat.agent_input_hints,
                     dirty,
                 );
                 return focus_chat_input();
@@ -1300,9 +1617,12 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     &state.project,
                     &state.highlighter,
                     state.config.chat.agent_input_hints,
-                state.config.vcs.workflow,
+                    state.window_width,
+                    state.config.vcs.workflow,
+                        state.config.chat.effective_viewer_style(),
                     );
-                return restore_chat_scroll(state);
+                // Scroll: open/switch → snap-to-latest in wrapper.
+                return Task::none();
             }
             // Chip click: shift held → promote to primary; otherwise open
             // the input pre-filled for rename. Modifier state lives in a
@@ -1329,7 +1649,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 &state.project,
                 &state.highlighter,
                 state.config.chat.agent_input_hints,
+                state.window_width,
                 state.config.vcs.workflow,
+                        state.config.chat.effective_viewer_style(),
                 );
             if focus_tag_input {
                 return iced::widget::operation::focus(area::ideas::TAG_INPUT_ID);
@@ -1342,6 +1664,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             }
         }
         Message::Settings(msg) => {
+            let style_before = state.config.chat.effective_viewer_style();
             area::settings::update(
                 &mut state.settings,
                 &mut state.config,
@@ -1349,6 +1672,19 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 msg,
             );
             theme::set_fonts(&state.config);
+            // Hybrid C editor content is style-dependent. Force rebuild so
+            // Focus↔Classic flips do not paint stale open-region / full-body
+            // editors until an unrelated materialize.
+            let style_after = state.config.chat.effective_viewer_style();
+            if style_before != style_after {
+                for ix in state.interactions.values_mut() {
+                    interaction::apply_viewer_style_to_sessions(
+                        ix,
+                        style_after,
+                        &state.highlighter,
+                    );
+                }
+            }
         }
         Message::TabSelect(idx) => {
             state.armed_tab_close = None;
@@ -1499,17 +1835,15 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             // Exploration id for a title refresh deferred until Ready.
             let mut pending_refresh_exp: Option<String> = None;
             // `(handle, assistant, user, gen)` — freeform oneshot, no heuristic/cmds.
-            type ReplyTaskInput = (
-                duckchat::AgentHandle,
-                String,
-                Option<String>,
-                u64,
-            );
+            type ReplyTaskInput = (duckchat::AgentHandle, String, Option<String>, u64);
             let mut reply_task_input: Option<ReplyTaskInput> = None;
             // Staged `(folder-slug, exploration-id)` from a `ds create change`
             // tool call, committed to `pending_bindings` once the `ax` borrow
             // below is released.
             let mut staged_binding: Option<(String, String)> = None;
+            // Build-pilot auto-send text after a non-priming TurnComplete when
+            // rank-1 next is safe for the armed mode (disarm leaves this None).
+            let mut pending_pilot_send: Option<String> = None;
             // SessionNotFound (or stringified equivalent): clear the dead id and
             // re-dispatch after this block so we can borrow `highlighter`.
             let mut recover_lost_session = false;
@@ -1556,20 +1890,17 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         let kind_switch =
                             interaction::apply_answer_content_delta(&mut ax.session, &text);
                         if ax.session.answer_thrash_tripped && !tripped_before {
-                            // Budget crossed: keep last draft, notice, cancel heat.
-                            // Same priming cleanup as CancelPressed so TurnComplete
-                            // cannot dispatch a staged follow-up after thrash.
-                            interaction::on_answer_thrash_trip(&mut ax.session);
-                            if let Some(handle) = &ax.agent_handle {
-                                handle.cancel();
-                            }
-                            interaction::clear_priming_followup(ax);
+                            // Budget crossed: keep last draft, notice, cancel heat,
+                            // disarm pilot so TurnComplete cannot pilot-auto-send.
+                            interaction::thrash_cancel_main_turn(ax);
                             force_materialize = true;
                         }
                         ax.needs_flush = true;
                         ax.chat_ui_dirty = true;
                         if interaction::should_materialize_chat_ui(
-                            &AgentEvent::ContentDelta { text: String::new() },
+                            &AgentEvent::ContentDelta {
+                                text: String::new(),
+                            },
                             streaming_before,
                             kind_switch,
                         ) {
@@ -1582,7 +1913,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         ax.needs_flush = true;
                         ax.chat_ui_dirty = true;
                         if interaction::should_materialize_chat_ui(
-                            &AgentEvent::ReasoningDelta { text: String::new() },
+                            &AgentEvent::ReasoningDelta {
+                                text: String::new(),
+                            },
                             streaming_before,
                             kind_switch,
                         ) {
@@ -1627,10 +1960,39 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         ax.chat_ui_dirty = true;
                         force_materialize = true;
                     }
+                    AgentEvent::UserChoiceRequest {
+                        correlation_id,
+                        prompt,
+                        options,
+                        allow_cancel,
+                    } => {
+                        interaction::apply_user_choice_request(
+                            ax,
+                            correlation_id,
+                            prompt,
+                            options,
+                            allow_cancel,
+                        );
+                        // Chips appear while the turn stays open.
+                        force_materialize = true;
+                    }
                     AgentEvent::TurnComplete => {
+                        // A user-cancelled turn may have streamed more answer
+                        // text after the cancel press; re-capture so the
+                        // resync draft matches everything the transcript kept.
+                        let was_cancel = ax.cancel_in_flight;
+                        if was_cancel {
+                            interaction::capture_unsynced_draft(&mut ax.session);
+                            ax.cancel_in_flight = false;
+                            // Belt-and-suspenders: cancel path disarms pilot;
+                            // never pilot-auto-send after a user cancel.
+                            ax.pilot = crate::build_pilot::PilotState::Off;
+                        }
                         interaction::flush_all_pending(&mut ax.session);
                         interaction::reset_answer_thrash(&mut ax.session);
                         ax.session.is_streaming = false;
+                        // Drop any leftover chips if the turn ended without answer.
+                        interaction::clear_user_choice_shell(ax);
                         ax.chat_ui_dirty = true;
                         force_materialize = true;
                         // Rebuild next actions from the new trailing assistant text.
@@ -1646,9 +2008,17 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         if was_priming {
                             ax.priming_in_flight = false;
                         }
-                        if let Err(e) = chat_store::save_session(&ax.session, proj_root.as_deref())
-                        {
-                            tracing::error!("failed to save chat session: {e}");
+                        // Build pilot: auto-send safe rank-1 trailing next, or
+                        // fully disarm. Skip priming turns and user-cancelled
+                        // completions (follow-up is the user's kick / stop).
+                        if !was_priming && !was_cancel {
+                            pending_pilot_send = crate::build_pilot::maybe_auto_send(
+                                &mut ax.pilot,
+                                &ax.next_actions,
+                            );
+                        }
+                        if !ax.mark_driven_and_persist(proj_root.as_deref()) {
+                            tracing::error!("failed to save chat session");
                         }
                         // Turn-boundary flush is authoritative — the debounced
                         // eager flag is now satisfied.
@@ -1679,7 +2049,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                                 ax.idea_description.clone(),
                             ));
                         }
-                        // Reply-suggestion oneshot: gated by agent input hints.
+                        // Reply-suggestion oneshot: gated by agent input hints
+                        // and empty next-action list (skip model when ghost wins).
                         if let Some((assistant, user)) =
                             default_prompts::last_assistant_and_user(&ax.session)
                         {
@@ -1688,18 +2059,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                                 agent_input_hints,
                                 was_priming,
                                 has_assistant,
+                                ax.next_actions.is_empty(),
                             ) && let Some(handle) = ax.agent_handle.clone()
                             {
                                 ax.begin_default_prompts_oneshot();
                                 let prompts_gen = ax.default_prompts_gen;
-                                reply_task_input = Some((
-                                    handle,
-                                    assistant,
-                                    user,
-                                    prompts_gen,
-                                ));
+                                reply_task_input = Some((handle, assistant, user, prompts_gen));
                             }
                         }
+                        // Shell empty until oneshot settles (or clear if ineligible).
+                        interaction::sync_oneshot_chips(ax, agent_input_hints);
                     }
                     AgentEvent::Error(msg) => {
                         // Defensive: stringified session-not-found (older
@@ -1714,6 +2083,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                             tracing::error!(key, "agent error: {msg}");
                             ax.session.is_streaming = false;
                             interaction::reset_answer_thrash(&mut ax.session);
+                            interaction::clear_user_choice_shell(ax);
                             // Drop priming state so a failed AGENTS.md priming
                             // doesn't fire its follow-up against a half-broken
                             // session. The user will retype if they want to retry.
@@ -1736,10 +2106,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         // stored id — typically a cwd-key mismatch or prune.
                         // Drop the dead id and re-dispatch the last user turn
                         // with a history preamble so the chat unblocks.
-                        tracing::warn!(
-                            key,
-                            "agent session not found; recovering as fresh session"
-                        );
+                        tracing::warn!(key, "agent session not found; recovering as fresh session");
                         recover_lost_session = true;
                     }
                     AgentEvent::SessionIdUpdated { session_id } => {
@@ -1760,19 +2127,25 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         if output_tokens > 0 {
                             ax.agent_output_tokens = output_tokens;
                         }
+                        // Write-through so the next turn-boundary / eager save
+                        // persists last-known fill. Do not set needs_flush for
+                        // usage alone (avoid rewriting the session on every
+                        // telemetry tick when messages are unchanged).
+                        ax.session.context_tokens = ax.agent_input_tokens + ax.agent_output_tokens;
                     }
                     AgentEvent::ProcessExited => {
                         tracing::info!(key, "agent process exited");
                         ax.agent_handle = None;
                         ax.session.is_streaming = false;
                         interaction::reset_answer_thrash(&mut ax.session);
+                        interaction::clear_user_choice_shell(ax);
                         // Drop any priming state — without a handle the
                         // follow-up can't dispatch, and stale flags would
                         // confuse the next reconnect.
                         ax.priming_in_flight = false;
                         ax.pending_followup_prompt = None;
-                        // Belt: do not leave reply-suggestion chrome on loading
-                        // when the worker is gone with no DefaultPromptsReady.
+                        // Drop in-flight oneshot list/chips when the worker is
+                        // gone with no DefaultPromptsReady settle.
                         ax.clear_agent_default_prompts();
                         // Paint any deferred stream tail and drop streaming chrome.
                         force_materialize = true;
@@ -1785,6 +2158,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             let State {
                 interactions,
                 highlighter,
+                dashboard,
                 ..
             } = state;
             let ax = resolve_session_mut(interactions, &key);
@@ -1806,10 +2180,16 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     // An abrupt turn end (Error / ProcessExited) leaves
                     // streamed messages dirty without a turn-boundary save —
                     // persist them now so the turn's tail survives.
-                    if ax.needs_flush
-                        && interaction::persist_session_snapshot(&ax.session, proj_root.as_deref())
-                    {
-                        ax.needs_flush = false;
+                    if ax.needs_flush {
+                        ax.mark_driven();
+                        if interaction::persist_session_snapshot(
+                            &ax.session,
+                            ax.drive_role,
+                            proj_root.as_deref(),
+                        ) {
+                            ax.needs_flush = false;
+                            dashboard.note_session_activity(&ax.session);
+                        }
                     }
                     // Order matters: dispatch the AGENTS.md priming follow-up
                     // before any queued message so the user's intended first
@@ -1831,6 +2211,11 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         if !text.trim().is_empty() {
                             interaction::send_prompt_text(ax, text, highlighter);
                         }
+                    } else if ax.agent_handle.is_some()
+                        && let Some(text) = pending_pilot_send.take()
+                    {
+                        // Pilot hop: confirm / allowlisted /ds-* as a normal user turn.
+                        interaction::send_prompt_text(ax, text, highlighter);
                     }
                 }
             }
@@ -1869,6 +2254,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     // Title generation only needs the scope name, not full
                     // lifecycle facts — keep the hint terse.
                     change_facts: None,
+                    has_inputs_ledger: false,
                 };
                 if let Some(out) = scope::CurrentScopeHook.compute(&scope_input) {
                     hints.push(out.text);
@@ -1881,12 +2267,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 let route_key = key.clone();
                 // `AgentHandle` is `Clone`; move the clone into the async task
                 // so title summary uses the chat's oneshot runtime.
-                let work = async move {
-                    handle
-                        .title_summary(req)
-                        .await
-                        .map_err(|e| e.to_string())
-                };
+                let work =
+                    async move { handle.title_summary(req).await.map_err(|e| e.to_string()) };
                 follow_tasks.push(Task::perform(work, move |result| {
                     Message::SessionTitleReady {
                         key: route_key.clone(),
@@ -1947,6 +2329,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             prompts_gen,
             result,
         } => {
+            let agent_input_hints = state.config.chat.agent_input_hints;
             let Some(ax) = state.agent_session_mut(&key) else {
                 return Task::none();
             };
@@ -1965,9 +2348,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 return Task::none();
             };
             // Oneshot list (parse only; empty on fail) is ready. Next actions
-            // are independent and not updated here.
+            // are independent and not updated here. Sync chips when eligible.
             ax.agent_default_prompts = list;
             ax.default_prompts_pending = false;
+            interaction::sync_oneshot_chips(ax, agent_input_hints);
         }
         Message::ThemeChanged(mode) => {
             theme::set_mode(mode);
@@ -2021,6 +2405,12 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             for ix in state.interactions.values_mut() {
                 interaction::flush_dirty_sessions(ix, proj_root.as_deref());
             }
+            // Session writes can advance attention; keep Dashboard's warm map current.
+            for ix in state.interactions.values() {
+                for ax in &ix.sessions {
+                    state.dashboard.note_session_activity(&ax.session);
+                }
+            }
         }
         Message::WindowCloseRequested(id) => {
             // Force a final flush of every session before the window closes so
@@ -2032,6 +2422,32 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 interaction::flush_sessions(ix, proj_root.as_deref());
             }
             return iced::window::close(id);
+        }
+        Message::WindowResized(size) => {
+            state.window_width = size.width;
+            // Keep list within the new window's soft max.
+            let max_list = max_list_column_width(size.width);
+            if state.list_column_width > max_list {
+                state.list_column_width = max_list.max(widget::list_resize::MIN_LIST_WIDTH);
+            }
+            for ix in state.interactions.values_mut() {
+                interaction::rebalance_uncustomized_for(
+                    ix,
+                    size.width,
+                    state.list_column_width,
+                );
+            }
+        }
+        Message::ListColumnWidth(w) => {
+            let max = max_list_column_width(state.window_width);
+            state.list_column_width = w.clamp(widget::list_resize::MIN_LIST_WIDTH, max);
+            for ix in state.interactions.values_mut() {
+                interaction::rebalance_uncustomized_for(
+                    ix,
+                    state.window_width,
+                    state.list_column_width,
+                );
+            }
         }
         Message::KeyPress(key, mods, text) => {
             // Escape dismisses the stale-build recipe panel first.
@@ -2137,6 +2553,26 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         update(state, Message::Ideas(area::ideas::Message::SaveBody))
                     }
                 };
+            }
+
+            // Ctrl+1/2/3 — select nth painted Change/Ideas list row. Use the
+            // physical Control key (not Command/logo). `keybind_list_digit`
+            // also no-ops under modals/rename.
+            if mods.control()
+                && !mods.logo()
+                && !mods.alt()
+                && !mods.shift()
+                && let keyboard::Key::Character(c) = &key
+            {
+                let digit = match c.as_str() {
+                    "1" => Some(1u8),
+                    "2" => Some(2),
+                    "3" => Some(3),
+                    _ => None,
+                };
+                if let Some(n) = digit {
+                    return dispatch_list_digit(state, n);
+                }
             }
 
             // Cmd+Shift+F: open project-wide text search.
@@ -2438,6 +2874,29 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 return Task::none();
             }
 
+            // ⌘↑/↓/←/→ chat landmarks — after modal handlers so open modals
+            // keep arrow ownership. Bare arrows still go to the composer.
+            if mods.command()
+                && !mods.shift()
+                && !mods.alt()
+                && keybinds::keybind_chat_landmarks(state)
+            {
+                use keybinds::ChatLandmarkAction;
+                use keyboard::key::Named;
+                let action = match &key {
+                    keyboard::Key::Named(Named::ArrowUp) => Some(ChatLandmarkAction::HistoryTop),
+                    keyboard::Key::Named(Named::ArrowDown) => {
+                        Some(ChatLandmarkAction::HistoryBottom)
+                    }
+                    keyboard::Key::Named(Named::ArrowLeft) => Some(ChatLandmarkAction::PrevAnswer),
+                    keyboard::Key::Named(Named::ArrowRight) => Some(ChatLandmarkAction::NextAnswer),
+                    _ => None,
+                };
+                if let Some(action) = action {
+                    return apply_chat_landmark(state, action);
+                }
+            }
+
             // Cmd-K — pin the active session's tentative selection.
             // `keybinds::keybind_pin_selection` decides whether the focus
             // is right; the live runtime check (was there actually a
@@ -2532,20 +2991,13 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 // Agent chat keyboard shortcuts (completion, esc-cancel, enter-send).
                 let agent_input_hints = state.config.chat.agent_input_hints;
                 if agent_chat_active && let Some(ix) = state.interaction_mut(routing_key) {
-                    match interaction::handle_agent_chat_key(
-                        ix,
-                        &key,
-                        mods,
-                        agent_input_hints,
-                    ) {
+                    match interaction::handle_agent_chat_key(ix, &key, mods, agent_input_hints) {
                         interaction::AgentChatKeyResult::Handled => return Task::none(),
                         interaction::AgentChatKeyResult::Dispatch(msg) => {
                             // Tab-cycling defaults should leave the caret in the
                             // chat input so Enter still works without a re-click.
-                            let refocus = matches!(
-                                &msg,
-                                widget::agent_chat::Msg::CycleNextAction(_)
-                            );
+                            let refocus =
+                                matches!(&msg, widget::agent_chat::Msg::CycleNextAction(_));
                             let dispatch = dispatch_interaction_msg(
                                 state,
                                 routing_key,
@@ -2657,6 +3109,23 @@ fn tab_display_path(tab: &tab_bar::Tab, project_root: Option<&Path>) -> String {
     tab.title.clone()
 }
 
+/// Active chat identity: scope plus session id. Used to decide whether a
+/// message changed which chat is visible (open/switch vs layout preserve).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChatIdentity {
+    scope: scope::Scope,
+    session_id: String,
+}
+
+fn active_chat_identity(state: &State) -> Option<ChatIdentity> {
+    let scope = state.active_scope()?;
+    let ax = state.interactions.get(&scope)?.active()?;
+    Some(ChatIdentity {
+        scope,
+        session_id: ax.session.id.clone(),
+    })
+}
+
 /// Restore the chat scrollable's viewport for the area we just switched to.
 /// `AgentSession` survives area switches but the iced `Scrollable` widget
 /// is rebuilt fresh on each view, defaulting back to (0, 0). We replay the
@@ -2672,14 +3141,122 @@ fn restore_chat_scroll(state: &State) -> Task<Message> {
     let Some(ax) = ix.active() else {
         return Task::none();
     };
-    if ax.stick_to_bottom {
-        iced::widget::operation::snap_to_end(widget::agent_chat::CHAT_SCROLLABLE_ID)
-    } else {
-        let y = ax.last_chat_offset_y.unwrap_or(0.0);
-        iced::widget::operation::scroll_to(
+    match restored_viewport_intent(ax.stick_to_bottom, ax.last_chat_offset_y) {
+        RestoredViewport::Latest => {
+            iced::widget::operation::snap_to_end(widget::agent_chat::CHAT_SCROLLABLE_ID)
+        }
+        RestoredViewport::Offset(y) => iced::widget::operation::scroll_to(
             widget::agent_chat::CHAT_SCROLLABLE_ID,
             iced::widget::scrollable::AbsoluteOffset { x: 0.0, y },
+        ),
+    }
+}
+
+/// Pure post-update scroll action when identity / message class is known.
+/// Extracted so unit tests can cover session-scroll policy without iced Tasks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatScrollPolicy {
+    /// Same identity: replay pre-update layout snapshot.
+    Preserve,
+    /// Intentional open/switch: force latest.
+    SnapLatest,
+    /// Identity changed without open/switch (area nav, incidental area entry):
+    /// restore the newly active session's memory. Single owner is the wrapper.
+    Restore,
+    /// No identity-driven scroll action from the wrapper.
+    None,
+}
+
+/// Decide scroll policy after `update` from identity change + message class.
+fn chat_scroll_policy(
+    identity_changed: bool,
+    opens_or_switches: bool,
+    has_snapshot: bool,
+) -> ChatScrollPolicy {
+    if identity_changed {
+        if opens_or_switches {
+            ChatScrollPolicy::SnapLatest
+        } else {
+            ChatScrollPolicy::Restore
+        }
+    } else if has_snapshot {
+        ChatScrollPolicy::Preserve
+    } else {
+        ChatScrollPolicy::None
+    }
+}
+
+/// Viewport intent used by restore / after snap-to-latest.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RestoredViewport {
+    Latest,
+    Offset(f32),
+}
+
+fn restored_viewport_intent(stick_to_bottom: bool, last_offset: Option<f32>) -> RestoredViewport {
+    if stick_to_bottom {
+        RestoredViewport::Latest
+    } else {
+        RestoredViewport::Offset(last_offset.unwrap_or(0.0))
+    }
+}
+
+/// Engage stick-to-bottom on a session before snapping the scrollable to end.
+fn engage_stick_to_latest(ax: &mut interaction::AgentSession) {
+    ax.stick_to_bottom = true;
+    ax.pending_snap_to_bottom = false;
+}
+
+/// Force the active session to latest (stick + snap_to_end). Used when the
+/// active chat identity changes through an intentional open or switch.
+fn snap_chat_to_latest(state: &mut State) -> Task<Message> {
+    if let Some(scope) = state.active_scope()
+        && let Some(ix) = state.interactions.get_mut(&scope)
+        && let Some(ax) = ix.active_mut()
+    {
+        engage_stick_to_latest(ax);
+    }
+    iced::widget::operation::snap_to_end(widget::agent_chat::CHAT_SCROLLABLE_ID)
+}
+
+/// True when the message intentionally opens or switches the active chat
+/// session (scope pick, session tab, new/clear, dashboard open, cross-links).
+/// Pure area navigation is not included — that restores remembered viewport.
+fn message_opens_or_switches_chat(message: &Message) -> bool {
+    fn is_session_mgmt(im: &interaction::Msg) -> bool {
+        matches!(
+            im,
+            interaction::Msg::NewSession
+                | interaction::Msg::SelectSession(_)
+                | interaction::Msg::ClearSession
         )
+    }
+    match message {
+        Message::Interaction(im) => is_session_mgmt(im),
+        Message::Change(m) => match m {
+            area::change::Message::Interaction(im) => is_session_mgmt(im),
+            area::change::Message::SelectChange(_)
+            | area::change::Message::AddExploration
+            | area::change::Message::OpenIdeaForChange(_) => true,
+            _ => false,
+        },
+        Message::Caps(area::caps::Message::Interaction(im))
+        | Message::Codex(area::codex::Message::Interaction(im)) => is_session_mgmt(im),
+        Message::Ideas(m) => match m {
+            area::ideas::Message::Interaction(im) => is_session_mgmt(im),
+            area::ideas::Message::SelectIdea(_)
+            | area::ideas::Message::StartExploration(_)
+            | area::ideas::Message::OpenChange(_) => true,
+            _ => false,
+        },
+        Message::Dashboard(m) => matches!(
+            m,
+            area::dashboard::Message::ChangeClicked(_)
+                | area::dashboard::Message::ArchivedChangeClicked(_)
+                | area::dashboard::Message::ExplorationClicked(_)
+                | area::dashboard::Message::AddExploration
+        ),
+        _ => false,
     }
 }
 
@@ -2745,10 +3322,11 @@ fn take_pending_priming_recollapse(state: &mut State) -> Task<Message> {
 /// True when any chat session has an accumulated edge auto-scroll delta from a
 /// drag that ran past the chat fold, awaiting drain into a `scroll_to`.
 fn has_pending_chat_autoscroll(state: &State) -> bool {
-    state
-        .interactions
-        .values()
-        .any(|ix| ix.sessions.iter().any(|ax| ax.pending_chat_autoscroll.is_some()))
+    state.interactions.values().any(|ix| {
+        ix.sessions
+            .iter()
+            .any(|ax| ax.pending_chat_autoscroll.is_some())
+    })
 }
 
 /// Drain each session's pending chat auto-scroll delta into an absolute scroll
@@ -2865,11 +3443,13 @@ fn update_with_scroll_preservation(state: &mut State, message: Message) -> Task<
     // Chrome pad measure messages must not snapshot/replay scroll — they only
     // adjust an in-scroll spacer.
     let is_chrome_layout = is_chrome_layout_message(&message);
+    let id_before = active_chat_identity(state);
     let snapshot = if is_chat_scroll_message(&message) || is_chrome_layout {
         None
     } else {
         capture_chat_scroll_snapshot(state)
     };
+    let opens_or_switches = message_opens_or_switches_chat(&message);
     state.chat_scroll_overridden = false;
     let tab_before = state.tabs.active_tab().map(|t| t.id.clone());
     // A list click that opens content re-expands the content column even when
@@ -2913,9 +3493,16 @@ fn update_with_scroll_preservation(state: &mut State, message: Message) -> Task<
             maybe_measure_chrome_pad(state),
         ]);
     }
-    let task = match snapshot {
-        Some(snap) => Task::batch([task, replay_chat_scroll(snap)]),
-        None => task,
+    let id_after = active_chat_identity(state);
+    // When the active chat identity changes, never replay the previous
+    // session's layout snapshot onto the new one. Open/switch → latest;
+    // area nav and other non-open identity changes → restore (wrapper owns it).
+    let policy = chat_scroll_policy(id_before != id_after, opens_or_switches, snapshot.is_some());
+    let task = match policy {
+        ChatScrollPolicy::Preserve => Task::batch([task, replay_chat_scroll(snapshot.unwrap())]),
+        ChatScrollPolicy::None => task,
+        ChatScrollPolicy::SnapLatest => Task::batch([task, snap_chat_to_latest(state)]),
+        ChatScrollPolicy::Restore => Task::batch([task, restore_chat_scroll(state)]),
     };
     // After layout-affecting updates, measure scroll bounds so the bottom-pin
     // pad works when content still fits the viewport (no on_scroll from iced).
@@ -2945,10 +3532,10 @@ fn is_chrome_layout_message(msg: &Message) -> bool {
     }
 }
 
-/// When obvious chrome is visible on the active chat, schedule a bounds
+/// When fast-response chips are visible on the active chat, schedule a bounds
 /// measure so the in-scroll bottom-pin pad can update. No-op otherwise.
 fn maybe_measure_chrome_pad(state: &State) -> Task<Message> {
-        let Some(scope) = state.active_scope() else {
+    let Some(scope) = state.active_scope() else {
         return Task::none();
     };
     let Some(ix) = state.interactions.get(&scope) else {
@@ -2958,7 +3545,12 @@ fn maybe_measure_chrome_pad(state: &State) -> Task<Message> {
         return Task::none();
     };
     let input_empty = ax.chat_input.text().trim().is_empty();
-    if !crate::obvious_bubble::chrome_visible(ax.session.is_streaming, input_empty, &ax.obvious_chrome) {
+    if !crate::fast_response::visible(
+        ax.session.is_streaming,
+        ax.is_awaiting_user,
+        input_empty,
+        &ax.fast_response,
+    ) {
         return Task::none();
     }
     let area = state.active_area;
@@ -3020,6 +3612,30 @@ fn dispatch_interaction_msg(state: &mut State, key: &str, msg: interaction::Msg)
                 )
             }
         }
+    }
+}
+
+/// Apply a resolved list-digit chord. Skips re-select so exploration rename
+/// (second `SelectChange` on the same exploration) never fires from digits.
+fn dispatch_list_digit(state: &mut State, n: u8) -> Task<Message> {
+    use keybinds::ListDigitAction;
+    match keybinds::keybind_list_digit(state, n) {
+        Some(ListDigitAction::SelectChange(id)) => {
+            if state.change.selected_change.as_deref() == Some(id.as_str()) {
+                return Task::none();
+            }
+            update(
+                state,
+                Message::Change(area::change::Message::SelectChange(id)),
+            )
+        }
+        Some(ListDigitAction::SelectIdea(path)) => {
+            if state.ideas.selected.as_ref() == Some(&path) {
+                return Task::none();
+            }
+            update(state, Message::Ideas(area::ideas::Message::SelectIdea(path)))
+        }
+        None => Task::none(),
     }
 }
 
@@ -3290,8 +3906,7 @@ fn is_chat_focus_msg(msg: Option<&interaction::Msg>) -> bool {
                 // Empty Enter / send remounts input state; restore caret like Tab cycle.
                 | interaction::Msg::AgentChat(
                     ChatMsg::SendPressed
-                        | ChatMsg::SendOneshotSuggestion
-                        | ChatMsg::SendObviousAction(_)
+                        | ChatMsg::ActivateFastResponse(_)
                         | ChatMsg::CycleNextAction(_)
                 )
         )
@@ -3491,6 +4106,174 @@ fn route_promotion(state: &mut State, exp_id: &str, new_name: &str) {
             );
         }
     }
+    // Carry worktree placement / sidecar binding onto the change scope.
+    if let Some(root) = root.as_ref() {
+        worktree::transfer_scope_binding(
+            &mut state.worktree_bindings,
+            exp_id,
+            new_name,
+            root,
+        );
+    }
+}
+
+/// Cycle Main → Worktree → Auto for a CHANGE-row scope when placement is allowed.
+fn cycle_scope_placement(state: &mut State, scope_key: &str) -> Task<Message> {
+    let workflow = state.config.vcs.workflow;
+    if !worktree::placement_allows_sidecars(workflow) {
+        return Task::none();
+    }
+    let Some(root) = state.project.project_root.clone() else {
+        return Task::none();
+    };
+    let current =
+        worktree::effective_placement(&state.worktree_bindings, scope_key, workflow);
+    let next = worktree::cycle_placement(current);
+    worktree::set_placement(&mut state.worktree_bindings, &root, scope_key, next);
+    let _ = worktree::save_bindings(&root, &state.worktree_bindings);
+    stamp_send_blocks(state);
+    Task::none()
+}
+
+/// Cycle stack base for a scope through other live explorations/changes.
+fn cycle_scope_stack_base(state: &mut State, scope_key: &str) -> Task<Message> {
+    if !worktree::placement_allows_sidecars(state.config.vcs.workflow) {
+        return Task::none();
+    }
+    let Some(root) = state.project.project_root.clone() else {
+        return Task::none();
+    };
+    let mut candidates: Vec<String> = state
+        .change
+        .explorations
+        .iter()
+        .filter(|e| !e.is_archived() && e.id != scope_key)
+        .map(|e| e.id.clone())
+        .collect();
+    for ch in &state.project.active_changes {
+        if ch.name != scope_key {
+            candidates.push(ch.name.clone());
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    let current = state
+        .worktree_bindings
+        .scopes
+        .get(scope_key)
+        .and_then(|b| b.base_scope.clone());
+    let next = worktree::cycle_stack_base(current.as_deref(), &candidates);
+    match worktree::set_base_scope(
+        &mut state.worktree_bindings,
+        &root,
+        scope_key,
+        next.as_deref(),
+    ) {
+        Ok(()) => {}
+        Err(e) => {
+            tracing::debug!(?e, scope = %scope_key, "set stack base rejected");
+        }
+    }
+    stamp_send_blocks(state);
+    Task::none()
+}
+
+fn toggle_require_base_merged(state: &mut State, scope_key: &str) -> Task<Message> {
+    if !worktree::placement_allows_sidecars(state.config.vcs.workflow) {
+        return Task::none();
+    }
+    let Some(root) = state.project.project_root.clone() else {
+        return Task::none();
+    };
+    let cur = state
+        .worktree_bindings
+        .scopes
+        .get(scope_key)
+        .map(|b| b.require_base_merged)
+        .unwrap_or(false);
+    worktree::set_require_base_merged(
+        &mut state.worktree_bindings,
+        &root,
+        scope_key,
+        !cur,
+    );
+    stamp_send_blocks(state);
+    Task::none()
+}
+
+/// Explicit merge-to-main and archive auto-merge share this path.
+fn run_integrate_to_main(
+    state: &mut State,
+    scope_key: &str,
+) -> worktree::IntegrateOutcome {
+    let Some(root) = state.project.project_root.clone() else {
+        return worktree::IntegrateOutcome::Failed {
+            message: "no project root".into(),
+        };
+    };
+    let Some(backend) = worktree::backend_for_workflow(state.config.vcs.workflow) else {
+        return worktree::IntegrateOutcome::NoopMain;
+    };
+    let outcome = worktree::integrate_to_main(
+        &mut state.worktree_bindings,
+        &root,
+        scope_key,
+        backend,
+        &worktree::CliWorktreeOps,
+    );
+    match &outcome {
+        worktree::IntegrateOutcome::Conflict { paths } => {
+            tracing::warn!(
+                scope = %scope_key,
+                ?paths,
+                "integrate to main stopped on conflict"
+            );
+            surface_integrate_outcome_in_chat(state, scope_key, &outcome);
+        }
+        worktree::IntegrateOutcome::Failed { message } => {
+            tracing::warn!(scope = %scope_key, %message, "integrate to main failed");
+            surface_integrate_outcome_in_chat(state, scope_key, &outcome);
+        }
+        worktree::IntegrateOutcome::Clean => {
+            tracing::info!(scope = %scope_key, "integrated sidecar to main");
+            refresh_changed_files(state);
+        }
+        worktree::IntegrateOutcome::NoopMain => {}
+    }
+    stamp_send_blocks(state);
+    outcome
+}
+
+/// Post conflict/fail detail on the scope’s active chat so paths are user-visible.
+fn surface_integrate_outcome_in_chat(
+    state: &mut State,
+    scope_key: &str,
+    outcome: &worktree::IntegrateOutcome,
+) {
+    let Some(text) = worktree::format_integrate_surface_message(scope_key, outcome) else {
+        return;
+    };
+    let scope = state.change.scope_for(scope_key);
+    let Some(ix) = state.interactions.get_mut(&scope) else {
+        return;
+    };
+    let Some(ax) = ix.active_mut() else {
+        return;
+    };
+    ax.session.messages.push(chat_store::ChatMessage {
+        role: chat_store::Role::System,
+        content: vec![chat_store::ContentBlock::Text(text)],
+        timestamp: String::new(),
+        is_priming: false,
+    });
+    ax.chat_ui_dirty = true;
+    ax.needs_flush = true;
+    interaction::materialize_chat_ui(ax, &state.highlighter);
+}
+
+fn merge_scope_to_main(state: &mut State, scope_key: &str) -> Task<Message> {
+    let _ = run_integrate_to_main(state, scope_key);
+    Task::none()
 }
 
 /// Promote the exploration bound to a newly-detected change directory, if any.
@@ -3528,9 +4311,27 @@ struct ReconcileOutcome {
     promoted: bool,
 }
 
+/// Apply external chat session file events (`chat/session-sharing`).
+///
+/// Idle sessions reload or drop; in-flight local turns are shielded.
+fn apply_external_session_events(
+    state: &mut State,
+    events: &[duckcore::session_sharing::ExternalSessionEvent],
+) {
+    let project_root = state.project.project_root.clone();
+    let root = project_root.as_deref();
+    let highlighter = state.highlighter.clone();
+
+    for event in events {
+        for ix in state.interactions.values_mut() {
+            interaction::apply_external_session_event(ix, event, root, highlighter.as_ref());
+        }
+    }
+}
+
 /// Reload `ProjectData` and reconcile duckboard-local state: promote a selected
 /// exploration if a new change appeared, migrate subscriptions when a change
-/// was archived externally, and refresh the obvious-command hint.
+/// was archived externally, and refresh lifecycle next-command / oneshot chips.
 fn reload_and_reconcile(state: &mut State) -> ReconcileOutcome {
     use std::collections::HashSet;
 
@@ -3579,6 +4380,15 @@ fn reload_and_reconcile(state: &mut State) -> ReconcileOutcome {
         let Some(base_name) = data::strip_archive_prefix(&archived_name) else {
             continue;
         };
+        // Archive success: auto-attempt integrate when this change still has a sidecar.
+        if worktree::scope_has_sidecar(&state.worktree_bindings, base_name) {
+            let outcome = run_integrate_to_main(state, base_name);
+            tracing::info!(
+                change = base_name,
+                ?outcome,
+                "archive auto-integrate to main"
+            );
+        }
         if state
             .interactions
             .contains_key(&scope::Scope::Change(base_name.to_string()))
@@ -3598,6 +4408,15 @@ fn reload_and_reconcile(state: &mut State) -> ReconcileOutcome {
             );
             archived_any = true;
         }
+        // Keep binding key aligned with archived scope name when present.
+        if let Some(root) = state.project.project_root.clone() {
+            worktree::transfer_scope_binding(
+                &mut state.worktree_bindings,
+                base_name,
+                &archived_name,
+                &root,
+            );
+        }
     }
 
     let moves = idea_store::reconcile(&mut state.ideas.ideas, &state.project);
@@ -3612,7 +4431,16 @@ fn reload_and_reconcile(state: &mut State) -> ReconcileOutcome {
     }
 
     let dirty = !state.change.changed_files.is_empty();
-    area::change::refresh_obvious_chrome(&mut state.interactions, &state.project, dirty);
+    area::change::refresh_fast_response(
+        &mut state.interactions,
+        &state.project,
+        state.config.chat.agent_input_hints,
+        dirty,
+    );
+    // Reload refreshes shallow mtimes; recompute warm chat activity for ranking.
+    state
+        .dashboard
+        .refresh_chat_activity(&state.project, &state.change.explorations);
     ReconcileOutcome {
         archived: archived_any,
         promoted,
@@ -3662,6 +4490,9 @@ fn promote_idea_exploration(state: &mut State, idea_path: &Path, change_name: &s
         .get(&scope::Scope::Exploration(exploration_id.clone()))
     {
         interaction::flush_sessions(ix, project_root.as_deref());
+        for ax in &ix.sessions {
+            state.dashboard.note_session_activity(&ax.session);
+        }
     }
     if let Some(mut ix) = state
         .interactions
@@ -3682,6 +4513,10 @@ fn promote_idea_exploration(state: &mut State, idea_path: &Path, change_name: &s
         }
     }
     chat_store::merge_scope(&exploration_id, change_name, project_root.as_deref());
+    // Scope rename moves activity under the change name — full recompute.
+    state
+        .dashboard
+        .refresh_chat_activity(&state.project, &state.change.explorations);
 }
 
 /// Re-read content for all open text tabs from disk and enqueue async
@@ -3894,10 +4729,10 @@ fn spawn_diff_highlight(
 /// return the async task that computes its syntect highlight. The tab
 /// renders with fallback muted colors until the task completes.
 fn open_diff_preview(state: &mut State, area: Area, rel_path: &std::path::Path) -> Task<Message> {
-    let Some(root) = state.project.project_root.as_deref() else {
+    let Some(root) = active_work_root(state) else {
         return Task::none();
     };
-    let Some(content) = widget::diff_view::build_diff_tab(root, rel_path) else {
+    let Some(content) = widget::diff_view::build_diff_tab(&root, rel_path) else {
         return Task::none();
     };
     let id = format!("vcs:{}", rel_path.display());
@@ -3977,16 +4812,16 @@ fn find_diff_tab_mut<'a>(
     }
 }
 
-/// Refresh the VCS changed files list.
-/// Re-walk the project tree for the Files explorer. Only invoked while the
-/// explorer section is expanded, so collapsed sessions never pay for the
-/// walk.
+/// Re-walk the Files explorer tree from the **active work root** (focused
+/// scope sidecar or main). Only invoked while the explorer section is
+/// expanded (or on scope switch when already expanded), so collapsed
+/// sessions never pay for the walk.
 fn refresh_project_files(state: &mut State) {
-    let Some(root) = state.project.project_root.as_deref() else {
+    let Some(root) = active_work_root(state) else {
         return;
     };
     let mut files = Vec::new();
-    widget::file_finder::walk_project_files(root, |rel| files.push(rel.to_path_buf()));
+    widget::file_finder::walk_project_files(&root, |rel| files.push(rel.to_path_buf()));
     state.change.set_project_files(&files);
 }
 
@@ -4032,13 +4867,177 @@ fn reveal_active_file_in_explorer(state: &mut State) -> Task<Message> {
     .map(|offset| Message::Change(area::change::Message::ScrollList(offset)))
 }
 
+/// Project main root, if a project is open.
+fn project_main_root(state: &State) -> Option<PathBuf> {
+    state.project.project_root.clone()
+}
+
+/// Scope key string for worktree lookup (`caps` / `codex` / change name / exp id).
+fn active_scope_key(state: &State) -> Option<String> {
+    state.active_scope().map(|s| s.key().to_string())
+}
+
+/// Focused exploration/change work root (or project main). Caps/codex → main.
+fn active_work_root(state: &State) -> Option<PathBuf> {
+    let main = project_main_root(state)?;
+    let key = active_scope_key(state).unwrap_or_else(|| "caps".into());
+    Some(worktree::desired_work_root(
+        &state.worktree_bindings,
+        &main,
+        &key,
+    ))
+}
+
+/// Stamp `send_block_reason` on every session from current stack bindings.
+fn stamp_send_blocks(state: &mut State) {
+    let Some(main) = project_main_root(state) else {
+        return;
+    };
+    for (scope, ix) in state.interactions.iter_mut() {
+        let key = scope.key().to_string();
+        let blocked =
+            worktree::agent_send_blocked(&state.worktree_bindings, &key, &main);
+        for ax in &mut ix.sessions {
+            ax.send_block_reason = blocked.clone();
+        }
+    }
+}
+
+/// Activate placement for the focused change/exploration and refresh dirty list.
+fn ensure_focused_work_root(state: &mut State) {
+    let Some(main) = project_main_root(state) else {
+        return;
+    };
+    let Some(scope) = state.active_scope() else {
+        stamp_send_blocks(state);
+        return;
+    };
+    let key = scope.key().to_string();
+    if worktree::scope_kind_forces_main(&key) {
+        stamp_send_blocks(state);
+        return;
+    }
+    let workflow = state.config.vcs.workflow;
+    if !worktree::placement_allows_sidecars(workflow) {
+        stamp_send_blocks(state);
+        return;
+    }
+    let main_dirty = worktree::is_dirty(&main);
+    match worktree::activate_scope(
+        &mut state.worktree_bindings,
+        &main,
+        &key,
+        workflow,
+        main_dirty,
+        &worktree::CliWorktreeOps,
+    ) {
+        Ok(_) => {
+            let _ = worktree::save_bindings(&main, &state.worktree_bindings);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, scope = %key, "worktree activate failed");
+        }
+    }
+    stamp_send_blocks(state);
+}
+
 fn refresh_changed_files(state: &mut State) {
-    if let Some(root) = &state.project.project_root {
-        state.change.set_changed_files(vcs::changed_files(root));
+    ensure_focused_work_root(state);
+    if let Some(root) = active_work_root(state) {
+        state.change.set_changed_files(vcs::changed_files(&root));
     }
     // Commit chrome depends on dirty; recompose when the file list updates.
     let dirty = !state.change.changed_files.is_empty();
-    area::change::refresh_obvious_chrome(&mut state.interactions, &state.project, dirty);
+    area::change::refresh_fast_response(
+        &mut state.interactions,
+        &state.project,
+        state.config.chat.agent_input_hints,
+        dirty,
+    );
+}
+
+/// Phase pills above the chat composer for change / exploration scopes.
+fn chat_phase_display(
+    state: &State,
+    scope: Option<&scope::Scope>,
+    ix: &interaction::InteractionState,
+) -> Option<area::change::PhaseDisplay> {
+    if !state.config.ui.phase_pill_chat {
+        return None;
+    }
+    let dirty = !state.change.changed_files.is_empty();
+    match scope? {
+        scope::Scope::Change(name) => {
+            area::change::phase_display_for_change(name, &state.project, dirty)
+        }
+        scope::Scope::Exploration(_) => {
+            let empty = ix
+                .active()
+                .map(|ax| ax.session.messages.is_empty())
+                .unwrap_or(true);
+            Some(area::change::phase_display_for_exploration(empty))
+        }
+        scope::Scope::Caps | scope::Scope::Codex => None,
+    }
+}
+
+/// List-origin phase pill: select target if needed, ensure session, submit text.
+///
+/// Must not call `SelectChange` when the target is already selected — for
+/// explorations that second select opens rename instead of focusing chat.
+fn handle_list_phase_pill_send(
+    state: &mut State,
+    target: String,
+    text: String,
+) -> Task<Message> {
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return Task::none();
+    }
+    let already_selected = state.change.selected_change.as_deref() == Some(target.as_str());
+    if !already_selected {
+        area::change::update(
+            &mut state.change,
+            &mut state.tabs,
+            &mut state.interactions,
+            area::change::Message::SelectChange(target.clone()),
+            &state.project,
+            &state.highlighter,
+            state.config.chat.agent_input_hints,
+            state.window_width,
+            state.config.vcs.workflow,
+                        state.config.chat.effective_viewer_style(),
+        );
+    } else {
+        // Already focused: keep selection/rename semantics untouched; still
+        // ensure a chat session exists and the panel is visible.
+        let kind = state.change.scope_kind_for(&target);
+        let label = state.change.scope_display_label(&target);
+        let scope = state.change.scope_for(&target);
+        let ix = state
+            .interactions
+            .entry(scope)
+            .or_insert_with(|| interaction::InteractionState::for_window(state.window_width));
+        interaction::ensure_sessions_with_label(
+            ix,
+            &target,
+            &label,
+            kind,
+            state.project.project_root.as_deref(),
+            &state.highlighter,
+            state.config.chat.effective_viewer_style(),
+        );
+        if !ix.visible {
+            interaction::show_panel(ix, state.window_width);
+        }
+    }
+    let scope = state.change.scope_for(&target);
+    if let Some(ix) = state.interactions.get_mut(&scope)
+        && let Some(ax) = ix.active_mut()
+    {
+        interaction::submit_phase_pill_text(ax, text, &state.highlighter);
+    }
+    focus_chat_input()
 }
 
 /// Re-read any open `file:`-prefixed tabs whose underlying path matches
@@ -4237,8 +5236,7 @@ fn update_focused_column(state: &mut State, message: &Message) {
                     | ChatMsg::ChatAction(_, _)
                     | ChatMsg::QueueAction(_)
                     | ChatMsg::SendPressed
-                    | ChatMsg::SendObviousAction(_)
-                    | ChatMsg::SendOneshotSuggestion
+                    | ChatMsg::ActivateFastResponse(_)
                     | ChatMsg::ChatScrolled(_)
                     | ChatMsg::CycleNextAction(_)
             );
@@ -4333,6 +5331,8 @@ fn chat_block_role_label(kind: widget::text_edit::BlockKind) -> &'static str {
         widget::text_edit::BlockKind::ToolUse => "Tool",
         widget::text_edit::BlockKind::ToolResult => "Result",
         widget::text_edit::BlockKind::System => "System",
+        widget::text_edit::BlockKind::UserChoiceQuestion => "Question",
+        widget::text_edit::BlockKind::UserChoiceAnswer => "Answer",
     }
 }
 
@@ -4495,6 +5495,81 @@ fn navigate_find(
         }
     }
     jump_to_current(state, target)
+}
+
+/// ⌘↑/↓/←/→ chat landmarks — history ends and Answer-to-Answer jumps.
+///
+/// Every arm sets `chat_scroll_overridden` so `update_with_scroll_preservation`
+/// does not replay a pre-key snapshot over the jump. Leave-bottom jumps clear
+/// stick so StreamTick auto-snap cannot undo them while streaming.
+fn apply_chat_landmark(state: &mut State, action: keybinds::ChatLandmarkAction) -> Task<Message> {
+    use keybinds::ChatLandmarkAction;
+    use widget::agent_chat;
+
+    // Always win against scroll-preservation replay for this tick.
+    state.chat_scroll_overridden = true;
+
+    match action {
+        ChatLandmarkAction::HistoryTop => {
+            if let Some(scope) = state.active_scope()
+                && let Some(ix) = state.interactions.get_mut(&scope)
+                && let Some(ax) = ix.active_mut()
+            {
+                ax.stick_to_bottom = false;
+                ax.pending_snap_to_bottom = false;
+                ax.last_chat_offset_y = Some(0.0);
+            }
+            iced::widget::operation::scroll_to(
+                agent_chat::CHAT_SCROLLABLE_ID,
+                iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
+            )
+        }
+        ChatLandmarkAction::HistoryBottom => {
+            if let Some(scope) = state.active_scope()
+                && let Some(ix) = state.interactions.get_mut(&scope)
+                && let Some(ax) = ix.active_mut()
+            {
+                ax.stick_to_bottom = true;
+                ax.pending_snap_to_bottom = false;
+            }
+            iced::widget::operation::snap_to_end(agent_chat::CHAT_SCROLLABLE_ID)
+        }
+        ChatLandmarkAction::PrevAnswer | ChatLandmarkAction::NextAnswer => {
+            let go_prev = matches!(action, ChatLandmarkAction::PrevAnswer);
+            let Some(scope) = state.active_scope() else {
+                return Task::none();
+            };
+            let (anchors, offset_y, stick) = {
+                let State {
+                    interactions,
+                    highlighter,
+                    ..
+                } = state;
+                let Some(ix) = interactions.get_mut(&scope) else {
+                    return Task::none();
+                };
+                let Some(ax) = ix.active_mut() else {
+                    return Task::none();
+                };
+                // Mid-stream with stick off defers materialize — paint blocks so
+                // Answer anchors and widget ids exist before the layout Operation.
+                if ax.chat_ui_dirty {
+                    interaction::materialize_chat_ui(ax, highlighter);
+                }
+                let anchors = agent_chat::answer_block_indices(&ax.chat_blocks);
+                if anchors.is_empty() {
+                    return Task::none();
+                }
+                let offset_y = ax.last_chat_offset_y.unwrap_or(0.0);
+                let stick = ax.stick_to_bottom;
+                // Leave-bottom jump: unstick so StreamTick auto-snap does not fight us.
+                ax.stick_to_bottom = false;
+                ax.pending_snap_to_bottom = false;
+                (anchors, offset_y, stick)
+            };
+            agent_chat::scroll_to_adjacent_answer(&anchors, go_prev, offset_y, stick)
+        }
+    }
 }
 
 /// Move the cursor / scroll position so the current match is visible.
@@ -4719,11 +5794,17 @@ fn route_interaction(state: &mut State, msg: interaction::Msg) -> Task<Message> 
                 &state.project,
                 &state.highlighter,
                 state.config.chat.agent_input_hints,
+                state.window_width,
                 state.config.vcs.workflow,
+                        state.config.chat.effective_viewer_style(),
             );
         }
         Area::Caps => {
-            let ix = state.interactions.entry(scope::Scope::Caps).or_default();
+            let window_w = state.window_width;
+            let ix = state
+                .interactions
+                .entry(scope::Scope::Caps)
+                .or_insert_with(|| interaction::InteractionState::for_window(window_w));
             area::caps::update(
                 &mut state.caps,
                 &mut state.tabs,
@@ -4732,11 +5813,17 @@ fn route_interaction(state: &mut State, msg: interaction::Msg) -> Task<Message> 
                 &state.project,
                 &state.highlighter,
                 state.config.chat.agent_input_hints,
+                state.window_width,
                 state.config.vcs.workflow,
+                        state.config.chat.effective_viewer_style(),
             );
         }
         Area::Codex => {
-            let ix = state.interactions.entry(scope::Scope::Codex).or_default();
+            let window_w = state.window_width;
+            let ix = state
+                .interactions
+                .entry(scope::Scope::Codex)
+                .or_insert_with(|| interaction::InteractionState::for_window(window_w));
             area::codex::update(
                 &mut state.codex,
                 &mut state.tabs,
@@ -4745,7 +5832,9 @@ fn route_interaction(state: &mut State, msg: interaction::Msg) -> Task<Message> 
                 &state.project,
                 &state.highlighter,
                 state.config.chat.agent_input_hints,
+                state.window_width,
                 state.config.vcs.workflow,
+                        state.config.chat.effective_viewer_style(),
             );
         }
         Area::Ideas => {
@@ -4757,7 +5846,9 @@ fn route_interaction(state: &mut State, msg: interaction::Msg) -> Task<Message> 
                 &state.project,
                 &state.highlighter,
                 state.config.chat.agent_input_hints,
+                state.window_width,
                 state.config.vcs.workflow,
+                        state.config.chat.effective_viewer_style(),
             );
         }
         Area::Dashboard | Area::Settings => {}
@@ -5169,6 +6260,7 @@ fn start_exploration_title_refresh(state: &mut State, exp_id: &str) -> Task<Mess
         scope::ScopeKind::Exploration,
         root.as_deref(),
         &state.highlighter,
+        state.config.chat.effective_viewer_style(),
     );
 
     let prepared = {
@@ -5210,6 +6302,7 @@ fn start_exploration_title_refresh(state: &mut State, exp_id: &str) -> Task<Mess
         kind: scope::ScopeKind::Exploration,
         scope_key: scope_key.clone(),
         change_facts: None,
+        has_inputs_ledger: false,
     };
     {
         use duckchat::ContextHook;
@@ -5273,8 +6366,8 @@ fn apply_session_title_inner(state: &mut State, key: &str, title: &str, force: b
     if !chat_store::apply_title_labels(&mut ax.session, exp, title, force) {
         return;
     }
-    if let Err(e) = chat_store::save_session(&ax.session, proj_root.as_deref()) {
-        tracing::error!(key, "failed to save chat session after title: {e}");
+    if !ax.mark_driven_and_persist(proj_root.as_deref()) {
+        tracing::error!(key, "failed to save chat session after title");
     }
     if scope_kind == scope::ScopeKind::Exploration {
         chat_store::save_explorations(
@@ -5295,22 +6388,51 @@ fn apply_session_title_inner(state: &mut State, key: &str, title: &str, force: b
 
 // ── View ─────────────────────────────────────────────────────────────────────
 
+/// Soft max for the list column: leave room for sidebar + handles + min chat.
+fn max_list_column_width(window_w: f32) -> f32 {
+    let reserved = theme::SIDEBAR_WIDTH
+        + 1.0
+        + widget::list_resize::HANDLE_WIDTH
+        + widget::interaction_toggle::HANDLE_WIDTH
+        + widget::interaction_toggle::MIN_PANEL_WIDTH;
+    let room = (window_w - reserved).max(widget::list_resize::MIN_LIST_WIDTH);
+    room.min(widget::list_resize::MAX_LIST_WIDTH)
+}
+
 /// Compose the shared three-column layout for any non-dashboard, non-settings
 /// area: list (per-area) | content (global tabs) | optional interaction.
 fn view_area_three_column(state: &State) -> Element<'_, Message> {
     let list: Element<'_, Message> =
         match state.active_area {
             Area::Change => {
-                area::change::view_list(&state.change, &state.project, &state.ideas, &state.tabs)
-                    .map(Message::Change)
+                area::change::view_list(
+                    &state.change,
+                    &state.project,
+                    &state.ideas,
+                    &state.tabs,
+                    &state.config.list,
+                    state.project.project_root.as_deref(),
+                    state.config.ui.phase_pill_list,
+                    !state.change.changed_files.is_empty(),
+                    worktree::placement_allows_sidecars(state.config.vcs.workflow),
+                    &state.worktree_bindings,
+                    state.config.vcs.workflow,
+                )
+                .map(Message::Change)
             }
             Area::Caps => {
                 area::caps::view_list(&state.caps, &state.project, &state.tabs).map(Message::Caps)
             }
             Area::Codex => area::codex::view_list(&state.codex, &state.project, &state.tabs)
                 .map(Message::Codex),
-            Area::Ideas => area::ideas::view_list(&state.ideas, &state.project, &state.tabs)
-                .map(Message::Ideas),
+            Area::Ideas => area::ideas::view_list(
+                &state.ideas,
+                &state.project,
+                &state.tabs,
+                &state.config.list,
+                state.config.ui.phase_pill_list,
+            )
+            .map(Message::Ideas),
             _ => unreachable!("view_area_three_column called for area without three-column layout"),
         };
 
@@ -5322,41 +6444,49 @@ fn view_area_three_column(state: &State) -> Element<'_, Message> {
         _ => interaction::SessionControls::Single,
     };
 
-    let divider = container(Space::new().height(Length::Fill))
-        .width(1.0)
-        .style(theme::divider);
-
-    // Change area exploration mode: skip the content column when there are no
-    // tabs open, so the empty state instructions are visible without an empty
-    // editor consuming the middle of the screen.
+    // Exploration without tabs still omits the door handle so the empty-state
+    // instructions dominate; content hide is tab-based for every area.
     let is_exploration =
         state.active_area == Area::Change && state.change.is_exploration_selected();
     let has_tabs = state.tabs.preview.is_some() || !state.tabs.file_tabs.is_empty();
 
+    let list_w = state.list_column_width;
+    let list_max = max_list_column_width(state.window_width);
+    let list_handle = widget::list_resize::view(list_w, list_max, |m| match m {
+        widget::list_resize::ListResizeMsg::SetWidth(w) => Message::ListColumnWidth(w),
+    });
+
     let mut row_items = row![
         container(list)
-            .width(theme::LIST_COLUMN_WIDTH)
+            .width(list_w)
             .height(Length::Fill)
             .style(theme::surface),
-        divider,
+        list_handle,
     ];
 
     let content_collapsed = ix.is_some_and(|i| i.content_collapsed);
-    // The content column shows unless we're in tab-less exploration or the
-    // door has been dragged fully open over it.
-    let show_content = (!is_exploration || has_tabs) && !content_collapsed;
+    // Content shows only when there is at least one open tab and the door has
+    // not collapsed it. No tabs → hide empty shell; chat fills free space.
+    let show_content = interaction::show_content_column(has_tabs, content_collapsed);
 
     if show_content {
         row_items = row_items.push(container(content).width(Length::Fill).height(Length::Fill));
     }
 
     let visible = ix.is_some_and(|i| i.visible);
-    let width = ix.map_or(theme::INTERACTION_COLUMN_WIDTH, |i| i.width);
+    let width = ix.map_or(
+        interaction::equal_interaction_width_for(state.window_width, list_w),
+        |i| i.width,
+    );
+    let free_max = interaction::free_content_chat_width_for(state.window_width, list_w);
 
+    // Door handle: always when tabs exist; for non-exploration also when the
+    // panel is available without tabs (so chat can open/close while content is hidden).
     if !is_exploration || has_tabs {
-        let toggle = widget::interaction_toggle::view(visible, content_collapsed, width, |m| {
-            Message::Interaction(interaction::Msg::Handle(m))
-        });
+        let toggle =
+            widget::interaction_toggle::view(visible, content_collapsed, width, free_max, |m| {
+                Message::Interaction(interaction::Msg::Handle(m))
+            });
         row_items = row_items.push(toggle);
     }
 
@@ -5380,22 +6510,23 @@ fn view_area_three_column(state: &State) -> Element<'_, Message> {
                 .get(&target)
                 .map(|fs| widget::find::view_toolbar(target.clone(), fs).map(Message::Find))
         });
-        let interaction_col =
-            interaction::view_column(
+        let phase_display = chat_phase_display(state, scope.as_ref(), ix);
+        let interaction_col = interaction::view_column(
             ix,
             Message::Interaction,
             controls,
             block_hl,
             find_toolbar,
             state.config.chat.agent_input_hints,
+            phase_display,
+            state.config.chat.effective_viewer_style(),
         );
         let col = container(interaction_col)
             .height(Length::Fill)
             .style(theme::surface);
-        let col = if show_content {
-            col.width(ix.width)
-        } else {
-            col.width(Length::Fill)
+        let col = match interaction::interaction_column_size(show_content, ix.width) {
+            interaction::InteractionColumnSize::Fixed(w) => col.width(w),
+            interaction::InteractionColumnSize::Fill => col.width(Length::Fill),
         };
         row_items = row_items.push(col);
     }
@@ -5506,6 +6637,7 @@ fn view(state: &State) -> Element<'_, Message> {
             &state.change.explorations,
             &state.config.projects.recent,
             &state.ideas.format_errors,
+            &state.change.changed_files,
         )
         .map(Message::Dashboard),
         Area::Settings => area::settings::view(
@@ -5599,17 +6731,24 @@ fn view(state: &State) -> Element<'_, Message> {
 fn subscription(state: &State) -> Subscription<Message> {
     let mut subs = vec![];
 
-    // File watcher: active when project root is known.
-    if let Some(root) = state.project.project_root.as_ref() {
-        subs.push(
-            watcher::watch_subscription(root.clone(), state.project.duckspec_root.clone())
-                .map(Message::FileChanged),
-        );
+    // File watchers: main + every live sidecar (background agents still refresh).
+    if let Some(main) = state.project.project_root.as_ref() {
+        for root in worktree::watch_roots(main, &state.worktree_bindings) {
+            let duckspec = if &root == main {
+                state.project.duckspec_root.clone()
+            } else {
+                None
+            };
+            subs.push(
+                watcher::watch_subscription(root, duckspec).map(Message::FileChanged),
+            );
+        }
     }
 
     // Per-terminal PTY subscriptions. Keyed by the stable `instance_id` and
     // the per-tab `terminal.id` so each tab's shell survives scope renames
     // (e.g. exploration→change promotion) and tab reorders.
+    // PTYs stay on main (session-worktrees design: agents are isolation target).
     let pty_cwd = state.project.project_root.clone();
     let push_pty = |ix: &interaction::InteractionState, subs: &mut Vec<Subscription<Message>>| {
         for tt in &ix.terminals {
@@ -5622,51 +6761,63 @@ fn subscription(state: &State) -> Subscription<Message> {
     }
 
     // Per-session agent subscriptions. Key format: `agent:ix:<instance_id>/<session_id>`.
-    // Like PTYs, keyed by `instance_id` so in-flight agent streams survive renames.
-    if let Some(root) = state.project.project_root.as_ref() {
-        let push_scope = |ix: &interaction::InteractionState,
-                          subs: &mut Vec<Subscription<Message>>| {
+    // Working dir is folded into the subscription identity so cold rebinds respawn;
+    // streaming sessions keep their handle cwd via agent_runtime_root.
+    if let Some(main) = state.project.project_root.as_ref() {
+        for (scope, ix) in &state.interactions {
+            let scope_key = scope.key().to_string();
+            let desired =
+                worktree::desired_work_root(&state.worktree_bindings, main, &scope_key);
             for session in &ix.sessions {
                 let key = format!("agent:ix:{}/{}", ix.instance_id, session.session.id);
-                // The worker runs on the provider named by the session's
-                // resolved model harness (per-chat pin → project default →
-                // built-in default). Folding it into the subscription respawns
-                // the worker on the new backend when the harness changes.
-                let harness = interaction::resolve_turn_model(
-                    session.session.selected_model.as_ref(),
-                    session.project_model_default.as_ref(),
-                )
-                .harness;
+                let handle_dir = session
+                    .agent_handle
+                    .as_ref()
+                    .map(|h| h.working_dir().to_path_buf());
+                let root = worktree::agent_runtime_root(
+                    &desired,
+                    session.session.is_streaming,
+                    handle_dir.as_deref(),
+                );
+                let harness = session.effective_harness();
+                let oneshot_model = agent::resolved_oneshot_model_for(
+                    &harness,
+                    state.config.chat.oneshot_model(&harness),
+                );
                 subs.push(
-                    agent::agent_subscription(key, root.clone(), harness).map(tagged_agent),
+                    agent::agent_subscription(key, root, harness, oneshot_model)
+                        .map(tagged_agent),
                 );
             }
-        };
-        for ix in state.interactions.values() {
-            push_scope(ix, &mut subs);
         }
     }
 
     // Global keyboard events.
     subs.push(event::listen_raw(handle_key_event));
 
+    // One-shot process model catalog refresh + UI wake when ready.
+    subs.push(model_catalog_ready_subscription());
+
     // Poll system dark/light mode.
     subs.push(theme_subscription());
 
-    // Animation tick for the streaming indicator. Only subscribed when at
-    // least one session is actively streaming, so idle chats don't wake
-    // the render loop. Uses iced's built-in `time::every` so the timer runs
-    // on iced's tokio runtime — the earlier handcrafted `tokio::time::sleep`
-    // stream panicked silently under the default thread-pool backend.
-    if any_session_streaming(state) {
+    // Animation / pure-content materialize tick. Only while a session needs
+    // the stream UI tick (active agent work, or deferred materialize while
+    // stick-to-bottom) — idle mid-turn await does not keep a 10 Hz pump.
+    // Uses iced's built-in `time::every` so the timer runs on iced's tokio
+    // runtime — the earlier handcrafted `tokio::time::sleep` stream panicked
+    // silently under the default thread-pool backend.
+    if any_session_needs_stream_tick(state) {
         subs.push(
             iced::time::every(std::time::Duration::from_millis(
                 widget::streaming_indicator::TICK_MS,
             ))
             .map(|_instant| Message::StreamTick),
         );
-        // Coalesced ~1s eager-persist tick, active only while streaming so idle
-        // chats don't wake the runtime. Bounds mid-turn crash loss to ~1s.
+    }
+    // Coalesced ~1s eager-persist tick while any session has unpersisted
+    // stream updates — not merely while a turn is open and clean.
+    if any_session_needs_flush_tick(state) {
         subs.push(
             iced::time::every(std::time::Duration::from_secs(1)).map(|_instant| Message::FlushTick),
         );
@@ -5675,6 +6826,9 @@ fn subscription(state: &State) -> Subscription<Message> {
     // Intercept window-close so we can flush every session before the window
     // goes away. Paired with `exit_on_close_request(false)` in `main`.
     subs.push(iced::window::close_requests().map(Message::WindowCloseRequested));
+
+    // Equal content/chat split tracks free space; uncustomized panels rebalance.
+    subs.push(iced::window::resize_events().map(|(_id, size)| Message::WindowResized(size)));
 
     // ~60fps tick driving terminal edge auto-scroll. Only subscribed while a
     // terminal drag holds the pointer past an edge, so the render loop stays
@@ -5692,22 +6846,58 @@ fn subscription(state: &State) -> Subscription<Message> {
 /// True if any terminal across all interaction panels is currently drag
 /// auto-scrolling (drag active and pointer past a vertical edge).
 fn any_terminal_autoscrolling(state: &State) -> bool {
-    state
-        .interactions
-        .values()
-        .any(|ix| ix.terminals.iter().any(|tt| tt.state.is_drag_autoscrolling()))
+    state.interactions.values().any(|ix| {
+        ix.terminals
+            .iter()
+            .any(|tt| tt.state.is_drag_autoscrolling())
+    })
 }
 
-/// True if any session across all interaction panels is actively streaming.
-fn any_session_streaming(state: &State) -> bool {
+/// True if any session needs the 10 Hz stream UI tick (see
+/// [`interaction::session_needs_stream_tick`]).
+fn any_session_needs_stream_tick(state: &State) -> bool {
+    state.interactions.values().any(|ix| {
+        ix.sessions.iter().any(|ax| {
+            interaction::session_needs_stream_tick(
+                ax.session.is_streaming,
+                ax.is_awaiting_user,
+                ax.chat_ui_dirty,
+                ax.stick_to_bottom,
+            )
+        })
+    })
+}
+
+/// True if any session has unpersisted stream updates for the eager flush tick.
+fn any_session_needs_flush_tick(state: &State) -> bool {
     state
         .interactions
         .values()
-        .any(|ix| ix.sessions.iter().any(|s| s.session.is_streaming))
+        .any(|ix| ix.sessions.iter().any(|ax| ax.needs_flush))
 }
 
 fn theme_subscription() -> Subscription<Message> {
     Subscription::run(theme_detect_stream).map(Message::ThemeChanged)
+}
+
+/// Refresh the process model catalog once per process, then emit
+/// [`Message::ModelCatalogReady`] so views and agent subscriptions re-read it.
+fn model_catalog_ready_subscription() -> Subscription<Message> {
+    Subscription::run(model_catalog_ready_stream)
+}
+
+fn model_catalog_ready_stream() -> impl iced::futures::Stream<Item = Message> {
+    use iced::futures::stream::{self, StreamExt};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static STARTED: AtomicBool = AtomicBool::new(false);
+
+    stream::once(async {
+        if !STARTED.swap(true, Ordering::SeqCst) {
+            let _ = tokio::task::spawn_blocking(agent::refresh_model_catalog).await;
+        }
+        Message::ModelCatalogReady
+    })
+    .boxed()
 }
 
 fn theme_detect_stream() -> impl iced::futures::Stream<Item = theme::ColorMode> {
@@ -5778,12 +6968,14 @@ fn main() -> iced::Result {
     // Detect system dark/light mode before creating the window.
     theme::set_mode(theme::detect_mode());
     tracing::info!(mode = ?theme::mode(), "duckboard starting");
+    // Model catalog refresh runs once via subscription and wakes the UI with
+    // Message::ModelCatalogReady (see `model_catalog_ready_subscription`).
 
     iced::application(State::new, update_with_scroll_preservation, view)
         .subscription(subscription)
         .title("duckboard")
         .theme(theme_fn)
-        .window_size((1200.0, 800.0))
+        .window_size((theme::DEFAULT_WINDOW_WIDTH, 800.0))
         // We flush every chat session on close before letting the window go
         // away (see `Message::WindowCloseRequested`), so suppress the default
         // close-on-request behavior.
@@ -5856,8 +7048,27 @@ fn handle_key_event(
             // react to them. Escape is exempt: iced's `text_input` captures it to
             // clear focus, so without the exemption the file finder would need
             // two Escape presses to close.
+            //
+            // ⌘↑/↓/←/→ are also exempt: TextEdit captures them for caret /
+            // document motion, but chat landmarks must still run with the
+            // composer focused (and while a turn streams).
             let is_escape = matches!(&key, keyboard::Key::Named(keyboard::key::Named::Escape));
-            if !is_escape && matches!(status, event::Status::Captured) {
+            let is_cmd_arrow_landmark = {
+                use keyboard::key::Named;
+                modifiers.command()
+                    && !modifiers.shift()
+                    && !modifiers.alt()
+                    && matches!(
+                        &key,
+                        keyboard::Key::Named(
+                            Named::ArrowUp
+                                | Named::ArrowDown
+                                | Named::ArrowLeft
+                                | Named::ArrowRight
+                        )
+                    )
+            };
+            if !is_escape && !is_cmd_arrow_landmark && matches!(status, event::Status::Captured) {
                 return None;
             }
             Some(Message::KeyPress(
@@ -5951,6 +7162,7 @@ mod tests {
             id: id.to_string(),
             display_name: id.to_string(),
             idea_path: None,
+            archived_at: None,
             session_count: 0,
         });
         let mut ix = interaction::InteractionState::default();
@@ -6046,13 +7258,12 @@ mod tests {
 
             // THEN the exploration is promoted into the change AND chat focus
             // is requested (callers batch focus_chat_input when promoted).
+            assert!(promoted, "bound promotion must request chat input focus");
             assert!(
-                promoted,
-                "bound promotion must request chat input focus"
+                state
+                    .interactions
+                    .contains_key(&scope::Scope::Change(new_name.to_string()))
             );
-            assert!(state
-                .interactions
-                .contains_key(&scope::Scope::Change(new_name.to_string())));
         });
     }
 
@@ -6078,9 +7289,11 @@ mod tests {
                 !promoted,
                 "unbound detection must not request chat input focus"
             );
-            assert!(!state
-                .interactions
-                .contains_key(&scope::Scope::Change(new_name.to_string())));
+            assert!(
+                !state
+                    .interactions
+                    .contains_key(&scope::Scope::Change(new_name.to_string()))
+            );
         });
     }
 
@@ -6144,9 +7357,7 @@ mod tests {
     #[test]
     fn parses_cd_prefixed_and_compound_command() {
         assert_eq!(
-            parse_create_change(&bash(
-                "cd /repo && ds create change my-thing && ds status"
-            )),
+            parse_create_change(&bash("cd /repo && ds create change my-thing && ds status")),
             Some("my-thing".to_string())
         );
     }
@@ -6156,9 +7367,7 @@ mod tests {
     #[test]
     fn parses_grok_run_terminal_command() {
         assert_eq!(
-            parse_create_change(&bash(
-                "ds create change md-table-render && ds status"
-            )),
+            parse_create_change(&bash("ds create change md-table-render && ds status")),
             Some("md-table-render".to_string())
         );
     }
@@ -6173,5 +7382,438 @@ mod tests {
     #[test]
     fn ignores_command_without_create_change() {
         assert_eq!(parse_create_change(&bash("ds status")), None);
+    }
+
+    // ── chat/session-scroll ──────────────────────────────────────────────────
+
+    /// Seed a scope with one session; returns the session id.
+    fn seed_scoped_session(
+        state: &mut State,
+        scope: scope::Scope,
+        kind: scope::ScopeKind,
+        session_id: &str,
+        stick: bool,
+        offset: Option<f32>,
+    ) -> String {
+        let mut ax = interaction::AgentSession::new(scope.key().to_string(), kind);
+        ax.session.id = session_id.to_string();
+        ax.stick_to_bottom = stick;
+        ax.last_chat_offset_y = offset;
+        let mut ix = interaction::InteractionState::default();
+        ix.sessions.push(ax);
+        ix.active_session = 0;
+        ix.visible = true;
+        state.interactions.insert(scope, ix);
+        session_id.to_string()
+    }
+
+    /// Seed a Change scope with two sessions (first is active).
+    #[allow(clippy::too_many_arguments)] // seed parameters are irreducibly distinct
+    fn seed_multi_session_change(
+        state: &mut State,
+        change: &str,
+        s1: &str,
+        s2: &str,
+        s1_stick: bool,
+        s1_offset: Option<f32>,
+        s2_stick: bool,
+        s2_offset: Option<f32>,
+    ) {
+        let scope = scope::Scope::Change(change.to_string());
+        let mut a1 = interaction::AgentSession::new(change.into(), scope::ScopeKind::Change);
+        a1.session.id = s1.to_string();
+        a1.stick_to_bottom = s1_stick;
+        a1.last_chat_offset_y = s1_offset;
+        let mut a2 = interaction::AgentSession::new(change.into(), scope::ScopeKind::Change);
+        a2.session.id = s2.to_string();
+        a2.stick_to_bottom = s2_stick;
+        a2.last_chat_offset_y = s2_offset;
+        let mut ix = interaction::InteractionState::default();
+        ix.sessions.push(a1);
+        ix.sessions.push(a2);
+        ix.active_session = 0;
+        ix.visible = true;
+        state.interactions.insert(scope, ix);
+        state.change.selected_change = Some(change.to_string());
+        state.active_area = Area::Change;
+    }
+
+    fn seed_exploration_idea(
+        state: &mut State,
+        path: &std::path::Path,
+        exp_id: &str,
+        session_id: &str,
+        stick: bool,
+        offset: Option<f32>,
+    ) {
+        state.ideas.ideas.push(idea_store::Idea {
+            abs_path: path.to_path_buf(),
+            state: idea_store::IdeaState::Exploration,
+            primary_tag_path: vec![],
+            frontmatter: idea_store::Frontmatter {
+                title: exp_id.to_string(),
+                created: "0".into(),
+                exploration: Some(exp_id.to_string()),
+                ..Default::default()
+            },
+        });
+        seed_scoped_session(
+            state,
+            scope::Scope::Exploration(exp_id.to_string()),
+            scope::ScopeKind::Exploration,
+            session_id,
+            stick,
+            offset,
+        );
+    }
+
+    fn active_ax(state: &State) -> &interaction::AgentSession {
+        let scope = state.active_scope().expect("active scope");
+        state
+            .interactions
+            .get(&scope)
+            .and_then(|ix| ix.active())
+            .expect("active session")
+    }
+
+    /// Run production update wrapper (drop iced Tasks).
+    fn run_scroll_message(state: &mut State, message: Message) {
+        let _ = update_with_scroll_preservation(state, message);
+    }
+
+    /// @spec chat/session-scroll Open and switch show latest: Intentional session open or switch lands at latest
+    #[test]
+    fn intentional_session_open_or_switch_lands_at_latest() {
+        // GIVEN two exploration chats; currently on e1 mid-history
+        let mut state = State::new();
+        let p1 = std::path::PathBuf::from("/ideas/exploration/e1.md");
+        let p2 = std::path::PathBuf::from("/ideas/exploration/e2.md");
+        seed_exploration_idea(
+            &mut state,
+            &p1,
+            "exploration-1",
+            "sess-1",
+            false,
+            Some(120.0),
+        );
+        seed_exploration_idea(
+            &mut state,
+            &p2,
+            "exploration-2",
+            "sess-2",
+            false,
+            Some(50.0),
+        );
+        state.active_area = Area::Ideas;
+        state.ideas.selected = Some(p1.clone());
+
+        // WHEN selecting the other idea (intentional open of a different session)
+        run_scroll_message(
+            &mut state,
+            Message::Ideas(area::ideas::Message::SelectIdea(p2)),
+        );
+
+        // THEN the newly active session is at latest intent (stick on)
+        let ax = active_ax(&state);
+        assert_eq!(ax.session.id, "sess-2");
+        assert!(
+            ax.stick_to_bottom,
+            "open/switch must engage stick so viewport lands at latest"
+        );
+        assert_eq!(
+            restored_viewport_intent(ax.stick_to_bottom, ax.last_chat_offset_y),
+            RestoredViewport::Latest
+        );
+    }
+
+    /// @spec chat/session-scroll Open and switch show latest: Stick-to-bottom engages on open or switch
+    #[test]
+    fn stick_to_bottom_engages_on_open_or_switch() {
+        // GIVEN multi-session change; active session scrolled mid-history
+        let mut state = State::new();
+        seed_multi_session_change(
+            &mut state,
+            "my-change",
+            "sess-a",
+            "sess-b",
+            false,
+            Some(80.0),
+            false,
+            Some(10.0),
+        );
+
+        // WHEN switching session tab
+        run_scroll_message(
+            &mut state,
+            Message::Change(area::change::Message::Interaction(
+                interaction::Msg::SelectSession("sess-b".into()),
+            )),
+        );
+
+        // THEN stick-to-bottom is engaged on the newly active session
+        let ax = active_ax(&state);
+        assert_eq!(ax.session.id, "sess-b");
+        assert!(ax.stick_to_bottom);
+        assert!(!ax.pending_snap_to_bottom);
+    }
+
+    /// @spec chat/session-scroll Area navigation restores viewport: Area change restores remembered mid-history
+    #[test]
+    fn area_change_restores_remembered_mid_history() {
+        // GIVEN change chat scrolled away from bottom
+        let mut state = State::new();
+        seed_scoped_session(
+            &mut state,
+            scope::Scope::Change("my-change".into()),
+            scope::ScopeKind::Change,
+            "sess-1",
+            false,
+            Some(240.0),
+        );
+        seed_scoped_session(
+            &mut state,
+            scope::Scope::Caps,
+            scope::ScopeKind::Caps,
+            "caps-1",
+            true,
+            None,
+        );
+        state.active_area = Area::Change;
+        state.change.selected_change = Some("my-change".into());
+
+        // WHEN navigating to another area and back without changing session identity
+        run_scroll_message(&mut state, Message::AreaSelected(Area::Caps));
+        run_scroll_message(&mut state, Message::AreaSelected(Area::Change));
+
+        // THEN remembered mid-history intent is intact (not force-latest)
+        let ax = active_ax(&state);
+        assert_eq!(ax.session.id, "sess-1");
+        assert!(!ax.stick_to_bottom);
+        assert_eq!(ax.last_chat_offset_y, Some(240.0));
+        assert_eq!(
+            restored_viewport_intent(ax.stick_to_bottom, ax.last_chat_offset_y),
+            RestoredViewport::Offset(240.0)
+        );
+    }
+
+    /// @spec chat/session-scroll Area navigation restores viewport: Area change keeps stick-to-bottom when that was the prior intent
+    #[test]
+    fn area_change_keeps_stick_to_bottom_when_prior_intent() {
+        // GIVEN change chat with stick-to-bottom engaged
+        let mut state = State::new();
+        seed_scoped_session(
+            &mut state,
+            scope::Scope::Change("my-change".into()),
+            scope::ScopeKind::Change,
+            "sess-1",
+            true,
+            Some(0.0),
+        );
+        seed_scoped_session(
+            &mut state,
+            scope::Scope::Caps,
+            scope::ScopeKind::Caps,
+            "caps-1",
+            false,
+            Some(99.0),
+        );
+        state.active_area = Area::Change;
+        state.change.selected_change = Some("my-change".into());
+
+        // WHEN navigating away and back
+        run_scroll_message(&mut state, Message::AreaSelected(Area::Caps));
+        run_scroll_message(&mut state, Message::AreaSelected(Area::Change));
+
+        // THEN stick remains engaged (latest intent preserved)
+        let ax = active_ax(&state);
+        assert!(ax.stick_to_bottom);
+        assert_eq!(
+            restored_viewport_intent(ax.stick_to_bottom, ax.last_chat_offset_y),
+            RestoredViewport::Latest
+        );
+    }
+
+    /// @spec chat/session-scroll Layout preserve stays within session identity: Same session keeps viewport across layout-affecting update
+    #[test]
+    fn same_session_keeps_viewport_across_layout_update() {
+        // GIVEN active change session mid-history
+        let mut state = State::new();
+        seed_scoped_session(
+            &mut state,
+            scope::Scope::Change("my-change".into()),
+            scope::ScopeKind::Change,
+            "sess-1",
+            false,
+            Some(180.0),
+        );
+        state.active_area = Area::Change;
+        state.change.selected_change = Some("my-change".into());
+        let id_before = active_chat_identity(&state);
+
+        // WHEN a layout-affecting update does not change chat identity
+        run_scroll_message(
+            &mut state,
+            Message::Change(area::change::Message::ToggleSection("picker".into())),
+        );
+
+        // THEN session identity and scroll intent are unchanged
+        assert_eq!(active_chat_identity(&state), id_before);
+        let ax = active_ax(&state);
+        assert!(!ax.stick_to_bottom);
+        assert_eq!(ax.last_chat_offset_y, Some(180.0));
+    }
+
+    /// @spec chat/session-scroll Layout preserve stays within session identity: Session identity change does not apply prior session offset
+    #[test]
+    fn session_identity_change_does_not_apply_prior_session_offset() {
+        // GIVEN multi-session change; s1 mid-history (offset 320), s2 mid-history (offset 10)
+        let mut state = State::new();
+        seed_multi_session_change(
+            &mut state,
+            "my-change",
+            "sess-a",
+            "sess-b",
+            false,
+            Some(320.0),
+            false,
+            Some(10.0),
+        );
+        let prior_id = active_chat_identity(&state);
+        assert_eq!(
+            prior_id.as_ref().map(|i| i.session_id.as_str()),
+            Some("sess-a")
+        );
+
+        // WHEN switching to the other session
+        run_scroll_message(
+            &mut state,
+            Message::Change(area::change::Message::Interaction(
+                interaction::Msg::SelectSession("sess-b".into()),
+            )),
+        );
+
+        // THEN new session is not layout-preserved at the prior session's offset:
+        // production open/switch path snaps to latest (stick on), not offset 320.
+        let after = active_chat_identity(&state);
+        assert_ne!(prior_id, after);
+        let ax = active_ax(&state);
+        assert_eq!(ax.session.id, "sess-b");
+        assert!(
+            ax.stick_to_bottom,
+            "identity change must not preserve prior session mid-history as layout replay"
+        );
+        assert_eq!(
+            restored_viewport_intent(ax.stick_to_bottom, ax.last_chat_offset_y),
+            RestoredViewport::Latest
+        );
+        // Prior session's remembered offset must not be copied onto the new session.
+        assert_ne!(ax.last_chat_offset_y, Some(320.0));
+    }
+
+    // ── list digit switch selection dispatch ───────────────────────────────
+
+    fn seed_digit_change(state: &mut State, name: &str) {
+        state.project.project_root = Some(std::path::PathBuf::from("/tmp/list-digit-sel"));
+        state.project.active_changes.push(data::ChangeData {
+            name: name.into(),
+            prefix: "changes".into(),
+            has_proposal: false,
+            has_design: false,
+            cap_tree: vec![],
+            steps: vec![],
+            reviews: vec![],
+            shallow_mtime_nanos: None,
+        });
+    }
+
+    fn seed_digit_exploration(state: &mut State, id: &str) {
+        state.project.project_root = Some(std::path::PathBuf::from("/tmp/list-digit-sel"));
+        let mut exp = chat_store::Exploration::new(1);
+        exp.id = id.into();
+        exp.display_name = id.into();
+        state.change.explorations.push(exp);
+    }
+
+    // @spec shell/list-digit-switch Selection without rename side effects: Digit selects a different live-queue row
+    #[test]
+    fn digit_selects_a_different_live_queue_row() {
+        let mut state = State::for_tests();
+        seed_digit_change(&mut state, "alpha");
+        seed_digit_change(&mut state, "beta");
+        state.active_area = Area::Change;
+        state.change.selected_change = Some("alpha".into());
+        let ids = area::change::painted_live_queue_ids(
+            &state.change,
+            &state.project,
+            &state.ideas,
+            state.list_prefs(),
+            state.project.project_root.as_deref(),
+            &[],
+        );
+        assert!(ids.len() >= 2);
+        let target = ids[1].clone();
+        assert_ne!(state.change.selected_change.as_deref(), Some(target.as_str()));
+        let _ = dispatch_list_digit(&mut state, 2);
+        assert_eq!(state.change.selected_change.as_deref(), Some(target.as_str()));
+        assert_eq!(state.active_area, Area::Change);
+        assert!(state.change.renaming_exploration.is_none());
+    }
+
+    // @spec shell/list-digit-switch Selection without rename side effects: Digit selects a different idea row
+    #[test]
+    fn digit_selects_a_different_idea_row() {
+        let mut state = State::for_tests();
+        state.project.project_root = Some(std::path::PathBuf::from("/tmp/list-digit-sel"));
+        state.active_area = Area::Ideas;
+        let p1 = std::path::PathBuf::from("/ideas/inbox/one.md");
+        let p2 = std::path::PathBuf::from("/ideas/inbox/two.md");
+        state.ideas.ideas.push(idea_store::Idea {
+            abs_path: p1.clone(),
+            state: idea_store::IdeaState::Inbox,
+            primary_tag_path: vec![],
+            frontmatter: idea_store::Frontmatter {
+                title: "one".into(),
+                created: "2026-01-01T00:00:00Z".into(),
+                ..Default::default()
+            },
+        });
+        state.ideas.ideas.push(idea_store::Idea {
+            abs_path: p2.clone(),
+            state: idea_store::IdeaState::Inbox,
+            primary_tag_path: vec![],
+            frontmatter: idea_store::Frontmatter {
+                title: "two".into(),
+                created: "2026-01-02T00:00:00Z".into(),
+                ..Default::default()
+            },
+        });
+        state.ideas.selected = Some(p1);
+        let paths =
+            area::ideas::painted_idea_paths(&state.ideas, &state.project, state.list_prefs());
+        assert!(paths.len() >= 2);
+        let target = paths[1].clone();
+        let _ = dispatch_list_digit(&mut state, 2);
+        assert_eq!(state.ideas.selected.as_ref(), Some(&target));
+        assert_eq!(state.active_area, Area::Ideas);
+    }
+
+    // @spec shell/list-digit-switch Selection without rename side effects: Already-selected exploration is no-op without rename
+    #[test]
+    fn already_selected_exploration_is_no_op_without_rename() {
+        let mut state = State::for_tests();
+        seed_digit_exploration(&mut state, "exploration-stay");
+        state.active_area = Area::Change;
+        state.change.selected_change = Some("exploration-stay".into());
+        // If we re-dispatched SelectChange, rename would start.
+        let _ = dispatch_list_digit(&mut state, 1);
+        assert_eq!(
+            state.change.selected_change.as_deref(),
+            Some("exploration-stay")
+        );
+        assert!(
+            state.change.renaming_exploration.is_none(),
+            "digit re-select must not open exploration rename"
+        );
+        assert_eq!(state.active_area, Area::Change);
     }
 }

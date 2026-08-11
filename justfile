@@ -1,13 +1,32 @@
-# Install ds, duckboard, and the Claude ACP agent to ~/.cargo/bin.
+# List available recipes (default).
+help:
+    @just --list
+
+# Install CLI tools to ~/.cargo/bin and deploy Duckboard.app to /Applications.
+# Quit a running Duckboard first so the Applications copy can be replaced.
 install:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "==> Quit Duckboard if it is running (Applications replace needs a free path)."
     cargo install --path crates/duckspec
     cargo install --path crates/duckboard
     cargo install --path crates/duckchat-claude-acp
+    cargo install --path crates/duckchat-codex-acp
+    cargo install --path crates/duckchat-agy-acp
+    just bundle
+    APP_SRC="dist/Duckboard.app"
+    APP_DST="/Applications/Duckboard.app"
+    echo "==> Deploying ${APP_SRC} → ${APP_DST}"
+    rm -rf "${APP_DST}"
+    cp -R "${APP_SRC}" "${APP_DST}"
+    # Re-sign after copy; ad-hoc signature can be invalidated by the copy.
+    codesign --force --deep --sign - "${APP_DST}"
+    echo "==> Installed. Reopen Duckboard from Applications (or ~/.cargo/bin/duckboard)."
 
-# Run duckboard from source (release build). Builds the Claude ACP agent into
-# the same target/ tree so sibling binary discovery works.
+# Run duckboard from source (release build). Builds ACP agents into the same
+# target/ tree so sibling binary discovery works.
 run:
-    cargo build --release -p duckchat-claude-acp -p duckboard
+    cargo build --release -p duckchat-claude-acp -p duckchat-codex-acp -p duckchat-agy-acp -p duckboard
     cargo run --release -p duckboard
 
 # Push main bookmark to origin (jj).
@@ -116,16 +135,18 @@ bundle:
     APP="${OUT_DIR}/${APP_NAME}.app"
     CONTENTS="${APP}/Contents"
 
-    echo "==> Building release binaries (duckboard ${VERSION} + duckchat-claude-acp)"
-    # Agent ships as a sibling of duckboard so Finder-launched apps (skeletal
-    # PATH) still resolve Claude turns via sibling-of-exe discovery.
-    cargo build --release -p duckchat-claude-acp -p duckboard
+    echo "==> Building release binaries (duckboard ${VERSION} + ACP agents)"
+    # Agents ship as siblings of duckboard so Finder-launched apps (skeletal
+    # PATH) still resolve harness turns via sibling-of-exe discovery.
+    cargo build --release -p duckchat-claude-acp -p duckchat-codex-acp -p duckchat-agy-acp -p duckboard
 
     echo "==> Assembling ${APP}"
     rm -rf "${APP}"
     mkdir -p "${CONTENTS}/MacOS" "${CONTENTS}/Resources"
     cp target/release/duckboard "${CONTENTS}/MacOS/duckboard"
     cp target/release/duckchat-claude-acp "${CONTENTS}/MacOS/duckchat-claude-acp"
+    cp target/release/duckchat-codex-acp "${CONTENTS}/MacOS/duckchat-codex-acp"
+    cp target/release/duckchat-agy-acp "${CONTENTS}/MacOS/duckchat-agy-acp"
 
     echo "==> Building .icns from ${SRC_ICON}"
     ICONSET=$(mktemp -d)/${APP_NAME}.iconset
@@ -149,7 +170,40 @@ bundle:
         name="${m##*:}"
         sips -z "$size" "$size" "${SRC_ICON}" -o "${ICONSET}/$name" >/dev/null
     done
-    iconutil -c icns "${ICONSET}" -o "${CONTENTS}/Resources/${APP_NAME}.icns"
+    ICNS="${CONTENTS}/Resources/${APP_NAME}.icns"
+    if ! iconutil -c icns "${ICONSET}" -o "${ICNS}"; then
+        # macOS 27 beta currently rejects valid iconsets (including iconsets
+        # extracted from Apple's own .icns files). Build the simple ICNS
+        # container directly from the generated PNGs as a deterministic
+        # fallback. Each chunk is a four-byte type, big-endian length, and
+        # PNG payload; the outer container uses the same framing.
+        echo "==> iconutil rejected the iconset; using direct ICNS packaging"
+        ICONSET="${ICONSET}" ICNS="${ICNS}" perl -e '
+            use strict;
+            use warnings;
+            my @chunks = (
+                [q{icp4}, q{icon_16x16.png}],
+                [q{ic11}, q{icon_16x16@2x.png}],
+                [q{icp5}, q{icon_32x32.png}],
+                [q{ic12}, q{icon_32x32@2x.png}],
+                [q{ic07}, q{icon_128x128.png}],
+                [q{ic13}, q{icon_128x128@2x.png}],
+                [q{ic08}, q{icon_256x256.png}],
+                [q{ic14}, q{icon_256x256@2x.png}],
+                [q{ic09}, q{icon_512x512.png}],
+                [q{ic10}, q{icon_512x512@2x.png}],
+            );
+            my $body = q{};
+            for my $chunk (@chunks) {
+                open my $input, q{<:raw}, "$ENV{ICONSET}/$chunk->[1]" or die $!;
+                local $/;
+                my $png = <$input>;
+                $body .= $chunk->[0] . pack(q{N}, 8 + length($png)) . $png;
+            }
+            open my $output, q{>:raw}, $ENV{ICNS} or die $!;
+            print {$output} q{icns}, pack(q{N}, 8 + length($body)), $body;
+        '
+    fi
 
     echo "==> Writing Info.plist"
     cat > "${CONTENTS}/Info.plist" <<PLIST

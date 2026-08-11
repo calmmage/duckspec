@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 
 use crate::cancel::CancelToken;
 use crate::error::Error;
-use crate::event::AgentEvent;
+use crate::event::{AgentEvent, PendingUserChoices};
 use crate::request::{TurnOutcome, TurnRequest};
 use crate::runtime::{MainRuntime, OneshotKind, OneshotRuntime};
 
@@ -102,6 +102,7 @@ impl MainRuntime for AcpMainRuntime {
         req: TurnRequest,
         events: mpsc::Sender<AgentEvent>,
         cancel: CancelToken,
+        pending_choices: Arc<PendingUserChoices>,
     ) -> Result<TurnOutcome, Error> {
         self.ensure_hot().await?;
 
@@ -156,9 +157,13 @@ impl MainRuntime for AcpMainRuntime {
                 context_window,
                 &events,
                 &cancel,
+                &pending_choices,
             )
             .await
         };
+
+        // Drop any still-parked choices (turn ended or failed).
+        pending_choices.cancel_all();
 
         match result {
             Ok(result) => match result.stop_reason.as_deref() {
@@ -284,13 +289,56 @@ impl AcpOneshotRuntime {
     }
 
     fn pick_model(&self) -> Option<String> {
-        if let Some(pref) = &self.preferred_model
-            && self.models.iter().any(|m| m.id == *pref)
-        {
-            return Some(pref.clone());
-        }
-        self.models.first().map(|m| m.id.clone())
+        pick_oneshot_model(self.preferred_model.as_deref(), &self.models)
     }
+}
+
+/// Select oneshot model from the advertise set.
+///
+/// 1. Exact preferred id if present
+/// 2. Substring match (e.g. preferred `haiku` → `claude-haiku-4-5-…`)
+/// 3. Cheap/fast default needles (haiku, then composer+fast, then fast)
+/// 4. First advertised model
+pub(crate) fn pick_oneshot_model(preferred: Option<&str>, models: &[AcpModel]) -> Option<String> {
+    if models.is_empty() {
+        return None;
+    }
+    if let Some(pref) = preferred {
+        let pref = pref.trim();
+        if !pref.is_empty() {
+            if let Some(m) = models.iter().find(|m| m.id == pref) {
+                return Some(m.id.clone());
+            }
+            let pref_l = pref.to_ascii_lowercase();
+            if let Some(m) = models
+                .iter()
+                .find(|m| m.id.to_ascii_lowercase().contains(&pref_l))
+            {
+                return Some(m.id.clone());
+            }
+        }
+    }
+    default_oneshot_from_advertised(models)
+}
+
+/// Prefer cheap/fast advertised models when no usable preferred id was given.
+fn default_oneshot_from_advertised(models: &[AcpModel]) -> Option<String> {
+    models
+        .iter()
+        .find(|m| m.id.to_ascii_lowercase().contains("haiku"))
+        .or_else(|| {
+            models.iter().find(|m| {
+                let id = m.id.to_ascii_lowercase();
+                id.contains("composer") && id.contains("fast")
+            })
+        })
+        .or_else(|| {
+            models
+                .iter()
+                .find(|m| m.id.to_ascii_lowercase().contains("fast"))
+        })
+        .or_else(|| models.first())
+        .map(|m| m.id.clone())
 }
 
 #[async_trait]
@@ -315,6 +363,11 @@ impl OneshotRuntime for AcpOneshotRuntime {
         let model = self
             .pick_model()
             .ok_or_else(|| Error::Other("agent advertised no models for oneshot".into()))?;
+        tracing::debug!(
+            %model,
+            preferred = ?self.preferred_model,
+            "oneshot selected model"
+        );
         let content = text_prompt_content(&text);
 
         // Cancel token is cooperative while prompt is polling; if the future is
@@ -516,7 +569,10 @@ mod tests {
             }
         });
 
-        AcpTurn::from_transport(Box::pin(client_write), Box::pin(BufReader::new(client_read)))
+        AcpTurn::from_transport(
+            Box::pin(client_write),
+            Box::pin(BufReader::new(client_read)),
+        )
     }
 
     /// Fake peer that hangs on the first `session/prompt` until the client
@@ -587,7 +643,10 @@ mod tests {
             }
         });
 
-        AcpTurn::from_transport(Box::pin(client_write), Box::pin(BufReader::new(client_read)))
+        AcpTurn::from_transport(
+            Box::pin(client_write),
+            Box::pin(BufReader::new(client_read)),
+        )
     }
 
     async fn write_line(
@@ -685,7 +744,10 @@ mod tests {
             }
         });
 
-        AcpTurn::from_transport(Box::pin(client_write), Box::pin(BufReader::new(client_read)))
+        AcpTurn::from_transport(
+            Box::pin(client_write),
+            Box::pin(BufReader::new(client_read)),
+        )
     }
 
     /// @spec harness/acp-client Session open and resume: When the agent rebinds the session id during a turn, the client surfaces the rebound id
@@ -696,7 +758,12 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(32);
 
         let out = rt
-            .run_turn(turn_req(None), tx, CancelToken::new())
+            .run_turn(
+                turn_req(None),
+                tx,
+                CancelToken::new(),
+                crate::event::PendingUserChoices::shared(),
+            )
             .await
             .expect("turn with rebind");
         assert_eq!(
@@ -737,7 +804,12 @@ mod tests {
 
         rt.ensure_hot().await.unwrap();
         let out1 = rt
-            .run_turn(turn_req(None), tx.clone(), CancelToken::new())
+            .run_turn(
+                turn_req(None),
+                tx.clone(),
+                CancelToken::new(),
+                crate::event::PendingUserChoices::shared(),
+            )
             .await
             .unwrap();
         assert!(!out1.session_id.is_empty());
@@ -747,6 +819,7 @@ mod tests {
                 turn_req(Some(&out1.session_id)),
                 tx.clone(),
                 CancelToken::new(),
+                crate::event::PendingUserChoices::shared(),
             )
             .await
             .unwrap();
@@ -791,7 +864,12 @@ mod tests {
         let turn = tokio::spawn(async move {
             let mut rt = rt_holder.take().unwrap();
             let result = rt
-                .run_turn(turn_req(Some("prior-sess-id")), tx, cancel2)
+                .run_turn(
+                    turn_req(Some("prior-sess-id")),
+                    tx,
+                    cancel2,
+                    crate::event::PendingUserChoices::shared(),
+                )
                 .await;
             (rt, result)
         });
@@ -810,6 +888,7 @@ mod tests {
                 turn_req(Some("prior-sess-id")),
                 tx2,
                 CancelToken::new(),
+                crate::event::PendingUserChoices::shared(),
             )
             .await
             .expect("turn after cancel should complete");
@@ -913,7 +992,10 @@ mod tests {
             rt.prompt(OneshotKind::Title, "will hang".into()),
         )
         .await;
-        assert!(hung.is_err(), "first oneshot should not finish within budget");
+        assert!(
+            hung.is_err(),
+            "first oneshot should not finish within budget"
+        );
 
         // Worker cold-reset path after Timeout.
         rt.shutdown().await;
@@ -930,5 +1012,71 @@ mod tests {
             "shutdown drops heat; next ensure_hot may spawn again"
         );
         rt.shutdown().await;
+    }
+
+    fn acp_model(id: &str) -> AcpModel {
+        AcpModel {
+            id: id.to_string(),
+            name: format!("{id} display"),
+            context_window: None,
+        }
+    }
+
+    // Claude preferred oneshot model is the curated haiku alias (or full id).
+    const PREFERRED: &str = "haiku";
+
+    // @spec harness/claude Oneshot preferred model: Preferred oneshot model is selected when advertised
+    #[test]
+    fn preferred_oneshot_model_is_selected_when_advertised() {
+        // GIVEN preferred haiku among others (fable listed first)
+        let models = vec![
+            acp_model("fable"),
+            acp_model("opus"),
+            acp_model("sonnet"),
+            acp_model(PREFERRED),
+        ];
+        // WHEN selecting for title/reply oneshot
+        let selected = pick_oneshot_model(Some(PREFERRED), &models);
+        // THEN preferred oneshot model wins
+        assert_eq!(selected.as_deref(), Some(PREFERRED));
+    }
+
+    // @spec harness/claude Oneshot preferred model: Oneshot model falls back when preferred is absent
+    #[test]
+    fn oneshot_model_falls_back_when_preferred_is_absent() {
+        // GIVEN advertised models without haiku
+        let models = vec![acp_model("fable"), acp_model("sonnet")];
+        // WHEN selecting for oneshot
+        let selected = pick_oneshot_model(Some(PREFERRED), &models);
+        // THEN another advertised model (first), not failure
+        assert_eq!(selected.as_deref(), Some("fable"));
+    }
+
+    #[test]
+    fn bare_haiku_preferred_matches_full_api_id() {
+        // GIVEN live advertise full ids (Sonnet first) and bare preferred "haiku"
+        let models = vec![
+            acp_model("claude-sonnet-5"),
+            acp_model("claude-opus-4-8"),
+            acp_model("claude-haiku-4-5-20251001"),
+        ];
+        // WHEN selecting with bare alias preferred
+        let selected = pick_oneshot_model(Some("haiku"), &models);
+        // THEN the full haiku id wins, not the first catalog entry
+        assert_eq!(selected.as_deref(), Some("claude-haiku-4-5-20251001"));
+    }
+
+    #[test]
+    fn no_preferred_defaults_to_haiku_or_fast_among_full_ids() {
+        let models = vec![
+            acp_model("claude-sonnet-5"),
+            acp_model("claude-haiku-4-5-20251001"),
+        ];
+        let selected = pick_oneshot_model(None, &models);
+        assert_eq!(selected.as_deref(), Some("claude-haiku-4-5-20251001"));
+
+        let grok = vec![acp_model("grok-4.5"), acp_model("grok-composer-2.5-fast")];
+        let selected = pick_oneshot_model(None, &grok);
+        assert_eq!(selected.as_deref(), Some("grok-composer-2.5-fast"));
     }
 }

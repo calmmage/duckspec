@@ -101,6 +101,9 @@ pub struct ChangeData {
     /// last entry is the current (highest-numbered) review. Reviews are
     /// advisory — they never affect phase or next-stage derivation.
     pub reviews: Vec<String>,
+    /// Max mtime of the change directory and its immediate children (unix
+    /// nanos). Used for Dashboard attention ranking; `None` if unavailable.
+    pub shallow_mtime_nanos: Option<i128>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,7 +164,10 @@ impl ProjectData {
                 let cap_tree = build_tree(&root.join("caps"), "caps");
                 let codex_entries = build_tree_contents(&root.join("codex"), "codex");
                 let active_changes = build_changes(&root.join("changes"), "changes");
-                let archived_changes = build_changes(&root.join("archive"), "archive");
+                // Archive folders are YYYY-MM-DD-NN-*; reverse ascending dir order
+                // so the most recently archived change is first.
+                let mut archived_changes = build_changes(&root.join("archive"), "archive");
+                archived_changes.reverse();
                 (cap_tree, codex_entries, active_changes, archived_changes)
             }
             None => Default::default(),
@@ -324,6 +330,7 @@ fn build_changes(dir: &Path, dir_prefix: &str) -> Vec<ChangeData> {
         let cap_tree = build_tree(&full.join("caps"), &format!("{}/caps", prefix));
         let steps = build_steps(&full.join("steps"), &prefix);
         let reviews = build_reviews(&full.join("reviews"));
+        let shallow_mtime_nanos = shallow_mtime_nanos(&full);
 
         changes.push(ChangeData {
             name,
@@ -333,9 +340,36 @@ fn build_changes(dir: &Path, dir_prefix: &str) -> Vec<ChangeData> {
             cap_tree,
             steps,
             reviews,
+            shallow_mtime_nanos,
         });
     }
     changes
+}
+
+/// Max modified time of `dir` and its immediate children as unix nanos.
+fn shallow_mtime_nanos(dir: &Path) -> Option<i128> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn as_nanos(t: SystemTime) -> Option<i128> {
+        t.duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_nanos() as i128)
+    }
+
+    let mut best: Option<SystemTime> = fs::metadata(dir).ok().and_then(|m| m.modified().ok());
+    if let Ok(rd) = fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            if let Ok(m) = entry.metadata() {
+                if let Ok(t) = m.modified() {
+                    best = Some(match best {
+                        Some(b) => b.max(t),
+                        None => t,
+                    });
+                }
+            }
+        }
+    }
+    best.and_then(as_nanos)
 }
 
 /// Collect a change's review filenames (`NN-<slug>.md`), sorted ascending by
@@ -546,5 +580,38 @@ mod tests {
         assert_eq!(strip_archive_prefix("26-04-20-01-foo"), None);
         assert_eq!(strip_archive_prefix("2026-4-20-01-foo"), None);
         assert_eq!(strip_archive_prefix("2026-04-20-01-"), None);
+    }
+
+    /// @spec archive/browse Archived change order: Archived changes list most recent first
+    #[test]
+    fn archived_changes_list_most_recent_first() {
+        let root = std::env::temp_dir().join(format!(
+            "duckboard-archive-order-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let archive = root.join("duckspec/archive");
+        std::fs::create_dir_all(archive.join("2026-01-01-01-old")).unwrap();
+        std::fs::create_dir_all(archive.join("2026-07-12-02-mid")).unwrap();
+        std::fs::create_dir_all(archive.join("2026-07-12-09-new")).unwrap();
+
+        let project = ProjectData::open(&root);
+        let names: Vec<&str> = project
+            .archived_changes
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(
+            names,
+            vec![
+                "2026-07-12-09-new",
+                "2026-07-12-02-mid",
+                "2026-01-01-01-old"
+            ]
+        );
     }
 }

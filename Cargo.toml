@@ -6,6 +6,10 @@ members = [
     "crates/duckboard",
     "crates/duckchat",
     "crates/duckchat-claude-acp",
+    "crates/duckchat-codex-acp",
+    "crates/duckchat-agy-acp",
+    "crates/duckcore",
+    "crates/ducktui",
 ]
 
 [workspace.package]
@@ -17,6 +21,7 @@ license = "MIT"
 # Internal crates
 duckpond = { path = "crates/duckpond" }
 duckchat = { path = "crates/duckchat" }
+duckcore = { path = "crates/duckcore" }
 
 # External dependencies
 thiserror = "2"
@@ -35,3 +40,4 @@ debug = "line-tables-only"
 
 [profile.release]
 strip = "debuginfo"
+# (patch members below)

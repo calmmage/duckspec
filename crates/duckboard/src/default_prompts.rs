@@ -1,11 +1,15 @@
 //! Pure helpers for empty-composer next actions and reply-suggestion oneshot.
 //!
-//! Next actions: empty-session lifecycle bootstrap or trailing `next` meta card.
-//! Oneshot: settled parse under the input (agent input hints gated) — separate
-//! from next actions. Empty Enter / Tab own next actions only.
+//! Next actions: empty-session inherited list or lifecycle bootstrap, else
+//! trailing `next` meta card. Oneshot: settled parse (agent input hints gated)
+//! may fill fast-response chips when eligible — separate from next actions.
+//! Empty Enter / Tab own next actions only. No under-input oneshot chrome.
 
 use crate::chat_store::{ChatMessage, ChatSession, ContentBlock, Role};
 use crate::meta_card::{NextAction, trailing_next_actions};
+
+/// Hard cap on oneshot display / chip options (matches duckchat parse cap).
+const ONESHOT_DISPLAY_CAP: usize = 3;
 
 /// Trim and drop empties from a oneshot parse (order preserved).
 pub fn oneshot_replies_trimmed(oneshot_replies: &[String]) -> Vec<String> {
@@ -18,20 +22,25 @@ pub fn oneshot_replies_trimmed(oneshot_replies: &[String]) -> Vec<String> {
 
 /// Build the next-action list for the empty composer.
 ///
-/// - Empty session: first lifecycle option in empty-send form (0 or 1 entry).
-/// - Non-empty: trailing next actions from the last assistant message only.
+/// - Empty session + non-empty inherited: that list (outranks bootstrap).
+/// - Empty session otherwise: first lifecycle option in empty-send form (0 or 1).
+/// - Non-empty: trailing next actions from the last assistant message only
+///   (inherited is ignored).
 /// - Never merges oneshot results or post-first-turn disk lifecycle options.
 pub fn next_action_list(
     session_empty: bool,
     bootstrap: Option<&str>,
     last_assistant: Option<&str>,
+    inherited: Option<&[NextAction]>,
 ) -> Vec<NextAction> {
     if session_empty {
-        return match crate::obvious_bubble::bubble_send_text(bootstrap) {
-            Some(send) => vec![NextAction {
-                send,
-                reason: None,
-            }],
+        if let Some(inh) = inherited
+            && !inh.is_empty()
+        {
+            return inh.to_vec();
+        }
+        return match crate::fast_response::lifecycle_send_text(bootstrap) {
+            Some(send) => vec![NextAction { send, reason: None }],
             None => Vec::new(),
         };
     }
@@ -41,53 +50,56 @@ pub fn next_action_list(
     }
 }
 
-/// Oneshot under-input list when agent input hints is on; otherwise empty.
-/// At most one entry is kept for display (oneshot is single-suggestion).
-pub fn oneshot_display_prompts(
-    oneshot_replies: &[String],
-    agent_input_hints: bool,
-) -> Vec<String> {
+/// Settled oneshot list when agent input hints is on; otherwise empty.
+/// At most three entries are kept (parser may already cap).
+pub fn oneshot_display_prompts(oneshot_replies: &[String], agent_input_hints: bool) -> Vec<String> {
     if !agent_input_hints {
         return Vec::new();
     }
     let mut list = oneshot_replies_trimmed(oneshot_replies);
-    list.truncate(1);
+    list.truncate(ONESHOT_DISPLAY_CAP);
     list
-}
-
-/// Marker shown before an armed under-input oneshot suggestion (`⌘↩`).
-pub const ONESHOT_CMD_ENTER_MARKER: &str = "⌘↩";
-
-/// Text to send on empty-composer Cmd-Enter from the armed oneshot suggestion.
-///
-/// Requires ready (not pending), not streaming, agent input hints on, and a
-/// non-empty first oneshot entry. Empty Enter never uses this path.
-pub fn oneshot_cmd_submit_text(
-    pending: bool,
-    is_streaming: bool,
-    agent_input_hints: bool,
-    oneshot_prompts: &[String],
-) -> Option<String> {
-    if pending || is_streaming || !agent_input_hints {
-        return None;
-    }
-    oneshot_prompts
-        .first()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
 }
 
 /// Whether a reply-suggestion oneshot may start after a turn.
 ///
-/// Requires agent input hints enabled, a non-priming turn, and a non-empty last
-/// assistant message (caller has already resolved assistant text).
+/// Requires agent input hints enabled, a non-priming turn, non-empty last
+/// assistant text (caller resolved), and an empty next-action list (ghost
+/// would win — skip the model call).
 pub fn should_begin_reply_oneshot(
     agent_input_hints: bool,
     was_priming: bool,
     has_assistant_text: bool,
+    next_actions_empty: bool,
 ) -> bool {
-    agent_input_hints && !was_priming && has_assistant_text
+    agent_input_hints && !was_priming && has_assistant_text && next_actions_empty
+}
+
+/// Whether settled oneshot replies may occupy the fast-response shell.
+pub fn oneshot_chips_allowed(
+    is_streaming: bool,
+    is_awaiting_user: bool,
+    next_actions_len: usize,
+    agent_input_hints: bool,
+    oneshot_len: usize,
+) -> bool {
+    agent_input_hints
+        && !is_streaming
+        && !is_awaiting_user
+        && next_actions_len == 0
+        && oneshot_len > 0
+}
+
+/// Under-input oneshot chrome was removed — never shown (no loading strip, no
+/// suggestion row under the composer).
+#[cfg(test)]
+fn oneshot_under_input_chrome_visible(
+    _input_empty: bool,
+    _pending: bool,
+    _is_streaming: bool,
+    _prompts_len: usize,
+) -> bool {
+    false
 }
 
 /// Text to send on empty-composer Enter from the next-action list.
@@ -126,11 +138,7 @@ pub fn next_ghost_text(
 }
 
 /// Whether to show the tab-available marker for multi next actions.
-pub fn next_tab_marker_visible(
-    input_empty: bool,
-    is_streaming: bool,
-    actions_len: usize,
-) -> bool {
+pub fn next_tab_marker_visible(input_empty: bool, is_streaming: bool, actions_len: usize) -> bool {
     input_empty && !is_streaming && actions_len > 1
 }
 
@@ -165,11 +173,7 @@ pub fn cycle_active_index(len: usize, active_idx: usize, delta: i8) -> usize {
 
 /// Clamp `active_idx` into `[0, len)` (or `0` when empty) after the list changes.
 pub fn clamp_active_index(len: usize, active_idx: usize) -> usize {
-    if len == 0 {
-        0
-    } else {
-        active_idx.min(len - 1)
-    }
+    if len == 0 { 0 } else { active_idx.min(len - 1) }
 }
 
 /// Active next-action index after rebuilding the list.
@@ -188,41 +192,6 @@ pub fn next_action_idx_after_refresh(
         0
     } else {
         clamp_active_index(new_sends.len(), prev_idx)
-    }
-}
-
-/// Empty-composer oneshot under-input chrome: nothing, loading while pending, or the list.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DefaultsChrome {
-    /// Input non-empty, streaming, or ready with an empty oneshot list.
-    Hidden,
-    /// Oneshot in flight; show loading, not a suggestion.
-    Loading,
-    /// Ready with a non-empty oneshot list.
-    List,
-}
-
-/// What the under-input oneshot chrome should show.
-///
-/// While a main agent turn is streaming, chrome is always hidden (no list and
-/// no oneshot loading strip), even if a non-empty list or a pending oneshot
-/// would apply when idle.
-pub fn defaults_chrome(
-    input_empty: bool,
-    pending: bool,
-    is_streaming: bool,
-    prompts_len: usize,
-) -> DefaultsChrome {
-    if !input_empty || is_streaming {
-        return DefaultsChrome::Hidden;
-    }
-    if pending {
-        return DefaultsChrome::Loading;
-    }
-    if prompts_len == 0 {
-        DefaultsChrome::Hidden
-    } else {
-        DefaultsChrome::List
     }
 }
 
@@ -276,11 +245,11 @@ mod tests {
     #[test]
     fn empty_session_seeds_first_lifecycle() {
         // GIVEN empty transcript + first lifecycle option in empty-send form
-        let got = next_action_list(true, Some("/ds-explore"), None);
+        let got = next_action_list(true, Some("/ds-explore"), None, None);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].send, "/ds-explore");
         // Bare name formats with leading slash.
-        let got = next_action_list(true, Some("ds-propose"), None);
+        let got = next_action_list(true, Some("ds-propose"), None, None);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].send, "/ds-propose");
     }
@@ -289,9 +258,9 @@ mod tests {
     #[test]
     fn empty_session_without_lifecycle_yields_empty() {
         // GIVEN empty transcript + no first lifecycle option
-        let got = next_action_list(true, None, None);
+        let got = next_action_list(true, None, None, None);
         assert!(got.is_empty());
-        let got = next_action_list(true, Some("  "), None);
+        let got = next_action_list(true, Some("  "), None, None);
         assert!(got.is_empty());
     }
 
@@ -307,7 +276,7 @@ Done.
 > `/ds-spec`  write specs
 > `/ds-design`  design it
 ";
-        let got = next_action_list(false, Some("/ds-explore"), Some(assistant));
+        let got = next_action_list(false, Some("/ds-explore"), Some(assistant), None);
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].send, "/ds-spec");
         assert_eq!(got[1].send, "/ds-design");
@@ -320,7 +289,7 @@ Done.
     fn non_empty_session_without_trailing_next_yields_empty() {
         // GIVEN non-empty session + assistant without trailing next + lifecycle present
         let assistant = "Just some prose, no meta card.";
-        let got = next_action_list(false, Some("/ds-explore"), Some(assistant));
+        let got = next_action_list(false, Some("/ds-explore"), Some(assistant), None);
         assert!(got.is_empty());
     }
 
@@ -330,13 +299,76 @@ Done.
         // GIVEN non-empty session + no trailing next + settled oneshot suggestion
         // next_action_list never takes oneshot input — only assistant + bootstrap.
         let assistant = "No trailing next here.";
-        let got = next_action_list(false, None, Some(assistant));
+        let got = next_action_list(false, None, Some(assistant), None);
         assert!(got.is_empty());
         // Oneshot display is a separate path.
         let oneshot = oneshot_display_prompts(&["nice reply".into()], true);
         assert_eq!(oneshot, vec!["nice reply"]);
         // Merging is not part of next_action_list.
         assert!(got.is_empty());
+    }
+
+    // @spec chat/default-prompts Next-action list: Empty session with inherited next actions uses inherited list
+    #[test]
+    fn empty_session_with_inherited_next_actions_uses_inherited_list() {
+        // GIVEN empty transcript + two inherited send tokens + different lifecycle
+        let inherited = [
+            NextAction {
+                send: "/ds-spec".into(),
+                reason: Some("write specs".into()),
+            },
+            NextAction {
+                send: "confirm".into(),
+                reason: None,
+            },
+        ];
+        let got = next_action_list(true, Some("/ds-explore"), None, Some(&inherited));
+        // THEN exactly the inherited tokens in order (not lifecycle)
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].send, "/ds-spec");
+        assert_eq!(got[1].send, "confirm");
+        assert!(!got.iter().any(|a| a.send == "/ds-explore"));
+    }
+
+    // @spec chat/default-prompts Next-action list: Empty session without inherited falls back to lifecycle
+    #[test]
+    fn empty_session_without_inherited_falls_back_to_lifecycle() {
+        // GIVEN empty transcript + no non-empty inherited + lifecycle option
+        let got = next_action_list(true, Some("/ds-propose"), None, None);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].send, "/ds-propose");
+        // Empty inherited slice is treated as absent.
+        let empty: &[NextAction] = &[];
+        let got = next_action_list(true, Some("ds-apply"), None, Some(empty));
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].send, "/ds-apply");
+    }
+
+    // @spec chat/default-prompts Next-action list: Non-empty session drops inheritance
+    #[test]
+    fn non_empty_session_drops_inheritance() {
+        // GIVEN non-empty session + inherited list + trailing next with different token
+        let inherited = [NextAction {
+            send: "confirm".into(),
+            reason: None,
+        }];
+        let assistant = "\
+Done.
+
+> **next**
+>
+> `/ds-step`  plan implementation
+";
+        let got = next_action_list(
+            false,
+            Some("/ds-explore"),
+            Some(assistant),
+            Some(&inherited),
+        );
+        // THEN trailing next only; inherited not used
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].send, "/ds-step");
+        assert!(!got.iter().any(|a| a.send == "confirm"));
     }
 
     // @spec chat/default-prompts Next-action empty-input send and cycle: Empty submit sends the active next action
@@ -354,6 +386,7 @@ Done.
 > `/ds-design`
 ",
             ),
+            None,
         );
         assert_eq!(
             next_empty_submit_text(false, &actions, 1).as_deref(),
@@ -471,171 +504,119 @@ Done.
     #[test]
     fn oneshot_launch_requires_agent_input_hints_enabled() {
         // GIVEN agent input hints disabled + non-priming turn that would qualify
-        assert!(!should_begin_reply_oneshot(false, false, true));
-        // Enabled + non-priming + assistant → may start
-        assert!(should_begin_reply_oneshot(true, false, true));
+        assert!(!should_begin_reply_oneshot(false, false, true, true));
+        // Enabled + non-priming + assistant + empty next-actions → may start
+        assert!(should_begin_reply_oneshot(true, false, true, true));
         // Priming or missing assistant still blocks
-        assert!(!should_begin_reply_oneshot(true, true, true));
-        assert!(!should_begin_reply_oneshot(true, false, false));
+        assert!(!should_begin_reply_oneshot(true, true, true, true));
+        assert!(!should_begin_reply_oneshot(true, false, false, true));
     }
 
-    // @spec chat/default-prompts Oneshot readiness: Pending hides oneshot row and shows loading
+    // @spec chat/default-prompts Agent input hints gate: Oneshot launch is skipped when the next-action list is non-empty
     #[test]
-    fn pending_hides_oneshot_row_and_shows_loading() {
-        // GIVEN pending oneshot + empty input
-        assert_eq!(
-            defaults_chrome(true, true, false, 1),
-            DefaultsChrome::Loading
-        );
-        // Typing: no chrome.
-        assert_eq!(
-            defaults_chrome(false, true, false, 1),
-            DefaultsChrome::Hidden
-        );
-    }
-
-    // @spec chat/default-prompts Oneshot readiness: Empty Cmd-Enter is a no-op while oneshot pending
-    #[test]
-    fn empty_cmd_enter_is_a_no_op_while_oneshot_pending() {
-        // GIVEN pending oneshot + empty composer + a suggestion that would arm when ready
-        let prompts = vec!["nice reply".into()];
-        assert_eq!(
-            oneshot_cmd_submit_text(true, false, true, &prompts),
-            None
-        );
-    }
-
-    // @spec chat/default-prompts Oneshot readiness: Ready after settle arms the oneshot row
-    #[test]
-    fn ready_after_settle_arms_the_oneshot_row() {
-        let list = apply_oneshot_if_current(3, 3, Ok(vec!["nice reply".into()]))
-            .expect("matching gen applies");
-        let pending = false;
-        assert_eq!(list, vec!["nice reply"]);
-        assert_eq!(
-            defaults_chrome(true, pending, false, list.len()),
-            DefaultsChrome::List
-        );
-        assert_eq!(
-            oneshot_cmd_submit_text(pending, false, true, &list).as_deref(),
-            Some("nice reply")
-        );
+    fn oneshot_launch_is_skipped_when_the_next_action_list_is_non_empty() {
+        // GIVEN hints on + non-priming + assistant + non-empty next-actions
+        assert!(!should_begin_reply_oneshot(true, false, true, false));
+        // Empty next-actions still allows launch when other gates pass
+        assert!(should_begin_reply_oneshot(true, false, true, true));
     }
 
     // @spec chat/default-prompts Oneshot readiness: Superseded generation does not arm oneshot
     #[test]
     fn superseded_generation_does_not_arm_oneshot() {
         let applied = apply_oneshot_if_current(5, 4, Ok(vec!["stale".into()]));
-        assert!(applied.is_none(), "superseded gen must not replace the list");
-    }
-
-    // @spec chat/default-prompts Oneshot readiness: Main turn in progress hides oneshot chrome
-    #[test]
-    fn main_turn_in_progress_hides_oneshot_chrome() {
-        // GIVEN streaming main turn + empty composer + non-empty oneshot
-        assert_eq!(
-            defaults_chrome(true, false, true, 1),
-            DefaultsChrome::Hidden
-        );
-        assert_eq!(
-            defaults_chrome(true, true, true, 1),
-            DefaultsChrome::Hidden
-        );
-        let prompts = vec!["nice reply".into()];
-        assert_eq!(
-            oneshot_cmd_submit_text(false, true, true, &prompts),
-            None
+        assert!(
+            applied.is_none(),
+            "superseded gen must not replace the list"
         );
     }
 
-    // @spec chat/default-prompts Oneshot readiness: Timed-out or failed oneshot settles to ready empty
+    // @spec chat/default-prompts Oneshot readiness: Failed or timed-out oneshot settles without presenting suggestions
     #[test]
-    fn timed_out_or_failed_oneshot_settles_to_ready_empty() {
+    fn failed_or_timed_out_oneshot_settles_without_presenting_suggestions() {
         let list = apply_oneshot_if_current(
             1,
             1,
             Err("oneshot timed out: oneshot call exceeded budget".into()),
         )
         .expect("matching gen applies");
-        let pending = false;
+        // Ready with empty list — no suggestions to present
         assert!(list.is_empty());
-        assert_eq!(
-            defaults_chrome(true, pending, false, list.len()),
-            DefaultsChrome::Hidden
-        );
-        assert_eq!(
-            oneshot_cmd_submit_text(pending, false, true, &list),
-            None
-        );
+        assert!(!oneshot_chips_allowed(false, false, 0, true, list.len()));
+        assert!(!oneshot_under_input_chrome_visible(
+            true,
+            false,
+            false,
+            list.len()
+        ));
     }
 
-    // @spec chat/default-prompts Oneshot readiness: Agent handle ends while oneshot pending becomes ready
+    // @spec chat/default-prompts Oneshot readiness: Agent handle end while pending leaves suggestions ready empty
     #[test]
-    fn agent_handle_ends_while_oneshot_pending_becomes_ready() {
-        // GIVEN pending oneshot + empty composer → loading.
-        assert_eq!(
-            defaults_chrome(true, true, false, 0),
-            DefaultsChrome::Loading
-        );
-        // WHEN handle ends without settle → ready, empty, no loading.
+    fn agent_handle_end_while_pending_leaves_suggestions_ready_empty() {
+        // WHEN handle ends without settle → ready, empty list, no loading chrome
         let pending = false;
         let prompts: Vec<String> = Vec::new();
-        assert_eq!(
-            defaults_chrome(true, pending, false, prompts.len()),
-            DefaultsChrome::Hidden
-        );
+        assert!(!oneshot_under_input_chrome_visible(
+            true,
+            pending,
+            false,
+            prompts.len()
+        ));
+        assert!(!oneshot_chips_allowed(false, false, 0, true, prompts.len()));
     }
 
-    // @spec chat/default-prompts Oneshot empty-input send: Empty Cmd-Enter sends the armed oneshot suggestion
+    // @spec chat/default-prompts Oneshot readiness: Pending oneshot presents no loading chrome
     #[test]
-    fn empty_cmd_enter_sends_the_armed_oneshot_suggestion() {
-        let prompts = vec!["sounds good, go ahead".into()];
-        assert_eq!(
-            oneshot_cmd_submit_text(false, false, true, &prompts).as_deref(),
-            Some("sounds good, go ahead")
-        );
+    fn pending_oneshot_presents_no_loading_chrome() {
+        // GIVEN pending oneshot + empty composer — under-input chrome never shows
+        assert!(!oneshot_under_input_chrome_visible(true, true, false, 0));
+        assert!(!oneshot_under_input_chrome_visible(true, true, false, 1));
+        // Pending also has no settled list for chips yet
+        assert!(!oneshot_chips_allowed(false, false, 0, true, 0));
     }
 
-    // @spec chat/default-prompts Oneshot empty-input send: Empty Cmd-Enter is a no-op when no oneshot suggestion
+    // @spec chat/default-prompts Oneshot chip eligibility: Eligible when idle with no next actions and a settled list
     #[test]
-    fn empty_cmd_enter_is_a_no_op_when_no_oneshot_suggestion() {
-        assert_eq!(
-            oneshot_cmd_submit_text(false, false, true, &[]),
-            None
-        );
-        // Agent input hints off also disarms.
-        let prompts = vec!["would not send".into()];
-        assert_eq!(
-            oneshot_cmd_submit_text(false, false, false, &prompts),
-            None
-        );
+    fn eligible_when_idle_with_no_next_actions_and_a_settled_list() {
+        assert!(oneshot_chips_allowed(false, false, 0, true, 2));
     }
 
-    // @spec chat/default-prompts Oneshot empty-input send: Empty Enter does not send the oneshot suggestion
+    // @spec chat/default-prompts Oneshot chip eligibility: Ineligible when next-action list is non-empty
     #[test]
-    fn empty_enter_does_not_send_the_oneshot_suggestion() {
-        // GIVEN empty next-action list + armed oneshot — empty Enter is no-op.
+    fn ineligible_when_next_action_list_is_non_empty() {
+        assert!(!oneshot_chips_allowed(false, false, 1, true, 2));
+    }
+
+    // @spec chat/default-prompts Oneshot chip eligibility: Ineligible while awaiting a user choice
+    #[test]
+    fn ineligible_while_awaiting_a_user_choice() {
+        assert!(!oneshot_chips_allowed(false, true, 0, true, 2));
+    }
+
+    // @spec chat/default-prompts Oneshot chip eligibility: Ineligible while streaming
+    #[test]
+    fn ineligible_while_streaming() {
+        assert!(!oneshot_chips_allowed(true, false, 0, true, 2));
+    }
+
+    // @spec chat/default-prompts Oneshot chip eligibility: Ineligible when the settled list is empty
+    #[test]
+    fn ineligible_when_the_settled_list_is_empty() {
+        assert!(!oneshot_chips_allowed(false, false, 0, true, 0));
+    }
+
+    #[test]
+    fn oneshot_display_keeps_up_to_three() {
+        let display =
+            oneshot_display_prompts(&["a".into(), "b".into(), "c".into(), "d".into()], true);
+        assert_eq!(display, vec!["a", "b", "c"]);
+        assert!(oneshot_display_prompts(&["a".into()], false).is_empty());
+    }
+
+    // Empty Enter never sends oneshot — next-action path only.
+    #[test]
+    fn empty_enter_does_not_send_oneshot_when_next_actions_empty() {
         assert_eq!(next_empty_submit_text(false, &[], 0), None);
-        // Oneshot is only on the Cmd-Enter path (binding implemented in TextEdit/app).
-        let prompts = vec!["oneshot only".into()];
-        assert_eq!(
-            oneshot_cmd_submit_text(false, false, true, &prompts).as_deref(),
-            Some("oneshot only")
-        );
     }
-
-    // @spec chat/default-prompts Oneshot presentation: Armed oneshot shows a Cmd-Enter marker before the suggestion
-    #[test]
-    fn armed_oneshot_shows_a_cmd_enter_marker_before_the_suggestion() {
-        // GIVEN ready non-empty oneshot + empty input
-        assert_eq!(
-            defaults_chrome(true, false, false, 1),
-            DefaultsChrome::List
-        );
-        assert_eq!(ONESHOT_CMD_ENTER_MARKER, "⌘↩");
-        // Display path keeps at most one suggestion.
-        let display = oneshot_display_prompts(&["a".into(), "b".into()], true);
-        assert_eq!(display, vec!["a"]);
-    }
-
 }
