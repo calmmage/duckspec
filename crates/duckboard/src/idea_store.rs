@@ -772,6 +772,9 @@ pub fn cycle_mark_for_target(
 
 /// Apply a tag to a mint target: mint a linked idea when none exists, otherwise
 /// append the tag on the existing idea. Returns `(idea_path, minted)`.
+///
+/// Queue-row tag UI is not wired yet; kept as the mint/tag surface for list marks.
+#[allow(dead_code)]
 pub fn apply_tag_to_link(
     ideas: &mut Vec<Idea>,
     target: MintTarget,
@@ -817,6 +820,7 @@ pub fn apply_tag_to_link(
 }
 
 /// Tag an exploration row: mint+link on first tag, then keep `idea_path` in sync.
+#[allow(dead_code)] // queue-row tag UI not wired yet; covered by unit tests
 pub fn apply_tag_to_exploration(
     ideas: &mut Vec<Idea>,
     exp: &mut crate::chat_store::Exploration,
@@ -833,6 +837,7 @@ pub fn apply_tag_to_exploration(
 }
 
 /// Tag a change row: mint on first tag when unlinked.
+#[allow(dead_code)] // queue-row tag UI not wired yet; covered by unit tests
 pub fn apply_tag_to_change(
     ideas: &mut Vec<Idea>,
     change_name: &str,
@@ -1172,10 +1177,7 @@ mod tests {
             IdeaMark::Cool
         );
         assert_eq!(
-            mark_for_link(
-                &ideas,
-                &QueueLinkKey::Change("list-marks-tags-sort".into())
-            ),
+            mark_for_link(&ideas, &QueueLinkKey::Change("list-marks-tags-sort".into())),
             IdeaMark::Cool
         );
     }
@@ -1183,11 +1185,7 @@ mod tests {
     // @spec ideas/marks Linked rows inherit the idea mark: Exploration-linked row exposes the idea's mark
     #[test]
     fn exploration_linked_row_exposes_the_ideas_mark() {
-        let ideas = vec![sample_idea(
-            IdeaMark::Star,
-            None,
-            Some("exploration-1"),
-        )];
+        let ideas = vec![sample_idea(IdeaMark::Star, None, Some("exploration-1"))];
         assert_eq!(
             mark_for_exploration(&ideas, "exploration-1"),
             IdeaMark::Star
@@ -1233,13 +1231,9 @@ mod tests {
         assert!(exp.is_on_live_list());
         assert!(exp.idea_path.is_none());
 
-        let (_path, minted) = apply_tag_to_exploration(
-            &mut ideas,
-            &mut exp,
-            "ui",
-            project.project_root.as_deref(),
-        )
-        .expect("mint");
+        let (_path, minted) =
+            apply_tag_to_exploration(&mut ideas, &mut exp, "ui", project.project_root.as_deref())
+                .expect("mint");
         assert!(minted);
         assert_eq!(ideas.len(), 1);
         assert_eq!(ideas[0].state, IdeaState::Exploration);
@@ -1330,7 +1324,9 @@ mod tests {
             id: exp.id.clone(),
             display_name: exp.display_name.clone(),
         };
-        assert!(cycle_mark_for_target(&mut ideas, target, project.project_root.as_deref()).unwrap());
+        assert!(
+            cycle_mark_for_target(&mut ideas, target, project.project_root.as_deref()).unwrap()
+        );
         assert_eq!(ideas.len(), 1);
         assert_eq!(ideas[0].state, IdeaState::Exploration);
         assert_eq!(ideas[0].frontmatter.title, "Cloud agent options");
@@ -1350,7 +1346,9 @@ mod tests {
         let target = MintTarget::Change {
             name: "list-marks-tags-sort".into(),
         };
-        assert!(cycle_mark_for_target(&mut ideas, target, project.project_root.as_deref()).unwrap());
+        assert!(
+            cycle_mark_for_target(&mut ideas, target, project.project_root.as_deref()).unwrap()
+        );
         assert_eq!(ideas.len(), 1);
         assert_eq!(ideas[0].state, IdeaState::Change);
         assert_eq!(ideas[0].frontmatter.mark, IdeaMark::Star);

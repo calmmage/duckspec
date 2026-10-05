@@ -282,8 +282,12 @@ pub const PRIMING_RECOLLAPSE_SECS: u64 = 15;
 fn first_sight_collapsed(seg: &TranscriptSeg) -> bool {
     match seg {
         TranscriptSeg::Thinking { live, .. } | TranscriptSeg::Activity { live, .. } => !live,
-        TranscriptSeg::User { is_priming: true, .. } => true,
-        TranscriptSeg::User { is_priming: false, .. }
+        TranscriptSeg::User {
+            is_priming: true, ..
+        } => true,
+        TranscriptSeg::User {
+            is_priming: false, ..
+        }
         | TranscriptSeg::System { .. }
         | TranscriptSeg::Answer { .. }
         | TranscriptSeg::UserChoiceQuestion { .. }
@@ -336,11 +340,15 @@ pub fn sync_collapse_states(states: &mut Vec<CollapseState>, segs: &[TranscriptS
                     states[i].collapsed = true;
                 }
             }
-            TranscriptSeg::User { is_priming: true, .. } => {
+            TranscriptSeg::User {
+                is_priming: true, ..
+            } => {
                 // Stay folded until the user clicks to inspect.
                 states[i].collapsed = true;
             }
-            TranscriptSeg::User { is_priming: false, .. }
+            TranscriptSeg::User {
+                is_priming: false, ..
+            }
             | TranscriptSeg::System { .. }
             | TranscriptSeg::Answer { .. }
             | TranscriptSeg::UserChoiceQuestion { .. }
@@ -765,6 +773,3 @@ pub fn truncate_chars(s: &str, max: usize) -> &str {
         None => s,
     }
 }
-
-
-

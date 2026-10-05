@@ -75,6 +75,24 @@ pub struct AgentHandle {
     pending_choices: std::sync::Arc<PendingUserChoices>,
 }
 
+/// Build a handle that records main commands without spawning a worker.
+///
+/// For unit tests that need a live [`AgentHandle`] (e.g. hop dispatch) without
+/// a real provider. The oneshot path is a dead channel (unused by main-turn
+/// send). Dropping the handle is enough; no shutdown task runs.
+pub fn stub_handle(working_dir: PathBuf) -> (AgentHandle, mpsc::UnboundedReceiver<AgentCommand>) {
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<AgentCommand>();
+    let (oneshot_tx, _oneshot_rx) = mpsc::unbounded_channel::<OneshotCommand>();
+    let handle = AgentHandle {
+        cancel: CancelToken::new(),
+        tx: cmd_tx,
+        oneshot_tx,
+        working_dir,
+        pending_choices: PendingUserChoices::shared(),
+    };
+    (handle, cmd_rx)
+}
+
 impl AgentHandle {
     /// Queue a `TurnRequest` directly.
     pub fn send_turn(&self, req: TurnRequest) {

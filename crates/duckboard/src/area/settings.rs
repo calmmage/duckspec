@@ -161,10 +161,8 @@ pub fn update(
             let _ = config::save(config);
         }
         Message::GlobalModelSelected(choice) => {
-            if let Some(model) = choice.to_ref() {
-                config.set_global_model_default(Some(model));
-                let _ = config::save(config);
-            }
+            config.set_global_model_default(choice.to_ref());
+            let _ = config::save(config);
         }
         Message::ModelDefaultSelected(choice) => {
             if let Some(root) = project_root {
@@ -206,19 +204,24 @@ pub fn update(
         }
         Message::ResetDefaults => {
             *config = Config::default();
-            // Re-seed a concrete global default when the process catalog has
-            // models — ModelCatalogReady is one-shot and will not re-seed.
-            let catalog = agent::available_models();
-            let _ = agent::seed_global_default_if_unset(config, &catalog);
             let _ = config::save(config);
         }
     }
 }
 
-/// Closed selection for the global default picker: a real catalog choice when
-/// set and available; **Missing** when unset or absent from the catalog.
+/// Closed selection for the global default picker: follow-backend sentinel when
+/// unset or still the former built-in; a catalog choice when pinned and
+/// available; **Missing** when a pin is absent from the catalog.
 fn global_default_picker_selected(config: &Config, choices: &[ModelChoice]) -> ModelChoice {
-    match config.global_model_default() {
+    let stored = config.global_model_default();
+    if duckcore::agent::is_follow_backend(stored) {
+        return choices
+            .iter()
+            .find(|c| c.harness.is_none() && c.id.is_none())
+            .cloned()
+            .unwrap_or_else(|| agent_chat::follow_backend_model_choice(None));
+    }
+    match stored {
         Some(m)
             if choices.iter().any(|c| {
                 c.harness.as_deref() == Some(m.harness.as_str())
@@ -228,7 +231,7 @@ fn global_default_picker_selected(config: &Config, choices: &[ModelChoice]) -> M
             agent_chat::selected_model_choice(choices, Some(m))
         }
         Some(m) => agent_chat::missing_closed_model_choice(Some(m)),
-        None => agent_chat::missing_closed_model_choice(None),
+        None => agent_chat::follow_backend_model_choice(None),
     }
 }
 
@@ -657,11 +660,7 @@ mod tests {
         // THEN plain git, jujutsu, and git worktrees are all offered for selection
         assert_eq!(
             choices,
-            [
-                VcsWorkflow::Git,
-                VcsWorkflow::Jj,
-                VcsWorkflow::Worktrees
-            ]
+            [VcsWorkflow::Git, VcsWorkflow::Jj, VcsWorkflow::Worktrees]
         );
         assert_eq!(choices, VcsWorkflow::ALL);
     }
@@ -775,17 +774,25 @@ mod tests {
     }
 
     #[test]
-    fn global_picker_shows_missing_when_unset() {
+    fn global_picker_shows_follow_sentinel_when_unset() {
         let cfg = Config::default();
-        let choices = vec![ModelChoice {
-            harness: Some("grok".into()),
-            id: Some("grok-4.5".into()),
-            label: "Grok · Grok 4.5".into(),
-            closed_label: "Grok 4.5".into(),
-        }];
+        let choices = vec![
+            ModelChoice {
+                harness: None,
+                id: None,
+                label: "Follow backend default".into(),
+                closed_label: "Grok Next (backend default)".into(),
+            },
+            ModelChoice {
+                harness: Some("grok".into()),
+                id: Some("grok-next".into()),
+                label: "Grok · Grok Next".into(),
+                closed_label: "Grok Next".into(),
+            },
+        ];
         let selected = global_default_picker_selected(&cfg, &choices);
-        assert_eq!(selected.closed_label, "Missing");
-        assert_eq!(selected.label, "Missing");
+        assert!(selected.harness.is_none() && selected.id.is_none());
+        assert_eq!(selected.label, "Follow backend default");
     }
 
     #[test]
@@ -806,29 +813,36 @@ mod tests {
     #[test]
     fn global_picker_shows_catalog_choice_when_set_and_available() {
         let mut cfg = Config::default();
-        cfg.set_global_model_default(Some(ModelRef::new("grok", "grok-4.5")));
-        let choices = vec![ModelChoice {
-            harness: Some("grok".into()),
-            id: Some("grok-4.5".into()),
-            label: "Grok · Grok 4.5".into(),
-            closed_label: "Grok 4.5".into(),
-        }];
+        cfg.set_global_model_default(Some(ModelRef::new("claude-code", "sonnet")));
+        let choices = vec![
+            ModelChoice {
+                harness: None,
+                id: None,
+                label: "Follow backend default".into(),
+                closed_label: "Follow backend default".into(),
+            },
+            ModelChoice {
+                harness: Some("claude-code".into()),
+                id: Some("sonnet".into()),
+                label: "Claude Code · Sonnet".into(),
+                closed_label: "Sonnet".into(),
+            },
+        ];
         let selected = global_default_picker_selected(&cfg, &choices);
-        assert_eq!(selected.closed_label, "Grok 4.5");
-        assert_eq!(selected.id.as_deref(), Some("grok-4.5"));
+        assert_eq!(selected.closed_label, "Sonnet");
+        assert_eq!(selected.id.as_deref(), Some("sonnet"));
     }
 
     #[test]
-    fn reset_reseeds_global_default_from_catalog() {
+    fn reset_leaves_global_default_as_follow_backend() {
         let mut cfg = Config::default();
         cfg.set_global_model_default(Some(ModelRef::new("claude-code", "opus")));
-        // Simulate ResetDefaults body without process catalog dependency:
         cfg = Config::default();
-        let catalog = vec![mi("claude-code", "sonnet"), mi("grok", "grok-4.5")];
-        assert!(agent::seed_global_default_if_unset(&mut cfg, &catalog));
-        assert_eq!(
-            cfg.global_model_default(),
-            Some(&ModelRef::new("grok", "grok-4.5"))
-        );
+        let catalog = vec![mi("claude-code", "sonnet"), mi("grok", "grok-next")];
+        assert!(!duckcore::agent::seed_global_default_if_unset(
+            &mut cfg.default_model,
+            &catalog
+        ));
+        assert!(cfg.global_model_default().is_none());
     }
 }

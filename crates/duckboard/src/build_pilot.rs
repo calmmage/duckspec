@@ -1,7 +1,8 @@
-//! Session build pilot: arm mode, allowlist policy, TurnComplete decisions.
+//! Session build pilot: arm mode, unattended auto-send policy, TurnComplete decisions.
 //!
 //! See `chat/build-pilot`. Classification of `/build-*` submits lives in
-//! `slash_commands`; this module owns armed state and safe auto-send rules.
+//! `slash_commands`; this module owns armed state and auto-send rules (N1 denylist,
+//! R3 recommended promotion).
 
 use crate::meta_card::NextAction;
 use crate::slash_commands::BuildPilotMode;
@@ -17,13 +18,6 @@ pub enum PilotState {
 impl PilotState {
     pub fn is_armed(self) -> bool {
         matches!(self, Self::Armed(_))
-    }
-
-    pub fn mode(self) -> Option<BuildPilotMode> {
-        match self {
-            Self::Off => None,
-            Self::Armed(m) => Some(m),
-        }
     }
 
     /// Quiet composer plaque label when armed (`Build auto` / `Build fast`).
@@ -44,39 +38,131 @@ pub enum PilotDecision {
     Disarm,
 }
 
-/// Allowlisted stage slash names (no leading `/`).
-const STAGE_BOTH: &[&str] = &[
-    "ds-explore",
-    "ds-propose",
-    "ds-design",
-    "ds-spec",
-    "ds-step",
-    "ds-apply",
-    "ds-followup",
-];
+/// Hard-denylisted bare names (no leading `/`). Exact token after trim + slash strip.
+const DENY_BOTH: &[&str] = &["reject", "revise", "ds-archive", "ds-codex", "ds-verify"];
 
-/// True when `send` is safe to auto-submit for `mode`.
+/// Normalized command/token for denylist match: trim, optional leading `/` stripped.
+fn token_name(send: &str) -> &str {
+    send.trim().strip_prefix('/').unwrap_or(send.trim())
+}
+
+/// True when `send` is hard-denylisted for `mode` (never auto-send).
+pub fn is_hard_denylist(mode: BuildPilotMode, send: &str) -> bool {
+    let name = token_name(send);
+    if name.is_empty() {
+        return true;
+    }
+    if DENY_BOTH.contains(&name) {
+        return true;
+    }
+    // Fast mode never auto-sends review.
+    if name == "ds-review" && matches!(mode, BuildPilotMode::Fast) {
+        return true;
+    }
+    false
+}
+
+/// True when `send` may auto-submit for `mode` (N1: anything non-empty not denylisted).
 pub fn is_auto_safe(mode: BuildPilotMode, send: &str) -> bool {
     let token = send.trim();
     if token.is_empty() {
         return false;
     }
-    if token == "confirm" {
-        return true;
+    !is_hard_denylist(mode, token)
+}
+
+/// True when option send/label text is marked recommended.
+pub fn is_recommended_mark(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("(recommended)") || lower.contains("recommended")
+}
+
+/// Pick mid-turn user-choice option for an armed pilot (M1): recommended label
+/// if any, else the first option. `None` when `options` is empty.
+pub fn pick_user_choice_option(options: &[(String, String)]) -> Option<&(String, String)> {
+    if options.is_empty() {
+        return None;
     }
-    let name = token.strip_prefix('/').unwrap_or(token);
-    if name == "ds-review" {
-        return matches!(mode, BuildPilotMode::Auto);
+    options
+        .iter()
+        .find(|(_, label)| is_recommended_mark(label))
+        .or_else(|| options.first())
+}
+
+/// Trailing Recommendation letter (A–C) from assistant prose, if any.
+///
+/// Recognizes lines containing `Recommendation` then `:` then letter, with
+/// optional markdown bold stars (e.g. `Recommendation: **B**`,
+/// `**Recommendation:** B`). Last matching line wins.
+pub fn recommendation_letter(source: &str) -> Option<char> {
+    let mut last: Option<char> = None;
+    for line in source.lines() {
+        let lower = line.to_ascii_lowercase();
+        let Some(idx) = lower.find("recommendation") else {
+            continue;
+        };
+        let after = &line[idx + "recommendation".len()..];
+        let after = after.trim_start_matches(|c: char| c == '*' || c.is_whitespace());
+        let Some(after) = after.strip_prefix(':') else {
+            continue;
+        };
+        let after = after.trim_start_matches(|c: char| c == '*' || c.is_whitespace());
+        if let Some(c) = after.chars().next() {
+            let u = c.to_ascii_uppercase();
+            if matches!(u, 'A' | 'B' | 'C') {
+                last = Some(u);
+            }
+        }
     }
-    if matches!(name, "ds-archive" | "ds-codex" | "ds-verify") {
-        return false;
+    last
+}
+
+/// Leading A–C letter on an option send line (`B — …`, `A - …`).
+fn option_send_letter(send: &str) -> Option<char> {
+    let c = send.trim().chars().next()?;
+    let u = c.to_ascii_uppercase();
+    matches!(u, 'A' | 'B' | 'C').then_some(u)
+}
+
+fn move_index_to_front(out: &mut Vec<NextAction>, i: usize) {
+    if i > 0 {
+        let item = out.remove(i);
+        out.insert(0, item);
     }
-    STAGE_BOTH.contains(&name)
+}
+
+/// Promote a recommended option to rank-1; otherwise keep list order.
+///
+/// 1. Option `send` marked `recommended` / `(recommended)` (first such wins).
+/// 2. Else trailing Recommendation letter in `assistant` matching an option letter.
+///
+/// Single-item and empty lists are returned unchanged.
+pub fn promote_recommended(next: &[NextAction], assistant: Option<&str>) -> Vec<NextAction> {
+    if next.len() < 2 {
+        return next.to_vec();
+    }
+    let mut out = next.to_vec();
+    if let Some(i) = out.iter().position(|a| is_recommended_mark(&a.send)) {
+        move_index_to_front(&mut out, i);
+        return out;
+    }
+    if let Some(letter) = assistant.and_then(recommendation_letter)
+        && let Some(i) = out
+            .iter()
+            .position(|a| option_send_letter(&a.send) == Some(letter))
+    {
+        move_index_to_front(&mut out, i);
+    }
+    out
 }
 
 /// Decide whether to auto-send rank-1 or disarm after a settled turn.
-pub fn decide(mode: BuildPilotMode, next: &[NextAction]) -> PilotDecision {
-    let Some(first) = next.first() else {
+///
+/// Applies recommended promotion (option marks + optional assistant Recommendation
+/// letter), then N1 denylist policy.
+pub fn decide(mode: BuildPilotMode, next: &[NextAction], assistant: Option<&str>) -> PilotDecision {
+    let ordered = promote_recommended(next, assistant);
+    let Some(first) = ordered.first() else {
         return PilotDecision::Disarm;
     };
     let send = first.send.trim();
@@ -88,11 +174,17 @@ pub fn decide(mode: BuildPilotMode, next: &[NextAction]) -> PilotDecision {
 }
 
 /// Apply decide to mutable pilot state; returns text to send, if any.
-pub fn maybe_auto_send(pilot: &mut PilotState, next: &[NextAction]) -> Option<String> {
+///
+/// `assistant` is the last non-priming assistant text (for Recommendation letter).
+pub fn maybe_auto_send(
+    pilot: &mut PilotState,
+    next: &[NextAction],
+    assistant: Option<&str>,
+) -> Option<String> {
     let PilotState::Armed(mode) = *pilot else {
         return None;
     };
-    match decide(mode, next) {
+    match decide(mode, next, assistant) {
         PilotDecision::AutoSend(text) => Some(text),
         PilotDecision::Disarm => {
             *pilot = PilotState::Off;
@@ -125,7 +217,8 @@ pub fn kick_text(kick_head: Option<&str>, args: &str) -> Option<String> {
 /// scope), leave pilot unchanged and return `None`.
 ///
 /// Product path arms only after send commits (`run_build_pilot_submit`); this
-/// helper remains for pure kick+arm policy tests.
+/// helper is for pure kick+arm policy unit tests.
+#[cfg(test)]
 pub fn try_arm_build_pilot(
     pilot: &mut PilotState,
     kick_head: Option<&str>,
@@ -155,6 +248,12 @@ mod tests {
     }
 
     #[test]
+    fn freeform_decision_safe_both_modes() {
+        assert!(is_auto_safe(BuildPilotMode::Auto, "confirm proposal"));
+        assert!(is_auto_safe(BuildPilotMode::Fast, "confirm proposal"));
+    }
+
+    #[test]
     fn review_only_auto() {
         assert!(is_auto_safe(BuildPilotMode::Auto, "/ds-review"));
         assert!(!is_auto_safe(BuildPilotMode::Fast, "/ds-review"));
@@ -169,7 +268,7 @@ mod tests {
     #[test]
     fn decide_disarms_on_empty() {
         assert_eq!(
-            decide(BuildPilotMode::Auto, &[]),
+            decide(BuildPilotMode::Auto, &[], None),
             PilotDecision::Disarm
         );
     }
@@ -201,7 +300,7 @@ mod tests {
     #[test]
     fn decide_autosends_allowlisted() {
         assert_eq!(
-            decide(BuildPilotMode::Auto, &[na("/ds-spec")]),
+            decide(BuildPilotMode::Auto, &[na("/ds-spec")], None),
             PilotDecision::AutoSend("/ds-spec".into())
         );
     }
@@ -283,76 +382,151 @@ mod tests {
         assert_eq!(pilot, PilotState::Off);
     }
 
-    /// @spec chat/build-pilot Safe auto-send: Rank-1 confirm auto-sends while armed
+    /// @spec chat/build-pilot Unattended auto-send: Rank-1 confirm auto-sends while armed
     #[test]
     fn rank1_confirm_auto_sends_while_armed() {
         let mut pilot = PilotState::Armed(BuildPilotMode::Auto);
         let next = [na("confirm")];
         // WHEN that non-priming agent turn completes
-        let send = maybe_auto_send(&mut pilot, &next);
+        let send = maybe_auto_send(&mut pilot, &next, None);
         // THEN a new agent turn prompt is `confirm` AND pilot remains armed
         assert_eq!(send.as_deref(), Some("confirm"));
         assert_eq!(pilot, PilotState::Armed(BuildPilotMode::Auto));
     }
 
-    /// @spec chat/build-pilot Safe auto-send: Rank-1 allowlisted stage slash auto-sends in auto mode
+    /// @spec chat/build-pilot Unattended auto-send: Rank-1 allowlisted stage slash auto-sends in auto mode
     #[test]
     fn rank1_allowlisted_stage_slash_auto_sends_in_auto_mode() {
         let mut pilot = PilotState::Armed(BuildPilotMode::Auto);
         let next = [na("/ds-spec")];
-        let send = maybe_auto_send(&mut pilot, &next);
+        let send = maybe_auto_send(&mut pilot, &next, None);
         assert_eq!(send.as_deref(), Some("/ds-spec"));
         assert!(pilot.is_armed());
     }
 
-    /// @spec chat/build-pilot Safe auto-send: Rank-1 ds-review auto-sends only in auto mode
+    /// @spec chat/build-pilot Unattended auto-send: Rank-1 ds-review auto-sends only in auto mode
     #[test]
     fn rank1_ds_review_auto_sends_only_in_auto_mode() {
         let mut pilot = PilotState::Armed(BuildPilotMode::Auto);
         let next = [na("/ds-review")];
-        let send = maybe_auto_send(&mut pilot, &next);
+        let send = maybe_auto_send(&mut pilot, &next, None);
         assert_eq!(send.as_deref(), Some("/ds-review"));
         assert!(pilot.is_armed());
     }
 
-    /// @spec chat/build-pilot Safe auto-send: Rank-1 ds-review disarms in fast mode without sending
+    /// @spec chat/build-pilot Unattended auto-send: Rank-1 ds-review disarms in fast mode without sending
     #[test]
     fn rank1_ds_review_disarms_in_fast_mode_without_sending() {
         let mut pilot = PilotState::Armed(BuildPilotMode::Fast);
         let next = [na("/ds-review")];
-        let send = maybe_auto_send(&mut pilot, &next);
+        let send = maybe_auto_send(&mut pilot, &next, None);
         assert!(send.is_none());
         assert_eq!(pilot, PilotState::Off);
     }
 
-    /// @spec chat/build-pilot Safe auto-send: Rank-1 archive codex or verify disarms without sending
+    /// @spec chat/build-pilot Unattended auto-send: Rank-1 archive codex or verify disarms without sending
     #[test]
     fn rank1_archive_codex_or_verify_disarms_without_sending() {
         let mut pilot = PilotState::Armed(BuildPilotMode::Auto);
         let next = [na("/ds-archive")];
-        let send = maybe_auto_send(&mut pilot, &next);
+        let send = maybe_auto_send(&mut pilot, &next, None);
         assert!(send.is_none());
         assert_eq!(pilot, PilotState::Off);
     }
 
-    /// @spec chat/build-pilot Safe auto-send: Missing or unsafe rank-1 disarms without sending
+    /// @spec chat/build-pilot Unattended auto-send: Missing rank-1 disarms without sending
     #[test]
-    fn missing_or_unsafe_rank1_disarms_without_sending() {
+    fn missing_rank1_disarms_without_sending() {
         let mut pilot = PilotState::Armed(BuildPilotMode::Auto);
-        let send = maybe_auto_send(&mut pilot, &[]);
+        let send = maybe_auto_send(&mut pilot, &[], None);
         assert!(send.is_none());
         assert_eq!(pilot, PilotState::Off);
+    }
+
+    /// @spec chat/build-pilot Unattended auto-send: Rank-1 freeform decision token auto-sends while armed
+    #[test]
+    fn rank1_freeform_decision_token_auto_sends_while_armed() {
+        let mut pilot = PilotState::Armed(BuildPilotMode::Auto);
+        let next = [na("confirm proposal")];
+        let send = maybe_auto_send(&mut pilot, &next, None);
+        assert_eq!(send.as_deref(), Some("confirm proposal"));
+        assert_eq!(pilot, PilotState::Armed(BuildPilotMode::Auto));
+    }
+
+    /// @spec chat/build-pilot Unattended auto-send: Rank-1 prose option line auto-sends while armed
+    #[test]
+    fn rank1_prose_option_line_auto_sends_while_armed() {
+        let mut pilot = PilotState::Armed(BuildPilotMode::Auto);
+        let next = [na("A — harness-scoped resume")];
+        let send = maybe_auto_send(&mut pilot, &next, None);
+        assert_eq!(send.as_deref(), Some("A — harness-scoped resume"));
+        assert!(pilot.is_armed());
+    }
+
+    /// @spec chat/build-pilot Unattended auto-send: Recommended option is auto-sent over earlier non-recommended
+    #[test]
+    fn recommended_option_is_auto_sent_over_earlier_non_recommended() {
+        // GIVEN options A then B with B marked recommended
+        let mut pilot = PilotState::Armed(BuildPilotMode::Auto);
+        let next = [na("A — first path"), na("B — second path (recommended)")];
+        // WHEN that non-priming agent turn completes
+        let send = maybe_auto_send(&mut pilot, &next, None);
+        // THEN the recommended option B is sent
+        assert_eq!(send.as_deref(), Some("B — second path (recommended)"));
+        assert!(pilot.is_armed());
+
+        // Letter-only: options lack the word recommended; trailing Recommendation: B
+        let mut pilot = PilotState::Armed(BuildPilotMode::Auto);
+        let next = [na("A — first path"), na("B — second path")];
+        let assistant = "\
+Pick:
+
+- **A** — first path
+- **B** — second path
+
+**Recommendation:** **B**
+";
+        let send = maybe_auto_send(&mut pilot, &next, Some(assistant));
+        assert_eq!(send.as_deref(), Some("B — second path"));
+        assert!(pilot.is_armed());
+    }
+
+    #[test]
+    fn recommendation_letter_parses_common_shapes() {
+        assert_eq!(recommendation_letter("Recommendation: **B**\n"), Some('B'));
+        assert_eq!(recommendation_letter("**Recommendation:** A\n"), Some('A'));
+        assert_eq!(
+            recommendation_letter("some text\nRecommendation: C\n"),
+            Some('C')
+        );
+        assert_eq!(recommendation_letter("no rec here"), None);
+    }
+
+    #[test]
+    fn pick_user_choice_prefers_recommended_then_first() {
+        let opts = [
+            ("a".into(), "Alpha".into()),
+            ("b".into(), "Beta (recommended)".into()),
+        ];
+        let picked = pick_user_choice_option(&opts).expect("pick");
+        assert_eq!(picked.0, "b");
+
+        let no_mark = [("a".into(), "Alpha".into()), ("b".into(), "Beta".into())];
+        let first = pick_user_choice_option(&no_mark).expect("pick");
+        assert_eq!(first.0, "a");
+
+        assert!(pick_user_choice_option(&[]).is_none());
     }
 
     /// @spec chat/build-pilot Disarm controls: Disarm stays off until build command relaunch
     #[test]
     fn disarm_stays_off_until_build_command_relaunch() {
-        // GIVEN a session whose pilot was disarmed after an unsafe next action
+        // GIVEN a session whose pilot was disarmed after a missing next action
         let mut pilot = PilotState::Armed(BuildPilotMode::Auto);
-        let _ = maybe_auto_send(&mut pilot, &[]);
+        let _ = maybe_auto_send(&mut pilot, &[], None);
         assert_eq!(pilot, PilotState::Off);
         // WHEN an ordinary non-build turn completes with a would-be-safe next
-        let send = maybe_auto_send(&mut pilot, &[na("confirm")]);
+        let send = maybe_auto_send(&mut pilot, &[na("confirm")], None);
         // THEN pilot remains disarmed (no auto-send without re-launch)
         assert!(send.is_none());
         assert_eq!(pilot, PilotState::Off);

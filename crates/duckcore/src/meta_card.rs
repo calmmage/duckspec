@@ -92,15 +92,16 @@ pub fn meta_card_line_flags(source: &str) -> Vec<bool> {
     flags
 }
 
-/// Trailing `next` card actions only (cap [`MAX_NEXT_ACTIONS`]).
+/// Actions from the **last** `next` meta card in `source` (cap [`MAX_NEXT_ACTIONS`]).
+///
+/// The card need not be the final non-empty content — agents often put a short
+/// footer after the card. Earlier `next` cards are ignored when a later one
+/// exists. Name kept as `trailing_next_actions` for callers/specs; semantics are
+/// last-next, not end-of-message-only.
 pub fn trailing_next_actions(source: &str) -> Vec<NextAction> {
     let lines: Vec<&str> = source.lines().collect();
     let cards = parse_meta_cards(source);
-    let Some(card) = cards
-        .iter()
-        .rev()
-        .find(|c| c.kind == MetaCardKind::Next && is_trailing_card(c, &lines))
-    else {
+    let Some(card) = cards.iter().rev().find(|c| c.kind == MetaCardKind::Next) else {
         return Vec::new();
     };
 
@@ -120,14 +121,6 @@ pub fn trailing_next_actions(source: &str) -> Vec<NextAction> {
         }
     }
     actions
-}
-
-fn is_trailing_card(card: &MetaCard, lines: &[&str]) -> bool {
-    let last_non_empty = lines.iter().rposition(|l| !l.trim().is_empty());
-    match last_non_empty {
-        None => false,
-        Some(idx) => card.line_end >= idx,
-    }
 }
 
 fn card_kind_for_run(run_lines: &[&str]) -> Option<MetaCardKind> {
@@ -283,21 +276,48 @@ Some prose.
         );
     }
 
-    // @spec chat/meta-cards Trailing next actions: Non-trailing next card yields no actions
+    // @spec chat/meta-cards Trailing next actions: Last next card yields actions with prose after
     #[test]
-    fn non_trailing_next_card_yields_no_actions() {
-        // GIVEN a next card followed by non-blank non-blockquote content
+    fn last_next_card_yields_actions_with_prose_after() {
+        // GIVEN a next card followed by non-blank non-blockquote footer (common agent pattern)
         let src = "\
 > **next**
 >
-> `confirm`  write this
+> `confirm design`
+> `reject design`
 
-More prose after the card.
+---
+
+Send **`confirm design`** and I'll write `design.md`.
 ";
         // WHEN trailing next actions are extracted
         let actions = trailing_next_actions(src);
-        // THEN the action list is empty
-        assert!(actions.is_empty());
+        // THEN the last next card still supplies actions (not end-of-message-only)
+        assert_eq!(
+            actions.iter().map(|a| a.send.as_str()).collect::<Vec<_>>(),
+            vec!["confirm design", "reject design"]
+        );
+    }
+
+    // @spec chat/meta-cards Trailing next actions: Later next card wins over an earlier one
+    #[test]
+    fn later_next_card_wins_over_an_earlier_one() {
+        let src = "\
+> **next**
+>
+> `old-token`
+
+Body.
+
+> **next**
+>
+> `confirm design`
+";
+        let actions = trailing_next_actions(src);
+        assert_eq!(
+            actions.iter().map(|a| a.send.as_str()).collect::<Vec<_>>(),
+            vec!["confirm design"]
+        );
     }
 
     // @spec chat/meta-cards Trailing next actions: Actions capped at three in source order

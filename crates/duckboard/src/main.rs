@@ -15,25 +15,25 @@ mod build_pilot;
 mod chat_store;
 #[cfg(test)]
 mod chat_store_integration_tests;
-mod inputs_ledger;
 pub mod config;
-mod focus_answer;
 mod dashboard_digest;
 mod data;
 mod default_prompts;
 mod fast_response;
+mod focus_answer;
 pub mod highlight;
 mod idea_format;
 mod idea_store;
+mod inputs_ledger;
 mod keybinds;
-mod queue_list;
 mod meta_card;
 mod path_env;
 mod path_link;
+mod queue_list;
 mod scope;
 mod self_version;
-mod source_fingerprint;
 mod slash_commands;
+mod source_fingerprint;
 mod theme;
 mod title_hints;
 mod vcs;
@@ -512,21 +512,16 @@ enum Message {
 /// the next send. `Config` lives here on the global state; the interaction
 /// layer reads the stamped values off `AgentSession`.
 ///
-/// Also re-seeds an unset global default when the process catalog has models
-/// (e.g. after Reset cleared config and ModelCatalogReady already fired).
+/// Stamps each session with the project override and the resolved global
+/// default (follow-backend when unset or still the former built-in).
 fn refresh_model_defaults(state: &mut State) {
     let catalog = agent::available_models();
-    if agent::seed_global_default_if_unset(&mut state.config, &catalog)
-        && let Err(e) = config::save(&state.config)
-    {
-        tracing::warn!("failed to persist re-seeded global default model: {e}");
-    }
     let project = state
         .project
         .project_root
         .as_deref()
         .and_then(|root| state.config.project_model_default(root));
-    let global = state.config.default_model.clone();
+    let global = agent::resolve_global_default(state.config.default_model.as_ref(), &catalog);
     for ix in state.interactions.values_mut() {
         for ax in ix.sessions.iter_mut() {
             ax.project_model_default = project.clone();
@@ -573,13 +568,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             // Catalog was filled on a background task; this message forces a
             // re-render and subscription rebuild so model/oneshot pickers and
             // worker oneshot preferred ids re-resolve from the live catalog.
-            // Seed a concrete global default once when still unset.
             let catalog = agent::available_models();
-            if agent::seed_global_default_if_unset(&mut state.config, &catalog)
-                && let Err(e) = config::save(&state.config)
-            {
-                tracing::warn!("failed to persist seeded global default model: {e}");
-            }
             tracing::info!(models = catalog.len(), "model catalog ready");
             return Task::none();
         }
@@ -1120,7 +1109,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         state.window_width,
                         state.config.vcs.workflow,
                         state.config.chat.effective_viewer_style(),
-                        );
+                    );
                     // Scroll: open/switch → snap-to-latest in
                     // `update_with_scroll_preservation`.
                     return Task::none();
@@ -1138,7 +1127,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         state.window_width,
                         state.config.vcs.workflow,
                         state.config.chat.effective_viewer_style(),
-                        );
+                    );
                     // Scroll: open/switch → snap-to-latest in wrapper.
                     return focus_chat_input();
                 }
@@ -1161,7 +1150,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         state.window_width,
                         state.config.vcs.workflow,
                         state.config.chat.effective_viewer_style(),
-                        );
+                    );
                     return restore_chat_scroll(state);
                 }
                 area::dashboard::Message::HoverRecent(path) => {
@@ -1189,8 +1178,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     state.dashboard.expanded_changes = !state.dashboard.expanded_changes;
                 }
                 area::dashboard::Message::ToggleExpandExplorations => {
-                    state.dashboard.expanded_explorations =
-                        !state.dashboard.expanded_explorations;
+                    state.dashboard.expanded_explorations = !state.dashboard.expanded_explorations;
                 }
                 area::dashboard::Message::ToggleArchivedOpen => {
                     state.dashboard.archived_open = !state.dashboard.archived_open;
@@ -1210,8 +1198,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     let project_root = state.project.project_root.as_deref();
                     let target = match &key {
                         idea_store::QueueLinkKey::Exploration(id) => {
-                            let Some(exp) =
-                                state.change.explorations.iter().find(|e| e.id == *id)
+                            let Some(exp) = state.change.explorations.iter().find(|e| e.id == *id)
                             else {
                                 return Task::none();
                             };
@@ -1220,9 +1207,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                                 display_name: exp.display_name.clone(),
                             }
                         }
-                        idea_store::QueueLinkKey::Change(name) => idea_store::MintTarget::Change {
-                            name: name.clone(),
-                        },
+                        idea_store::QueueLinkKey::Change(name) => {
+                            idea_store::MintTarget::Change { name: name.clone() }
+                        }
                     };
                     match idea_store::cycle_mark_for_target(
                         &mut state.ideas.ideas,
@@ -1235,11 +1222,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                                     idea_store::idea_for_exploration(&state.ideas.ideas, id)
                                         .map(|i| i.abs_path.display().to_string())
                                 {
-                                    if let Some(exp) = state
-                                        .change
-                                        .explorations
-                                        .iter_mut()
-                                        .find(|e| e.id == *id)
+                                    if let Some(exp) =
+                                        state.change.explorations.iter_mut().find(|e| e.id == *id)
                                     {
                                         exp.idea_path = Some(path);
                                         crate::chat_store::save_explorations(
@@ -1298,8 +1282,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                             .project_root
                             .as_deref()
                             .unwrap_or(root.as_path());
-                        let abs =
-                            worktree::resolve_under_work_root(&root, main, Path::new(rel));
+                        let abs = worktree::resolve_under_work_root(&root, main, Path::new(rel));
                         return open_path_in_tab(state, abs, None);
                     }
                 }
@@ -1316,8 +1299,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                             state.config.chat.agent_input_hints,
                             state.window_width,
                             state.config.vcs.workflow,
-                        state.config.chat.effective_viewer_style(),
-                            );
+                            state.config.chat.effective_viewer_style(),
+                        );
                         // Scroll: open/switch → snap-to-latest in wrapper.
                         return Task::none();
                     }
@@ -1334,6 +1317,15 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 }
                 area::change::Message::RefreshExplorationTitle(exp_id) => {
                     return start_exploration_title_refresh(state, &exp_id);
+                }
+                area::change::Message::LinkExplorationToChange {
+                    exploration_id,
+                    target,
+                } => {
+                    if manual_link_exploration(state, &exploration_id, &target) {
+                        refresh_changed_files(state);
+                    }
+                    return Task::none();
                 }
                 area::change::Message::CyclePlacement(scope_key) => {
                     return cycle_scope_placement(state, &scope_key);
@@ -1357,21 +1349,18 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         || is_chat_focus_msg(extract_change_interaction_msg(&msg));
                     // Second click on a selected exploration, or the pencil
                     // control, opens rename — focus the inline field after.
-                    let focus_rename = matches!(
-                        &msg,
-                        area::change::Message::SelectChange(name)
-                            if state.change.selected_change.as_deref() == Some(name.as_str())
-                                && state
-                                    .change
-                                    .explorations
-                                    .iter()
-                                    .any(|e| e.id == *name)
-                    ) || matches!(
-                        &msg,
-                        area::change::Message::StartRenameExploration(_)
-                    );
-                    let selected_scope =
-                        matches!(&msg, area::change::Message::SelectChange(_));
+                    let focus_rename =
+                        matches!(
+                            &msg,
+                            area::change::Message::SelectChange(name)
+                                if state.change.selected_change.as_deref() == Some(name.as_str())
+                                    && state
+                                        .change
+                                        .explorations
+                                        .iter()
+                                        .any(|e| e.id == *name)
+                        ) || matches!(&msg, area::change::Message::StartRenameExploration(_));
+                    let selected_scope = matches!(&msg, area::change::Message::SelectChange(_));
                     area::change::update(
                         &mut state.change,
                         &mut state.tabs,
@@ -1383,7 +1372,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         state.window_width,
                         state.config.vcs.workflow,
                         state.config.chat.effective_viewer_style(),
-                        );
+                    );
                     if selected_scope {
                         // Rebind Changed files / activate placement for the new focus.
                         refresh_changed_files(state);
@@ -1433,8 +1422,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.config.chat.agent_input_hints,
                 state.window_width,
                 state.config.vcs.workflow,
-                        state.config.chat.effective_viewer_style(),
-                );
+                state.config.chat.effective_viewer_style(),
+            );
             if needs_focus {
                 return focus_chat_input();
             }
@@ -1456,8 +1445,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.config.chat.agent_input_hints,
                 state.window_width,
                 state.config.vcs.workflow,
-                        state.config.chat.effective_viewer_style(),
-                );
+                state.config.chat.effective_viewer_style(),
+            );
             if needs_focus {
                 return focus_chat_input();
             }
@@ -1470,11 +1459,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     let next = idea_store::cycle_mark(idea.frontmatter.mark);
                     idea_store::apply_mark(&mut idea.frontmatter, next, now);
                     let body = idea_store::read_body(&idea.abs_path).unwrap_or_default();
-                    if let Err(e) = idea_store::save_idea(
-                        idea,
-                        &body,
-                        state.project.project_root.as_deref(),
-                    ) {
+                    if let Err(e) =
+                        idea_store::save_idea(idea, &body, state.project.project_root.as_deref())
+                    {
                         tracing::warn!("failed to save idea after mark cycle: {e}");
                     }
                 }
@@ -1570,8 +1557,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     state.config.chat.agent_input_hints,
                     state.window_width,
                     state.config.vcs.workflow,
-                        state.config.chat.effective_viewer_style(),
-                    );
+                    state.config.chat.effective_viewer_style(),
+                );
                 // SelectIdea spawns the exploration session with
                 // empty chrome; refresh so the chat input renders lifecycle
                 // chrome (mirrors ideas.rs).
@@ -1619,8 +1606,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     state.config.chat.agent_input_hints,
                     state.window_width,
                     state.config.vcs.workflow,
-                        state.config.chat.effective_viewer_style(),
-                    );
+                    state.config.chat.effective_viewer_style(),
+                );
                 // Scroll: open/switch → snap-to-latest in wrapper.
                 return Task::none();
             }
@@ -1651,8 +1638,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.config.chat.agent_input_hints,
                 state.window_width,
                 state.config.vcs.workflow,
-                        state.config.chat.effective_viewer_style(),
-                );
+                state.config.chat.effective_viewer_style(),
+            );
             if focus_tag_input {
                 return iced::widget::operation::focus(area::ideas::TAG_INPUT_ID);
             }
@@ -1837,9 +1824,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             // `(handle, assistant, user, gen)` — freeform oneshot, no heuristic/cmds.
             type ReplyTaskInput = (duckchat::AgentHandle, String, Option<String>, u64);
             let mut reply_task_input: Option<ReplyTaskInput> = None;
-            // Staged `(folder-slug, exploration-id)` from a `ds create change`
+            // Staged `(folder-name, exploration-id)` from a `ds create change`
             // tool call, committed to `pending_bindings` once the `ax` borrow
-            // below is released.
+            // below is released. Folder name matches the CLI argument verbatim.
             let mut staged_binding: Option<(String, String)> = None;
             // Build-pilot auto-send text after a non-priming TurnComplete when
             // rank-1 next is safe for the armed mode (disarm leaves this None).
@@ -1929,9 +1916,9 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         // Match on the command string, not the tool name —
                         // Claude uses "Bash", grok uses "run_terminal_command".
                         if ax.scope_kind == scope::ScopeKind::Exploration
-                            && let Some(slug) = parse_create_change(&input)
+                            && let Some(folder) = parse_create_change(&input)
                         {
-                            staged_binding = Some((slug, ax.session.scope.clone()));
+                            staged_binding = Some((folder, ax.session.scope.clone()));
                         }
                         interaction::flush_all_pending(&mut ax.session);
                         interaction::reset_answer_thrash(&mut ax.session);
@@ -2012,9 +1999,12 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         // fully disarm. Skip priming turns and user-cancelled
                         // completions (follow-up is the user's kick / stop).
                         if !was_priming && !was_cancel {
+                            let assistant = default_prompts::last_assistant_and_user(&ax.session)
+                                .map(|(a, _)| a);
                             pending_pilot_send = crate::build_pilot::maybe_auto_send(
                                 &mut ax.pilot,
                                 &ax.next_actions,
+                                assistant.as_deref(),
                             );
                         }
                         if !ax.mark_driven_and_persist(proj_root.as_deref()) {
@@ -2152,8 +2142,8 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     }
                 }
             }
-            if let Some((slug, exploration_id)) = staged_binding {
-                state.change.pending_bindings.insert(slug, exploration_id);
+            if let Some((folder, exploration_id)) = staged_binding {
+                state.change.pending_bindings.insert(folder, exploration_id);
             }
             let State {
                 interactions,
@@ -2211,11 +2201,10 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                         if !text.trim().is_empty() {
                             interaction::send_prompt_text(ax, text, highlighter);
                         }
-                    } else if ax.agent_handle.is_some()
-                        && let Some(text) = pending_pilot_send.take()
-                    {
-                        // Pilot hop: confirm / allowlisted /ds-* as a normal user turn.
-                        interaction::send_prompt_text(ax, text, highlighter);
+                    } else if let Some(text) = pending_pilot_send.take() {
+                        // Pilot hop: freeform rank-1 / stage token as a normal user turn.
+                        // Failed start (no handle, blocked model, …) disarms + notices.
+                        interaction::dispatch_pilot_auto_send(ax, text, highlighter);
                     }
                 }
             }
@@ -2431,11 +2420,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                 state.list_column_width = max_list.max(widget::list_resize::MIN_LIST_WIDTH);
             }
             for ix in state.interactions.values_mut() {
-                interaction::rebalance_uncustomized_for(
-                    ix,
-                    size.width,
-                    state.list_column_width,
-                );
+                interaction::rebalance_uncustomized_for(ix, size.width, state.list_column_width);
             }
         }
         Message::ListColumnWidth(w) => {
@@ -2876,6 +2861,7 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
 
             // ⌘↑/↓/←/→ chat landmarks — after modal handlers so open modals
             // keep arrow ownership. Bare arrows still go to the composer.
+            // Cmd+←/→ yield while the chat input is focused so line ends work.
             if mods.command()
                 && !mods.shift()
                 && !mods.alt()
@@ -2883,13 +2869,18 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
             {
                 use keybinds::ChatLandmarkAction;
                 use keyboard::key::Named;
+                let horizontal = keybinds::keybind_chat_landmark_horizontal(state);
                 let action = match &key {
                     keyboard::Key::Named(Named::ArrowUp) => Some(ChatLandmarkAction::HistoryTop),
                     keyboard::Key::Named(Named::ArrowDown) => {
                         Some(ChatLandmarkAction::HistoryBottom)
                     }
-                    keyboard::Key::Named(Named::ArrowLeft) => Some(ChatLandmarkAction::PrevAnswer),
-                    keyboard::Key::Named(Named::ArrowRight) => Some(ChatLandmarkAction::NextAnswer),
+                    keyboard::Key::Named(Named::ArrowLeft) if horizontal => {
+                        Some(ChatLandmarkAction::PrevAnswer)
+                    }
+                    keyboard::Key::Named(Named::ArrowRight) if horizontal => {
+                        Some(ChatLandmarkAction::NextAnswer)
+                    }
                     _ => None,
                 };
                 if let Some(action) = action {
@@ -2994,10 +2985,13 @@ fn update(state: &mut State, message: Message) -> Task<Message> {
                     match interaction::handle_agent_chat_key(ix, &key, mods, agent_input_hints) {
                         interaction::AgentChatKeyResult::Handled => return Task::none(),
                         interaction::AgentChatKeyResult::Dispatch(msg) => {
-                            // Tab-cycling defaults should leave the caret in the
-                            // chat input so Enter still works without a re-click.
-                            let refocus =
-                                matches!(&msg, widget::agent_chat::Msg::CycleNextAction(_));
+                            // Cycle/fill should leave the caret in the chat
+                            // input so Enter still works without a re-click.
+                            let refocus = matches!(
+                                &msg,
+                                widget::agent_chat::Msg::CycleNextAction(_)
+                                    | widget::agent_chat::Msg::FillNextAction
+                            );
                             let dispatch = dispatch_interaction_msg(
                                 state,
                                 routing_key,
@@ -3481,7 +3475,7 @@ fn update_with_scroll_preservation(state: &mut State, message: Message) -> Task<
     // scroll-to-match.
     if state.chat_scroll_overridden {
         state.chat_scroll_overridden = false;
-        return Task::batch([task, maybe_measure_chrome_pad(state)]);
+        return Task::batch([task, maybe_measure_chat_chrome(state)]);
     }
     // A chat-fold drag accumulated a deliberate scroll this tick. Issue it and
     // skip the snapshot replay — replaying the pre-update offset would undo the
@@ -3490,7 +3484,7 @@ fn update_with_scroll_preservation(state: &mut State, message: Message) -> Task<
         return Task::batch([
             task,
             take_pending_chat_autoscroll(state),
-            maybe_measure_chrome_pad(state),
+            maybe_measure_chat_chrome(state),
         ]);
     }
     let id_after = active_chat_identity(state);
@@ -3505,14 +3499,21 @@ fn update_with_scroll_preservation(state: &mut State, message: Message) -> Task<
         ChatScrollPolicy::Restore => Task::batch([task, restore_chat_scroll(state)]),
     };
     // After layout-affecting updates, measure scroll bounds so the bottom-pin
-    // pad works when content still fits the viewport (no on_scroll from iced).
-    // Skip re-measure on ChromeLayout itself to avoid a tight loop; one more
-    // measure is scheduled only when pad actually changes (handled there).
+    // pad works when content still fits the viewport (no on_scroll from iced),
+    // and refresh sticky last-user content top when invalidated.
+    // Skip re-measure on layout measure messages themselves to avoid a loop.
     if is_chrome_layout {
         task
     } else {
-        Task::batch([task, maybe_measure_chrome_pad(state)])
+        Task::batch([task, maybe_measure_chat_chrome(state)])
     }
+}
+
+fn maybe_measure_chat_chrome(state: &State) -> Task<Message> {
+    Task::batch([
+        maybe_measure_chrome_pad(state),
+        maybe_measure_sticky_last_user(state),
+    ])
 }
 
 fn is_chrome_layout_message(msg: &Message) -> bool {
@@ -3520,6 +3521,7 @@ fn is_chrome_layout_message(msg: &Message) -> bool {
         matches!(
             im,
             interaction::Msg::AgentChat(widget::agent_chat::Msg::ChromeLayout { .. })
+                | interaction::Msg::AgentChat(widget::agent_chat::Msg::StickyLastUserLayout { .. })
         )
     }
     match msg {
@@ -3558,6 +3560,41 @@ fn maybe_measure_chrome_pad(state: &State) -> Task<Message> {
         let im = interaction::Msg::AgentChat(widget::agent_chat::Msg::ChromeLayout {
             viewport_h,
             content_h,
+        });
+        match area {
+            Area::Change => Message::Change(area::change::Message::Interaction(im)),
+            Area::Caps => Message::Caps(area::caps::Message::Interaction(im)),
+            Area::Codex => Message::Codex(area::codex::Message::Interaction(im)),
+            Area::Ideas => Message::Ideas(area::ideas::Message::Interaction(im)),
+            Area::Dashboard | Area::Settings => Message::Interaction(im),
+        }
+    })
+}
+
+/// Schedule a layout measure of the last non-priming User block content top
+/// for sticky last-user visibility. Runs when the cache is empty (after clear)
+/// or when rematerialize requested a refresh without clear
+/// (`sticky_last_user_remeasure`).
+fn maybe_measure_sticky_last_user(state: &State) -> Task<Message> {
+    let Some(scope) = state.active_scope() else {
+        return Task::none();
+    };
+    let Some(ix) = state.interactions.get(&scope) else {
+        return Task::none();
+    };
+    let Some(ax) = ix.active() else {
+        return Task::none();
+    };
+    if ax.sticky_last_user_content_top.is_some() && !ax.sticky_last_user_remeasure {
+        return Task::none();
+    }
+    let Some(block_idx) = widget::agent_chat::last_non_priming_user_idx(&ax.chat_blocks) else {
+        return Task::none();
+    };
+    let area = state.active_area;
+    widget::agent_chat::measure_block_content_top(block_idx).map(move |content_top| {
+        let im = interaction::Msg::AgentChat(widget::agent_chat::Msg::StickyLastUserLayout {
+            content_top,
         });
         match area {
             Area::Change => Message::Change(area::change::Message::Interaction(im)),
@@ -3633,7 +3670,10 @@ fn dispatch_list_digit(state: &mut State, n: u8) -> Task<Message> {
             if state.ideas.selected.as_ref() == Some(&path) {
                 return Task::none();
             }
-            update(state, Message::Ideas(area::ideas::Message::SelectIdea(path)))
+            update(
+                state,
+                Message::Ideas(area::ideas::Message::SelectIdea(path)),
+            )
         }
         None => Task::none(),
     }
@@ -3908,6 +3948,7 @@ fn is_chat_focus_msg(msg: Option<&interaction::Msg>) -> bool {
                     ChatMsg::SendPressed
                         | ChatMsg::ActivateFastResponse(_)
                         | ChatMsg::CycleNextAction(_)
+                        | ChatMsg::FillNextAction
                 )
         )
     )
@@ -4027,16 +4068,16 @@ fn rehighlight_all(state: &mut State) -> Task<Message> {
     Task::batch(tasks)
 }
 
-/// Parse a `ToolUse` event into the change-folder slug it will create, or
+/// Parse a `ToolUse` event into the change-folder name it will create, or
 /// `None` when the call is not a shell command running `ds create change`.
 ///
 /// Attribution is content-first: any tool whose JSON input carries a
 /// `command` string is eligible — Claude's `"Bash"` and grok's
 /// `"run_terminal_command"` share that shape. The tool name is ignored so a
 /// new harness does not silently drop bindings. The extracted argument is
-/// slugified with the shared rule so the result equals the directory the CLI
-/// creates. Anything unrecognized yields `None`, which declines to bind
-/// rather than risk mis-attributing.
+/// kept verbatim so the binding key equals the directory `ds create change`
+/// creates (`changes/{name}` — not slugified). Anything unrecognized yields
+/// `None`, which declines to bind rather than risk mis-attributing.
 fn parse_create_change(input: &str) -> Option<String> {
     let command = serde_json::from_str::<serde_json::Value>(input)
         .ok()?
@@ -4044,8 +4085,7 @@ fn parse_create_change(input: &str) -> Option<String> {
         .as_str()?
         .to_string();
     let arg = extract_create_change_arg(&command)?;
-    let slug = duckpond::slug::slugify(&arg);
-    (!slug.is_empty()).then_some(slug)
+    (!arg.is_empty()).then_some(arg)
 }
 
 /// Locate a `ds create change` invocation in a shell command line and return
@@ -4108,12 +4148,7 @@ fn route_promotion(state: &mut State, exp_id: &str, new_name: &str) {
     }
     // Carry worktree placement / sidecar binding onto the change scope.
     if let Some(root) = root.as_ref() {
-        worktree::transfer_scope_binding(
-            &mut state.worktree_bindings,
-            exp_id,
-            new_name,
-            root,
-        );
+        worktree::transfer_scope_binding(&mut state.worktree_bindings, exp_id, new_name, root);
     }
 }
 
@@ -4126,8 +4161,7 @@ fn cycle_scope_placement(state: &mut State, scope_key: &str) -> Task<Message> {
     let Some(root) = state.project.project_root.clone() else {
         return Task::none();
     };
-    let current =
-        worktree::effective_placement(&state.worktree_bindings, scope_key, workflow);
+    let current = worktree::effective_placement(&state.worktree_bindings, scope_key, workflow);
     let next = worktree::cycle_placement(current);
     worktree::set_placement(&mut state.worktree_bindings, &root, scope_key, next);
     let _ = worktree::save_bindings(&root, &state.worktree_bindings);
@@ -4191,21 +4225,13 @@ fn toggle_require_base_merged(state: &mut State, scope_key: &str) -> Task<Messag
         .get(scope_key)
         .map(|b| b.require_base_merged)
         .unwrap_or(false);
-    worktree::set_require_base_merged(
-        &mut state.worktree_bindings,
-        &root,
-        scope_key,
-        !cur,
-    );
+    worktree::set_require_base_merged(&mut state.worktree_bindings, &root, scope_key, !cur);
     stamp_send_blocks(state);
     Task::none()
 }
 
 /// Explicit merge-to-main and archive auto-merge share this path.
-fn run_integrate_to_main(
-    state: &mut State,
-    scope_key: &str,
-) -> worktree::IntegrateOutcome {
+fn run_integrate_to_main(state: &mut State, scope_key: &str) -> worktree::IntegrateOutcome {
     let Some(root) = state.project.project_root.clone() else {
         return worktree::IntegrateOutcome::Failed {
             message: "no project root".into(),
@@ -4301,6 +4327,77 @@ fn promote_bound_exploration(state: &mut State, new_name: &str) -> bool {
     } else {
         false
     }
+}
+
+/// User-invoked fallback for an exploration whose automatic create-change
+/// binding was missed. This deliberately reuses the normal promotion path so
+/// idea frontmatter, chats, interactions, and worktree bindings move together.
+/// Archived targets then run the normal archive migration immediately.
+fn manual_link_exploration(
+    state: &mut State,
+    exploration_id: &str,
+    target: &area::change::ManualLinkTarget,
+) -> bool {
+    let target_exists = if target.archived {
+        state
+            .project
+            .archived_changes
+            .iter()
+            .any(|change| change.name == target.scope_name)
+    } else {
+        state
+            .project
+            .active_changes
+            .iter()
+            .any(|change| change.name == target.scope_name)
+    };
+    if !target_exists
+        || !state
+            .change
+            .explorations
+            .iter()
+            .any(|exploration| exploration.id == exploration_id)
+    {
+        return false;
+    }
+
+    route_promotion(state, exploration_id, &target.change_name);
+    state.change.selected_change = Some(target.change_name.clone());
+
+    if target.archived {
+        area::change::archive_change(
+            &mut state.change,
+            &mut state.interactions,
+            &mut state.tabs,
+            &target.change_name,
+            &target.scope_name,
+            state.project.project_root.as_deref(),
+        );
+        if let Some(root) = state.project.project_root.clone() {
+            worktree::transfer_scope_binding(
+                &mut state.worktree_bindings,
+                &target.change_name,
+                &target.scope_name,
+                &root,
+            );
+        }
+        let moves = idea_store::reconcile(&mut state.ideas.ideas, &state.project);
+        for mv in moves {
+            area::ideas::refresh_after_move(
+                &mut state.ideas,
+                &mut state.tabs,
+                &mv.old_path,
+                &mv.new_path,
+                &mv.title,
+            );
+        }
+        state.change.expanded_sections.insert("archived".into());
+    }
+
+    state
+        .dashboard
+        .refresh_chat_activity(&state.project, &state.change.explorations);
+    true
 }
 
 /// Result of reloading project data and reconciling local UI state.
@@ -4895,8 +4992,7 @@ fn stamp_send_blocks(state: &mut State) {
     };
     for (scope, ix) in state.interactions.iter_mut() {
         let key = scope.key().to_string();
-        let blocked =
-            worktree::agent_send_blocked(&state.worktree_bindings, &key, &main);
+        let blocked = worktree::agent_send_blocked(&state.worktree_bindings, &key, &main);
         for ax in &mut ix.sessions {
             ax.send_block_reason = blocked.clone();
         }
@@ -4985,11 +5081,7 @@ fn chat_phase_display(
 ///
 /// Must not call `SelectChange` when the target is already selected — for
 /// explorations that second select opens rename instead of focusing chat.
-fn handle_list_phase_pill_send(
-    state: &mut State,
-    target: String,
-    text: String,
-) -> Task<Message> {
+fn handle_list_phase_pill_send(state: &mut State, target: String, text: String) -> Task<Message> {
     let text = text.trim().to_string();
     if text.is_empty() {
         return Task::none();
@@ -5006,7 +5098,7 @@ fn handle_list_phase_pill_send(
             state.config.chat.agent_input_hints,
             state.window_width,
             state.config.vcs.workflow,
-                        state.config.chat.effective_viewer_style(),
+            state.config.chat.effective_viewer_style(),
         );
     } else {
         // Already focused: keep selection/rename semantics untouched; still
@@ -5239,6 +5331,7 @@ fn update_focused_column(state: &mut State, message: &Message) {
                     | ChatMsg::ActivateFastResponse(_)
                     | ChatMsg::ChatScrolled(_)
                     | ChatMsg::CycleNextAction(_)
+                    | ChatMsg::FillNextAction
             );
             // Click on a chat block or chat input → focus chat. Avoid
             // pulling focus on irrelevant variants (e.g. completion popup
@@ -5796,7 +5889,7 @@ fn route_interaction(state: &mut State, msg: interaction::Msg) -> Task<Message> 
                 state.config.chat.agent_input_hints,
                 state.window_width,
                 state.config.vcs.workflow,
-                        state.config.chat.effective_viewer_style(),
+                state.config.chat.effective_viewer_style(),
             );
         }
         Area::Caps => {
@@ -5815,7 +5908,7 @@ fn route_interaction(state: &mut State, msg: interaction::Msg) -> Task<Message> 
                 state.config.chat.agent_input_hints,
                 state.window_width,
                 state.config.vcs.workflow,
-                        state.config.chat.effective_viewer_style(),
+                state.config.chat.effective_viewer_style(),
             );
         }
         Area::Codex => {
@@ -5834,7 +5927,7 @@ fn route_interaction(state: &mut State, msg: interaction::Msg) -> Task<Message> 
                 state.config.chat.agent_input_hints,
                 state.window_width,
                 state.config.vcs.workflow,
-                        state.config.chat.effective_viewer_style(),
+                state.config.chat.effective_viewer_style(),
             );
         }
         Area::Ideas => {
@@ -5848,7 +5941,7 @@ fn route_interaction(state: &mut State, msg: interaction::Msg) -> Task<Message> 
                 state.config.chat.agent_input_hints,
                 state.window_width,
                 state.config.vcs.workflow,
-                        state.config.chat.effective_viewer_style(),
+                state.config.chat.effective_viewer_style(),
             );
         }
         Area::Dashboard | Area::Settings => {}
@@ -6315,12 +6408,7 @@ fn start_exploration_title_refresh(state: &mut State, exp_id: &str) -> Task<Mess
     }
     let mut req = duckchat::TitleRequest::new(target.message);
     req.context_hints = hints;
-    let work = async move {
-        handle
-            .title_summary(req)
-            .await
-            .map_err(|e| e.to_string())
-    };
+    let work = async move { handle.title_summary(req).await.map_err(|e| e.to_string()) };
     Task::perform(work, move |result| Message::SessionTitleRefreshReady {
         key: route_key.clone(),
         result,
@@ -6347,10 +6435,7 @@ fn apply_session_title_inner(state: &mut State, key: &str, title: &str, force: b
         change,
         ..
     } = state;
-    let Some(ix) = interactions
-        .values_mut()
-        .find(|ix| ix.instance_id == ix_id)
-    else {
+    let Some(ix) = interactions.values_mut().find(|ix| ix.instance_id == ix_id) else {
         return;
     };
     let Some(ax) = ix.find_session_mut(session_id) else {
@@ -6378,10 +6463,7 @@ fn apply_session_title_inner(state: &mut State, key: &str, title: &str, force: b
     }
 
     let label = change.scope_display_label(&scope_key);
-    if let Some(ix) = interactions
-        .values_mut()
-        .find(|ix| ix.instance_id == ix_id)
-    {
+    if let Some(ix) = interactions.values_mut().find(|ix| ix.instance_id == ix_id) {
         interaction::reconcile_display_names(&mut ix.sessions, &label);
     }
 }
@@ -6402,39 +6484,37 @@ fn max_list_column_width(window_w: f32) -> f32 {
 /// Compose the shared three-column layout for any non-dashboard, non-settings
 /// area: list (per-area) | content (global tabs) | optional interaction.
 fn view_area_three_column(state: &State) -> Element<'_, Message> {
-    let list: Element<'_, Message> =
-        match state.active_area {
-            Area::Change => {
-                area::change::view_list(
-                    &state.change,
-                    &state.project,
-                    &state.ideas,
-                    &state.tabs,
-                    &state.config.list,
-                    state.project.project_root.as_deref(),
-                    state.config.ui.phase_pill_list,
-                    !state.change.changed_files.is_empty(),
-                    worktree::placement_allows_sidecars(state.config.vcs.workflow),
-                    &state.worktree_bindings,
-                    state.config.vcs.workflow,
-                )
-                .map(Message::Change)
-            }
-            Area::Caps => {
-                area::caps::view_list(&state.caps, &state.project, &state.tabs).map(Message::Caps)
-            }
-            Area::Codex => area::codex::view_list(&state.codex, &state.project, &state.tabs)
-                .map(Message::Codex),
-            Area::Ideas => area::ideas::view_list(
-                &state.ideas,
-                &state.project,
-                &state.tabs,
-                &state.config.list,
-                state.config.ui.phase_pill_list,
-            )
-            .map(Message::Ideas),
-            _ => unreachable!("view_area_three_column called for area without three-column layout"),
-        };
+    let list: Element<'_, Message> = match state.active_area {
+        Area::Change => area::change::view_list(
+            &state.change,
+            &state.project,
+            &state.ideas,
+            &state.tabs,
+            &state.config.list,
+            state.project.project_root.as_deref(),
+            state.config.ui.phase_pill_list,
+            !state.change.changed_files.is_empty(),
+            worktree::placement_allows_sidecars(state.config.vcs.workflow),
+            &state.worktree_bindings,
+            state.config.vcs.workflow,
+        )
+        .map(Message::Change),
+        Area::Caps => {
+            area::caps::view_list(&state.caps, &state.project, &state.tabs).map(Message::Caps)
+        }
+        Area::Codex => {
+            area::codex::view_list(&state.codex, &state.project, &state.tabs).map(Message::Codex)
+        }
+        Area::Ideas => area::ideas::view_list(
+            &state.ideas,
+            &state.project,
+            &state.tabs,
+            &state.config.list,
+            state.config.ui.phase_pill_list,
+        )
+        .map(Message::Ideas),
+        _ => unreachable!("view_area_three_column called for area without three-column layout"),
+    };
 
     let content = view_global_content(state);
     let scope = state.active_scope();
@@ -6673,8 +6753,7 @@ fn view(state: &State) -> Element<'_, Message> {
         .filter(|ax| ax.selection_tentative.is_some())
         .map(|_| "⌘K keep selection".to_string());
     let on_update = state.stale.is_some().then_some(Message::StaleBuildOpen);
-    let status_bar =
-        widget::status_bar::view(segments, project_label, cmd_k_hint, on_update);
+    let status_bar = widget::status_bar::view(segments, project_label, cmd_k_hint, on_update);
     let status_divider = container(Space::new().width(Length::Fill))
         .height(1.0)
         .style(theme::divider);
@@ -6739,9 +6818,7 @@ fn subscription(state: &State) -> Subscription<Message> {
             } else {
                 None
             };
-            subs.push(
-                watcher::watch_subscription(root, duckspec).map(Message::FileChanged),
-            );
+            subs.push(watcher::watch_subscription(root, duckspec).map(Message::FileChanged));
         }
     }
 
@@ -6766,8 +6843,7 @@ fn subscription(state: &State) -> Subscription<Message> {
     if let Some(main) = state.project.project_root.as_ref() {
         for (scope, ix) in &state.interactions {
             let scope_key = scope.key().to_string();
-            let desired =
-                worktree::desired_work_root(&state.worktree_bindings, main, &scope_key);
+            let desired = worktree::desired_work_root(&state.worktree_bindings, main, &scope_key);
             for session in &ix.sessions {
                 let key = format!("agent:ix:{}/{}", ix.instance_id, session.session.id);
                 let handle_dir = session
@@ -6785,8 +6861,7 @@ fn subscription(state: &State) -> Subscription<Message> {
                     state.config.chat.oneshot_model(&harness),
                 );
                 subs.push(
-                    agent::agent_subscription(key, root, harness, oneshot_model)
-                        .map(tagged_agent),
+                    agent::agent_subscription(key, root, harness, oneshot_model).map(tagged_agent),
                 );
             }
         }
@@ -7346,11 +7421,23 @@ mod tests {
         );
     }
 
+    /// @spec exploration/promotion Binding key matches create-change folder name: Quoted multi-word argument binds under that exact string
     #[test]
     fn parses_quoted_multiword_title() {
+        // CLI creates `changes/My Thing` with the argument verbatim — binding
+        // must use the same string so promotion can match the new directory.
         assert_eq!(
             parse_create_change(&bash("ds create change \"My Thing\"")),
-            Some("my-thing".to_string())
+            Some("My Thing".to_string())
+        );
+    }
+
+    /// @spec exploration/promotion Binding key matches create-change folder name: Spaced title binds as the CLI folder name
+    #[test]
+    fn parses_quoted_title_with_spaces_matches_cli_folder() {
+        assert_eq!(
+            parse_create_change(&bash("ds create change \"Add sidebar\"")),
+            Some("Add sidebar".to_string())
         );
     }
 
@@ -7370,6 +7457,190 @@ mod tests {
             parse_create_change(&bash("ds create change md-table-render && ds status")),
             Some("md-table-render".to_string())
         );
+    }
+
+    #[test]
+    fn manual_link_promotes_free_exploration_to_active_change() {
+        let tmp = FsTmp::new();
+        with_home(tmp.path(), || {
+            let mut state = State::new();
+            let exp_id = "exploration-manual-active";
+            let change_name = "manual-active";
+            seed_exploration(&mut state, exp_id, "sess-manual-active");
+            state.change.selected_change = Some(exp_id.into());
+            state.project.active_changes.push(data::ChangeData {
+                name: change_name.into(),
+                prefix: "changes".into(),
+                has_proposal: false,
+                has_design: false,
+                cap_tree: vec![],
+                steps: vec![],
+                reviews: vec![],
+                shallow_mtime_nanos: None,
+            });
+            let target = area::change::ManualLinkTarget {
+                scope_name: change_name.into(),
+                change_name: change_name.into(),
+                archived: false,
+            };
+
+            assert!(manual_link_exploration(&mut state, exp_id, &target));
+            assert!(!state.change.explorations.iter().any(|e| e.id == exp_id));
+            assert_eq!(state.change.selected_change.as_deref(), Some(change_name));
+            assert!(
+                state
+                    .interactions
+                    .contains_key(&scope::Scope::Change(change_name.into()))
+            );
+        });
+    }
+
+    #[test]
+    fn manual_link_finishes_idea_and_chat_migration_to_archived_change() {
+        let tmp = FsTmp::new();
+        with_home(tmp.path(), || {
+            let project_root = tmp.path().join("project");
+            std::fs::create_dir_all(&project_root).unwrap();
+            let mut state = State::new();
+            state.project.project_root = Some(project_root.clone());
+
+            let exp_id = "exploration-manual-archive";
+            let change_name = "manual-archive";
+            let archive_name = "2026-08-13-01-manual-archive";
+            state.project.archived_changes.push(data::ChangeData {
+                name: archive_name.into(),
+                prefix: format!("archive/{archive_name}"),
+                has_proposal: false,
+                has_design: false,
+                cap_tree: vec![],
+                steps: vec![],
+                reviews: vec![],
+                shallow_mtime_nanos: None,
+            });
+
+            // The real recovery case: the archived change already has an idea
+            // and an archived chat. Linking the late exploration must preserve
+            // both instead of hiding the target or replacing its history.
+            let mut existing_idea = idea_store::Idea {
+                abs_path: idea_store::ideas_root(Some(&project_root))
+                    .join("archive/existing-target.md"),
+                state: idea_store::IdeaState::Archive,
+                primary_tag_path: vec![],
+                frontmatter: idea_store::Frontmatter {
+                    title: "Existing target".into(),
+                    created: "2026-08-12T00:00:00+03:00".into(),
+                    change: Some(change_name.into()),
+                    archived: Some(idea_store::ArchiveKind::ViaChange),
+                    ..Default::default()
+                },
+            };
+            idea_store::save_idea(
+                &mut existing_idea,
+                "# Existing target\n",
+                Some(&project_root),
+            )
+            .unwrap();
+            state.ideas.ideas.push(existing_idea);
+            seed_scoped_session(
+                &mut state,
+                scope::Scope::Change(archive_name.into()),
+                scope::ScopeKind::Change,
+                "sess-existing-archive",
+                true,
+                None,
+            );
+            state
+                .interactions
+                .get_mut(&scope::Scope::Change(archive_name.into()))
+                .and_then(|ix| ix.active_mut())
+                .unwrap()
+                .mark_driven_and_persist(Some(&project_root));
+
+            let mut idea = idea_store::Idea {
+                abs_path: idea_store::ideas_root(Some(&project_root))
+                    .join("exploration/manual-archive.md"),
+                state: idea_store::IdeaState::Exploration,
+                primary_tag_path: vec![],
+                frontmatter: idea_store::Frontmatter {
+                    title: "Manual archive".into(),
+                    created: "2026-08-13T00:00:00+03:00".into(),
+                    exploration: Some(exp_id.into()),
+                    ..Default::default()
+                },
+            };
+            idea_store::save_idea(&mut idea, "# Manual archive\n", Some(&project_root)).unwrap();
+            let idea_path = idea.abs_path.clone();
+            state.ideas.ideas.push(idea);
+            state.change.explorations.push(chat_store::Exploration {
+                id: exp_id.into(),
+                display_name: "Manual archive".into(),
+                idea_path: Some(idea_path.display().to_string()),
+                archived_at: None,
+                session_count: 1,
+            });
+            seed_scoped_session(
+                &mut state,
+                scope::Scope::Exploration(exp_id.into()),
+                scope::ScopeKind::Exploration,
+                "sess-manual-archive",
+                true,
+                None,
+            );
+            state
+                .interactions
+                .get_mut(&scope::Scope::Exploration(exp_id.into()))
+                .and_then(|ix| ix.active_mut())
+                .unwrap()
+                .mark_driven_and_persist(Some(&project_root));
+            state.change.selected_change = Some(exp_id.into());
+
+            let target = area::change::ManualLinkTarget {
+                scope_name: archive_name.into(),
+                change_name: change_name.into(),
+                archived: true,
+            };
+            assert!(manual_link_exploration(&mut state, exp_id, &target));
+
+            assert!(!state.change.explorations.iter().any(|e| e.id == exp_id));
+            assert_eq!(state.change.selected_change.as_deref(), Some(archive_name));
+            assert!(chat_store::load_sessions_for(exp_id, Some(&project_root)).is_empty());
+            assert_eq!(
+                chat_store::load_sessions_for(archive_name, Some(&project_root)).len(),
+                2
+            );
+            assert_eq!(
+                state
+                    .interactions
+                    .get(&scope::Scope::Change(archive_name.into()))
+                    .map(|ix| ix.sessions.len()),
+                Some(2)
+            );
+            let idea = state
+                .ideas
+                .ideas
+                .iter()
+                .find(|idea| idea.frontmatter.exploration.as_deref() == Some(exp_id))
+                .unwrap();
+            assert_eq!(idea.frontmatter.change.as_deref(), Some(change_name));
+            assert_eq!(idea.state, idea_store::IdeaState::Archive);
+            assert_eq!(
+                idea.frontmatter.archived,
+                Some(idea_store::ArchiveKind::ViaChange)
+            );
+            assert!(
+                idea.abs_path
+                    .starts_with(idea_store::ideas_root(Some(&project_root)).join("archive"))
+            );
+            assert_eq!(
+                state
+                    .ideas
+                    .ideas
+                    .iter()
+                    .filter(|idea| idea.frontmatter.change.as_deref() == Some(change_name))
+                    .count(),
+                2
+            );
+        });
     }
 
     #[test]
@@ -7752,9 +8023,15 @@ mod tests {
         );
         assert!(ids.len() >= 2);
         let target = ids[1].clone();
-        assert_ne!(state.change.selected_change.as_deref(), Some(target.as_str()));
+        assert_ne!(
+            state.change.selected_change.as_deref(),
+            Some(target.as_str())
+        );
         let _ = dispatch_list_digit(&mut state, 2);
-        assert_eq!(state.change.selected_change.as_deref(), Some(target.as_str()));
+        assert_eq!(
+            state.change.selected_change.as_deref(),
+            Some(target.as_str())
+        );
         assert_eq!(state.active_area, Area::Change);
         assert!(state.change.renaming_exploration.is_none());
     }

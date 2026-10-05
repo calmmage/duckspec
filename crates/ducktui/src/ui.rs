@@ -58,8 +58,8 @@ fn draw_project_picker(frame: &mut Frame, area: Rect, shell: &Shell) {
     lines.push(Line::from(
         "Enter bind · j/k or ↑↓ move · Tab path/recents · type path · q quit",
     ));
-    let body = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" ducktui "));
+    let body =
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" ducktui "));
     frame.render_widget(body, area);
 }
 
@@ -103,8 +103,8 @@ fn draw_work(frame: &mut Frame, area: Rect, shell: &mut Shell) {
             Line::from(text)
         })
         .collect();
-    let nav = Paragraph::new(nav_lines)
-        .block(Block::default().borders(Borders::ALL).title(nav_title));
+    let nav =
+        Paragraph::new(nav_lines).block(Block::default().borders(Borders::ALL).title(nav_title));
     let chat_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -206,8 +206,8 @@ fn draw_settings(frame: &mut Frame, area: Rect, shell: &Shell) {
     lines.push(Line::from(
         "j/k move · ←/→ or Enter cycle · Space toggle hints · Esc leave",
     ));
-    let body = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" settings "));
+    let body =
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" settings "));
     frame.render_widget(body, area);
 }
 

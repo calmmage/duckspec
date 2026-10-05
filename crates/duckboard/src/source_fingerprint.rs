@@ -19,11 +19,7 @@ pub fn resolve_source_id(root: &Path) -> String {
 }
 
 fn with_dirty(id: String, dirty: bool) -> String {
-    if dirty {
-        format!("{id}+")
-    } else {
-        id
-    }
+    if dirty { format!("{id}+") } else { id }
 }
 
 fn jj_change_id(root: &Path) -> Option<String> {
@@ -73,11 +69,7 @@ fn git_commit_short(root: &Path) -> Option<String> {
         return None;
     }
     let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if id.is_empty() {
-        None
-    } else {
-        Some(id)
-    }
+    if id.is_empty() { None } else { Some(id) }
 }
 
 fn git_dirty(root: &Path) -> bool {

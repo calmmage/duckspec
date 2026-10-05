@@ -612,7 +612,12 @@ pub fn change_entry(name: &str, phase: &str, sessions: usize) -> ChangeEntry {
     }
 }
 
-pub fn exploration_entry(id: &str, name: &str, sessions: usize, archived: bool) -> ExplorationEntry {
+pub fn exploration_entry(
+    id: &str,
+    name: &str,
+    sessions: usize,
+    archived: bool,
+) -> ExplorationEntry {
     ExplorationEntry {
         id: id.into(),
         display_name: name.into(),
@@ -716,10 +721,7 @@ mod tests {
         let nav = Navigator::from_snapshot(sample_snapshot());
         let rows = nav.visible_rows();
         let labels: Vec<_> = rows.iter().map(|r| r.label.as_str()).collect();
-        let ideas = labels
-            .iter()
-            .position(|l| l.starts_with("IDEAS"))
-            .unwrap();
+        let ideas = labels.iter().position(|l| l.starts_with("IDEAS")).unwrap();
         let codex = labels.iter().position(|l| *l == "CODEX").unwrap();
         let settings = labels.iter().position(|l| *l == "SETTINGS").unwrap();
         assert!(ideas < codex && codex < settings);

@@ -24,7 +24,7 @@ signal.
 - **THEN** there is no stale-build signal
 
 > test: code
-> - crates/duckboard/src/self_version.rs:277
+> - crates/duckboard/src/self_version.rs:263
 
 ### Scenario: Duckboard package tree is eligible for evaluation
 
@@ -35,7 +35,7 @@ signal.
 - **THEN** a stale-build signal is produced
 
 > test: code
-> - crates/duckboard/src/self_version.rs:290
+> - crates/duckboard/src/self_version.rs:276
 
 ## Requirement: Ahead comparison
 
@@ -69,7 +69,7 @@ produce a source-ahead signal.
 - **AND** the signal carries the running and disk package versions
 
 > test: code
-> - crates/duckboard/src/self_version.rs:291
+> - crates/duckboard/src/self_version.rs:277
 
 ### Scenario: Equal versions are not stale
 
@@ -80,7 +80,7 @@ produce a source-ahead signal.
 - **THEN** there is no stale-build signal
 
 > test: code
-> - crates/duckboard/src/self_version.rs:303
+> - crates/duckboard/src/self_version.rs:289
 
 ### Scenario: Lower disk version is not stale
 
@@ -91,7 +91,7 @@ produce a source-ahead signal.
 - **THEN** there is no stale-build signal
 
 > test: code
-> - crates/duckboard/src/self_version.rs:315
+> - crates/duckboard/src/self_version.rs:301
 
 ### Scenario: Unreadable disk version is not stale
 
@@ -102,7 +102,7 @@ produce a source-ahead signal.
 - **THEN** there is no stale-build signal
 
 > test: code
-> - crates/duckboard/src/self_version.rs:324
+> - crates/duckboard/src/self_version.rs:310
 
 ### Scenario: Differing source fingerprints are stale at equal version
 
@@ -115,7 +115,7 @@ produce a source-ahead signal.
 - **AND** the signal’s display strings include the source fingerprints
 
 > test: code
-> - crates/duckboard/src/self_version.rs:334
+> - crates/duckboard/src/self_version.rs:320
 
 ### Scenario: Missing source fingerprint skips source comparison
 
@@ -126,7 +126,7 @@ produce a source-ahead signal.
 - **THEN** there is no stale-build signal from source comparison
 
 > test: code
-> - crates/duckboard/src/self_version.rs:355
+> - crates/duckboard/src/self_version.rs:341
 
 ## Requirement: Install recipe command
 
@@ -144,7 +144,7 @@ SHALL NOT invoke build or install itself.
 - **AND** the path is single-quoted for POSIX
 
 > test: code
-> - crates/duckboard/src/self_version.rs:367
+> - crates/duckboard/src/self_version.rs:353
 
 ### Scenario: Recipe escapes single quotes in the path
 
@@ -156,7 +156,7 @@ SHALL NOT invoke build or install itself.
   word
 
 > test: code
-> - crates/duckboard/src/self_version.rs:375
+> - crates/duckboard/src/self_version.rs:361
 
 ## Requirement: Update plaque when stale
 

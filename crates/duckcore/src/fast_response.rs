@@ -504,12 +504,9 @@ mod tests {
     // @spec chat/fast-response Awaiting composer chrome: Awaiting user applies quiet accent tint to the composer section
     // iced theme test stays in duckboard: awaiting_user_applies_quiet_accent_tint_to_the_composer_section
 
-
     // @spec chat/fast-response Awaiting composer chrome: Not awaiting leaves the composer section untinted
     // iced theme test stays in duckboard: not_awaiting_leaves_the_composer_section_untinted
 
-
     // @spec chat/fast-response Awaiting composer chrome: Model selector matches the composer section tint while awaiting
     // iced theme test stays in duckboard: model_selector_matches_the_composer_section_tint_while_awaiting
-
 }

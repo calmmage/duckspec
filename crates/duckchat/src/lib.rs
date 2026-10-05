@@ -32,9 +32,7 @@ pub use event::{
     AgentEvent, PendingUserChoices, Usage, UserChoiceAnswer, UserChoiceOption, UserChoiceRequest,
 };
 pub use hook::{ContextHook, HookOutput};
-pub use provider::{
-    Capabilities, ModelInfo, ModelRef, Provider, SlashCommand, SlashCommandKind,
-};
+pub use provider::{Capabilities, ModelInfo, ModelRef, Provider, SlashCommand, SlashCommandKind};
 pub use reply_suggest::parse_replies;
 pub use request::{
     Attachment, ReasoningMode, ReplySuggestionRequest, TitleRequest, ToolPolicy, TurnOutcome,
@@ -42,4 +40,4 @@ pub use request::{
 };
 pub use runtime::{MainRuntime, OneshotKind, OneshotRuntime};
 pub use title::{build_title_prompt, clean_title};
-pub use worker::{AgentCommand, AgentHandle, ONESHOT_CALL_BUDGET, spawn_worker};
+pub use worker::{AgentCommand, AgentHandle, ONESHOT_CALL_BUDGET, spawn_worker, stub_handle};

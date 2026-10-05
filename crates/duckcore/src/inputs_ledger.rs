@@ -239,11 +239,7 @@ mod tests {
     fn priming_user_messages_are_omitted() {
         let priming = "AGENTS.md conventions inject";
         let real = "real human intent";
-        let s = session(
-            "c",
-            1,
-            vec![priming_msg(priming), user_msg(real)],
-        );
+        let s = session("c", 1, vec![priming_msg(priming), user_msg(real)]);
         let md = render_inputs_markdown("c", &[s]);
         assert!(!md.contains(priming), "priming leaked:\n{md}");
         assert!(md.contains(real));
@@ -406,10 +402,10 @@ mod tests {
                 chat_store::save_session(&s, Some(&root)).unwrap();
             }
             let changes = root.join("duckspec").join("changes");
-            let any_inputs = std::fs::read_dir(&changes)
-                .unwrap()
-                .flatten()
-                .any(|e| e.path().join("inputs.md").is_file() || e.path().extension().is_some_and(|x| x == "md"));
+            let any_inputs = std::fs::read_dir(&changes).unwrap().flatten().any(|e| {
+                e.path().join("inputs.md").is_file()
+                    || e.path().extension().is_some_and(|x| x == "md")
+            });
             assert!(
                 !any_inputs,
                 "non-change saves must not create package inputs"

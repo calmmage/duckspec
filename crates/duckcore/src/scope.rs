@@ -246,7 +246,7 @@ instructions for this repository:\n\n{body}"
 #[cfg(test)]
 mod tests {
     use super::*;
-        use duckchat::ContextHook;
+    use duckchat::ContextHook;
 
     fn orientation(scope: &SessionScope) -> String {
         CurrentScopeHook

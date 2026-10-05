@@ -18,7 +18,7 @@ or Stuck sections. The audit panel is outside this capability.
 - **THEN** the section headings present are limited to Changes, Explorations, and Archived
 
 > test: code
-> - crates/duckboard/src/dashboard_digest.rs:550
+> - crates/duckboard/src/dashboard_digest.rs:540
 
 ### Scenario: Ideas and Stuck sections are absent
 
@@ -28,7 +28,7 @@ or Stuck sections. The audit panel is outside this capability.
 - **AND** there is no Stuck section
 
 > test: code
-> - crates/duckboard/src/dashboard_digest.rs:563
+> - crates/duckboard/src/dashboard_digest.rs:553
 
 ## Requirement: Filter-law shortlist
 
@@ -49,7 +49,7 @@ count toward the three.
 - **AND** an “… 2 more” affordance is shown
 
 > test: code
-> - crates/duckboard/src/dashboard_digest.rs:577
+> - crates/duckboard/src/dashboard_digest.rs:567
 
 ### Scenario: Three or fewer changes omits overflow chrome
 
@@ -60,7 +60,7 @@ count toward the three.
 - **AND** no “… more” affordance is shown
 
 > test: code
-> - crates/duckboard/src/dashboard_digest.rs:586
+> - crates/duckboard/src/dashboard_digest.rs:576
 
 ### Scenario: Expand and collapse restore full list and shortlist
 
@@ -71,7 +71,7 @@ count toward the three.
 - **AND** when the user collapses Changes the resting shortlist of three is restored
 
 > test: code
-> - crates/duckboard/src/dashboard_digest.rs:595
+> - crates/duckboard/src/dashboard_digest.rs:585
 
 ### Scenario: New Exploration stays outside the shortlist slots
 
@@ -82,7 +82,7 @@ count toward the three.
 - **AND** exactly three exploration rows occupy the shortlist
 
 > test: code
-> - crates/duckboard/src/dashboard_digest.rs:608
+> - crates/duckboard/src/dashboard_digest.rs:598
 
 ## Requirement: Archived density on Dashboard
 
@@ -100,7 +100,7 @@ list, without day-seeded rotation.
 - **THEN** the Archived section is collapsed
 
 > test: code
-> - crates/duckboard/src/area/dashboard.rs:1203
+> - crates/duckboard/src/area/dashboard.rs:1187
 
 ### Scenario: Expanded Archived shortlists newest first
 
@@ -111,7 +111,7 @@ list, without day-seeded rotation.
 - **AND** an “… 2 more” affordance is shown
 
 > test: code
-> - crates/duckboard/src/dashboard_digest.rs:620
+> - crates/duckboard/src/dashboard_digest.rs:610
 
 ### Scenario: Archived shortlist does not day-rotate
 
@@ -125,7 +125,7 @@ list, without day-seeded rotation.
 - **THEN** the three visible rows are the three newest in both cases
 
 > test: code
-> - crates/duckboard/src/dashboard_digest.rs:632
+> - crates/duckboard/src/dashboard_digest.rs:622
 
 ## Requirement: Change ranking
 
@@ -143,7 +143,7 @@ activity SHALL sort as coldest recency.
 - **THEN** the change with the newer attention timestamp appears before the other
 
 > test: code
-> - crates/duckboard/src/dashboard_digest.rs:383
+> - crates/duckboard/src/dashboard_digest.rs:381
 
 ### Scenario: Needs-work breaks recency ties
 
@@ -153,7 +153,7 @@ activity SHALL sort as coldest recency.
 - **THEN** the needs-work change appears before the other
 
 > test: code
-> - crates/duckboard/src/dashboard_digest.rs:396
+> - crates/duckboard/src/dashboard_digest.rs:391
 
 ### Scenario: Missing activity sorts colder than known activity
 
@@ -163,7 +163,7 @@ activity SHALL sort as coldest recency.
 - **THEN** the change with known activity appears before the change without
 
 > test: code
-> - crates/duckboard/src/dashboard_digest.rs:409
+> - crates/duckboard/src/dashboard_digest.rs:401
 
 ## Requirement: Exploration ranking
 
@@ -180,7 +180,7 @@ missing. Archived explorations SHALL NOT appear in the Explorations section.
 - **THEN** the exploration with newer activity appears before the other
 
 > test: code
-> - crates/duckboard/src/dashboard_digest.rs:422
+> - crates/duckboard/src/dashboard_digest.rs:411
 
 ### Scenario: Missing chat falls back to id timestamp
 
@@ -190,7 +190,7 @@ missing. Archived explorations SHALL NOT appear in the Explorations section.
 - **THEN** they appear in descending id-timestamp order
 
 > test: code
-> - crates/duckboard/src/dashboard_digest.rs:435
+> - crates/duckboard/src/dashboard_digest.rs:424
 
 ### Scenario: Archived exploration omitted from Explorations
 
@@ -199,7 +199,7 @@ missing. Archived explorations SHALL NOT appear in the Explorations section.
 - **THEN** that exploration does not appear as a row
 
 > test: code
-> - crates/duckboard/src/dashboard_digest.rs:448
+> - crates/duckboard/src/dashboard_digest.rs:437
 
 ## Requirement: Day-seeded shortlist cut
 
@@ -220,7 +220,7 @@ shortlist members.
 - **AND** the third member is one of the remaining three
 
 > test: code
-> - crates/duckboard/src/dashboard_digest.rs:461
+> - crates/duckboard/src/dashboard_digest.rs:447
 
 ### Scenario: Same day and inputs yield the same shortlist
 
@@ -230,7 +230,7 @@ shortlist members.
 - **THEN** both results are identical
 
 > test: code
-> - crates/duckboard/src/dashboard_digest.rs:472
+> - crates/duckboard/src/dashboard_digest.rs:458
 
 ### Scenario: Different days may spin a different tail member
 
@@ -240,7 +240,7 @@ shortlist members.
 - **AND** the third member may differ between the dates
 
 > test: code
-> - crates/duckboard/src/dashboard_digest.rs:481
+> - crates/duckboard/src/dashboard_digest.rs:467
 
 ### Scenario: Expand shows full ranked list
 
@@ -250,7 +250,7 @@ shortlist members.
 - **THEN** all five changes appear in full ranked order
 
 > test: code
-> - crates/duckboard/src/dashboard_digest.rs:512
+> - crates/duckboard/src/dashboard_digest.rs:498
 
 ## Requirement: Expand state lifecycle
 
@@ -266,7 +266,7 @@ different project SHALL reset all three to the collapsed/resting state.
 - **THEN** the Changes section is at rest (not expanded)
 
 > test: code
-> - crates/duckboard/src/area/dashboard.rs:1186
+> - crates/duckboard/src/area/dashboard.rs:1170
 
 ## Requirement: Derived-only scores
 
@@ -282,4 +282,4 @@ Ranking and shortlist selection SHALL NOT write heat, scores, or shortlist membe
 - **THEN** no heat or score fields are written under that `duckspec/` tree
 
 > test: code
-> - crates/duckboard/src/dashboard_digest.rs:526
+> - crates/duckboard/src/dashboard_digest.rs:512

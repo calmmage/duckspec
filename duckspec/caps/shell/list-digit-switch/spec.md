@@ -22,7 +22,7 @@ when no project is open.
 - **THEN** list-digit selection resolves for index 1 of the Change live queue
 
 > test: code
-> - crates/duckboard/src/keybinds.rs:302
+> - crates/duckboard/src/keybinds.rs:318
 
 ### Scenario: Ideas area with project resolves digit
 
@@ -33,7 +33,7 @@ when no project is open.
 - **THEN** list-digit selection resolves for index 1 of the Ideas idea sequence
 
 > test: code
-> - crates/duckboard/src/keybinds.rs:316
+> - crates/duckboard/src/keybinds.rs:329
 
 ### Scenario: Other area does not resolve
 
@@ -43,7 +43,7 @@ when no project is open.
 - **THEN** list-digit selection does not resolve
 
 > test: code
-> - crates/duckboard/src/keybinds.rs:332
+> - crates/duckboard/src/keybinds.rs:345
 
 ### Scenario: Modal or rename capture does not resolve
 
@@ -54,7 +54,7 @@ when no project is open.
 - **THEN** list-digit selection does not resolve
 
 > test: code
-> - crates/duckboard/src/keybinds.rs:342
+> - crates/duckboard/src/keybinds.rs:355
 
 ### Scenario: Eligible with chat focused in Change or Ideas
 
@@ -66,7 +66,7 @@ when no project is open.
 - **THEN** list-digit selection resolves for index 1
 
 > test: code
-> - crates/duckboard/src/keybinds.rs:356
+> - crates/duckboard/src/keybinds.rs:369
 
 ## Requirement: Painted-row index
 
@@ -90,7 +90,7 @@ no corresponding row SHALL NOT select a row.
 - **THEN** the second live-queue row is the digit target
 
 > test: code
-> - crates/duckboard/src/keybinds.rs:380
+> - crates/duckboard/src/keybinds.rs:391
 
 ### Scenario: Ideas skips collapsed sections
 
@@ -101,7 +101,7 @@ no corresponding row SHALL NOT select a row.
 - **THEN** idea rows from the collapsed section are not indexed
 
 > test: code
-> - crates/duckboard/src/keybinds.rs:409
+> - crates/duckboard/src/keybinds.rs:420
 
 ### Scenario: Ideas includes nested painted rows in order
 
@@ -111,7 +111,7 @@ no corresponding row SHALL NOT select a row.
 - **THEN** the parent and nested ideas occupy consecutive digit indexes in paint order
 
 > test: code
-> - crates/duckboard/src/keybinds.rs:440
+> - crates/duckboard/src/keybinds.rs:446
 
 ### Scenario: Out-of-range digit selects nothing
 
@@ -121,7 +121,7 @@ no corresponding row SHALL NOT select a row.
 - **THEN** no row is selected by list-digit
 
 > test: code
-> - crates/duckboard/src/keybinds.rs:475
+> - crates/duckboard/src/keybinds.rs:476
 
 ## Requirement: Selection without rename side effects
 
@@ -140,7 +140,7 @@ resolution SHALL be a no-op and SHALL NOT start exploration rename.
 - **AND** the active area remains Change
 
 > test: code
-> - crates/duckboard/src/main.rs:7699
+> - crates/duckboard/src/main.rs:8008
 
 ### Scenario: Digit selects a different idea row
 
@@ -151,7 +151,7 @@ resolution SHALL be a no-op and SHALL NOT start exploration rename.
 - **AND** the active area remains Ideas
 
 > test: code
-> - crates/duckboard/src/main.rs:7724
+> - crates/duckboard/src/main.rs:8039
 
 ### Scenario: Already-selected exploration is no-op without rename
 
@@ -162,4 +162,4 @@ resolution SHALL be a no-op and SHALL NOT start exploration rename.
 - **AND** exploration rename is not started
 
 > test: code
-> - crates/duckboard/src/main.rs:7762
+> - crates/duckboard/src/main.rs:8077

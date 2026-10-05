@@ -19,7 +19,7 @@ sessions. An exploration loaded without an archive stamp SHALL be treated as liv
 - **THEN** it has no archive stamp
 
 > test: code
-> - crates/duckcore/src/chat_store.rs:1628
+> - crates/duckcore/src/chat_store.rs:1641
 
 ### Scenario: Archiving stamps archive time and keeps chats
 
@@ -29,7 +29,7 @@ sessions. An exploration loaded without an archive stamp SHALL be treated as liv
 - **AND** its chat sessions remain available under its scope
 
 > test: code
-> - crates/duckcore/src/chat_store.rs:1636
+> - crates/duckcore/src/chat_store.rs:1649
 
 ### Scenario: Missing stamp loads as live
 
@@ -38,7 +38,7 @@ sessions. An exploration loaded without an archive stamp SHALL be treated as liv
 - **THEN** that exploration is treated as live
 
 > test: code
-> - crates/duckcore/src/chat_store.rs:1662
+> - crates/duckcore/src/chat_store.rs:1675
 
 ## Requirement: Live list membership
 
@@ -56,7 +56,7 @@ listed.
 - **THEN** that exploration does not appear on those lists
 
 > test: code
-> - crates/duckboard/src/area/change.rs:3903
+> - crates/duckboard/src/area/change.rs:4039
 
 ### Scenario: Live non–idea-owned exploration remains on live lists
 
@@ -65,7 +65,7 @@ listed.
 - **THEN** that exploration appears on those lists
 
 > test: code
-> - crates/duckboard/src/area/change.rs:3912
+> - crates/duckboard/src/area/change.rs:4048
 
 ## Requirement: Hover control by state
 
@@ -84,7 +84,7 @@ has sessions, and SHALL commit on the first activation when it has none.
 - **AND** its chat sessions remain available under its scope
 
 > test: code
-> - crates/duckboard/src/area/change.rs:3923
+> - crates/duckboard/src/area/change.rs:4059
 
 ### Scenario: Archived exploration hover control removes
 
@@ -95,7 +95,7 @@ has sessions, and SHALL commit on the first activation when it has none.
 - **AND** its chat sessions are deleted
 
 > test: code
-> - crates/duckboard/src/area/change.rs:3972
+> - crates/duckboard/src/area/change.rs:4108
 
 ### Scenario: Remove with sessions requires arm then commit
 
@@ -105,7 +105,7 @@ has sessions, and SHALL commit on the first activation when it has none.
 - **AND** a second activation of the control removes it
 
 > test: code
-> - crates/duckboard/src/area/change.rs:4022
+> - crates/duckboard/src/area/change.rs:4158
 
 ### Scenario: Remove with no sessions commits without arm
 
@@ -114,4 +114,4 @@ has sessions, and SHALL commit on the first activation when it has none.
 - **THEN** the exploration is no longer retained
 
 > test: code
-> - crates/duckboard/src/area/change.rs:4082
+> - crates/duckboard/src/area/change.rs:4218

@@ -19,7 +19,7 @@ sort with non-pinned rows and SHALL NOT occupy a pin slot.
 - **THEN** the three starred rows appear before every non-starred row
 
 > test: code
-> - crates/duckboard/src/queue_list.rs:365
+> - crates/duckboard/src/queue_list.rs:371
 
 ### Scenario: A fourth star follows ordinary sort among non-pinned rows
 
@@ -33,7 +33,7 @@ sort with non-pinned rows and SHALL NOT occupy a pin slot.
   ordinary sort key
 
 > test: code
-> - crates/duckboard/src/queue_list.rs:383
+> - crates/duckboard/src/queue_list.rs:413
 
 ### Scenario: Pin ranking uses pin time newest-first
 
@@ -42,7 +42,7 @@ sort with non-pinned rows and SHALL NOT occupy a pin slot.
 - **THEN** those three appear in the pin prefix ordered by pin time newest-first
 
 > test: code
-> - crates/duckboard/src/queue_list.rs:401
+> - crates/duckboard/src/queue_list.rs:463
 
 ## Requirement: Ordinary sort keys
 
@@ -63,7 +63,7 @@ the row's creation time.
 - **THEN** the row with the newer last message appears before the other
 
 > test: code
-> - crates/duckboard/src/queue_list.rs:414
+> - crates/duckboard/src/queue_list.rs:500
 
 ### Scenario: Missing activity sorts after rows with activity under last-message key
 
@@ -74,7 +74,7 @@ the row's creation time.
 - **THEN** the row with known activity appears before the row without
 
 > test: code
-> - crates/duckboard/src/queue_list.rs:426
+> - crates/duckboard/src/queue_list.rs:512
 
 ### Scenario: Phase key orders by lifecycle phase then title
 
@@ -85,7 +85,7 @@ the row's creation time.
 - **AND** rows that share a phase are ordered by title
 
 > test: code
-> - crates/duckboard/src/queue_list.rs:438
+> - crates/duckboard/src/queue_list.rs:524
 
 ### Scenario: Created key orders by creation time
 
@@ -95,7 +95,7 @@ the row's creation time.
 - **THEN** they appear ordered by creation time
 
 > test: code
-> - crates/duckboard/src/queue_list.rs:476
+> - crates/duckboard/src/queue_list.rs:562
 
 ## Requirement: List preferences and sort menu
 
@@ -114,7 +114,7 @@ offer a sort menu that can change those preferences.
 - **THEN** it uses the phase sort key
 
 > test: code
-> - crates/duckboard/src/queue_list.rs:488
+> - crates/duckboard/src/queue_list.rs:590
 
 ### Scenario: Type and phase pillow visibility prefs default on and are toggled from the menu
 
@@ -124,7 +124,7 @@ offer a sort menu that can change those preferences.
 - **AND** phase pillows remain enabled
 
 > test: code
-> - crates/duckboard/src/queue_list.rs:501
+> - crates/duckboard/src/queue_list.rs:603
 
 ### Scenario: Sort menu is available on Change and Ideas section headers
 
@@ -156,7 +156,7 @@ kind SHALL not appear even if width remains.
 - **AND** no type pillow for `parser` is present
 
 > test: code
-> - crates/duckboard/src/queue_list.rs:531
+> - crates/duckboard/src/queue_list.rs:633
 
 ### Scenario: Change-linked row can show derived phase pillow when pref is on
 
@@ -166,7 +166,7 @@ kind SHALL not appear even if width remains.
 - **THEN** a phase pillow showing that phase is present
 
 > test: code
-> - crates/duckboard/src/queue_list.rs:541
+> - crates/duckboard/src/queue_list.rs:643
 
 ### Scenario: When title plus pillows overflow row width, pillows hide until row hover
 
@@ -177,7 +177,7 @@ kind SHALL not appear even if width remains.
 - **AND** the same row under hover shows the enabled pillows
 
 > test: code
-> - crates/duckboard/src/queue_list.rs:565
+> - crates/duckboard/src/queue_list.rs:664
 
 ### Scenario: Hidden pillow prefs suppress those pillows even when space remains
 
@@ -187,4 +187,4 @@ kind SHALL not appear even if width remains.
 - **THEN** no type pillows are shown
 
 > test: code
-> - crates/duckboard/src/queue_list.rs:578
+> - crates/duckboard/src/queue_list.rs:677

@@ -118,10 +118,7 @@ mod tests {
                 .iter()
                 .find(|s| s.session.id == "sess-pilot")
                 .expect("session");
-            assert_eq!(
-                sess.pilot,
-                PilotState::Armed(BuildPilotMode::Auto)
-            );
+            assert_eq!(sess.pilot, PilotState::Armed(BuildPilotMode::Auto));
             assert_eq!(sess.scope_kind, ScopeKind::Change);
         });
     }
@@ -198,5 +195,4 @@ mod tests {
             );
         });
     }
-
 }

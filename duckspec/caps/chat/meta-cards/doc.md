@@ -41,9 +41,10 @@ treated as blockquote lines even if they start with `>`.
 
 ## Trailing next actions
 
-Only a **trailing** `next` card supplies empty-composer actions: the card must end at the
-last non-empty line of the message (blank lines after it are fine). A `next` card
-mid-message, or a trailing `write` card alone, yields no actions.
+The **last** `next` card in the message supplies empty-composer actions (function name
+kept as trailing for historical callers). The card need not be the final non-empty content
+— agents often add a short footer after the card. An earlier `next` is ignored when a
+later one exists. A message with only a `write` card (no `next`) yields no actions.
 
 ```
 | Body line shape                         | Contribution                         |

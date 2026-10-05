@@ -19,10 +19,7 @@ pub enum SubmitSlash {
     LocalHelp,
     /// System `/build-auto` / `/build-fast` [args] — local classification;
     /// arm + kick owned by build-pilot.
-    LocalBuildPilot {
-        mode: BuildPilotMode,
-        args: String,
-    },
+    LocalBuildPilot { mode: BuildPilotMode, args: String },
     /// Agent turn. `display` is the user-bubble text; `prompt` is what the
     /// harness receives (may differ under `//` escape).
     Agent { display: String, prompt: String },
@@ -86,9 +83,7 @@ pub fn parse_submit_slash(text: &str) -> SubmitSlash {
         && !rest.starts_with('/')
         && !rest.is_empty()
     {
-        let cmd_end = rest
-            .find(char::is_whitespace)
-            .unwrap_or(rest.len());
+        let cmd_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
         let cmd = &rest[..cmd_end];
         let args = rest[cmd_end..].trim();
         match cmd {
@@ -300,7 +295,10 @@ mod tests {
         // WHEN the completion catalog is built
         let catalog = build_completion_catalog(vec![], discovered);
         // THEN kind is Workflow
-        let entry = catalog.iter().find(|c| c.name == "ds-spec").expect("ds-spec");
+        let entry = catalog
+            .iter()
+            .find(|c| c.name == "ds-spec")
+            .expect("ds-spec");
         assert_eq!(entry.kind, SlashCommandKind::Workflow);
     }
 
@@ -454,10 +452,7 @@ mod tests {
             Some("/help")
         );
         assert_eq!(agent_prompt_for_recovery("/help"), None);
-        assert_eq!(
-            agent_prompt_for_recovery("hello").as_deref(),
-            Some("hello")
-        );
+        assert_eq!(agent_prompt_for_recovery("hello").as_deref(), Some("hello"));
     }
 
     /// @spec chat/slash-commands Double-slash agent escape: Escape keeps typed //help as the user message text
@@ -547,7 +542,9 @@ mod tests {
 
     #[test]
     fn slash_kind_rank_orders_system_workflow_agent() {
-        assert!(slash_kind_rank(SlashCommandKind::System) < slash_kind_rank(SlashCommandKind::Workflow));
+        assert!(
+            slash_kind_rank(SlashCommandKind::System) < slash_kind_rank(SlashCommandKind::Workflow)
+        );
         assert!(
             slash_kind_rank(SlashCommandKind::Workflow) < slash_kind_rank(SlashCommandKind::Agent)
         );

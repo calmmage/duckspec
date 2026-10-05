@@ -340,7 +340,7 @@ impl Shell {
             None => Navigator::default(),
         };
         let picker = ProjectPicker::from_recents(shared_config.projects.recent.clone());
-        let model = shared_config.default_model.clone();
+        let model = config::resolve_default_model(&shared_config);
         Self {
             screen,
             project_root,
@@ -380,7 +380,7 @@ impl Shell {
         self.focus = PaneFocus::Navigator;
         self.overlay = None;
         if self.model.is_none() {
-            self.model = self.shared_config.default_model.clone();
+            self.model = config::resolve_default_model(&self.shared_config);
         }
     }
 
@@ -391,7 +391,7 @@ impl Shell {
         self.shared_config = config::promote_recent(&path);
         self.picker.recents = self.shared_config.projects.recent.clone();
         if self.model.is_none() {
-            self.model = self.shared_config.default_model.clone();
+            self.model = config::resolve_default_model(&self.shared_config);
         }
     }
 
@@ -636,7 +636,7 @@ impl Shell {
             .settings
             .default_model
             .clone()
-            .or_else(|| self.shared_config.default_model.clone());
+            .or_else(|| config::resolve_default_model(&self.shared_config));
         self.screen = if self.project_root.is_some() {
             Screen::Work
         } else {
@@ -706,8 +706,11 @@ impl Shell {
             let tag = slash_commands::slash_kind_row_tag(cmd.kind)
                 .map(|t| format!("[{t}] "))
                 .unwrap_or_default();
-            list.rows
-                .push(format!("/{name}  {tag}{desc}", name = cmd.name, desc = cmd.description));
+            list.rows.push(format!(
+                "/{name}  {tag}{desc}",
+                name = cmd.name,
+                desc = cmd.description
+            ));
             list.slash_names.push(cmd.name);
         }
         list.clamp_cursor();
@@ -722,18 +725,18 @@ impl Shell {
         // Prefer currently selected model as cursor.
         let mut selected_idx = 0usize;
         for (i, m) in catalog.iter().enumerate() {
-            let mark = if self.model.as_ref().is_some_and(|sel| {
-                sel.harness == m.harness && sel.model == m.id
-            }) {
+            let mark = if self
+                .model
+                .as_ref()
+                .is_some_and(|sel| sel.harness == m.harness && sel.model == m.id)
+            {
                 selected_idx = i;
                 "▸ "
             } else {
                 "  "
             };
-            list.rows.push(format!(
-                "{mark}{}/{}  {}",
-                m.harness, m.id, m.display
-            ));
+            list.rows
+                .push(format!("{mark}{}/{}  {}", m.harness, m.id, m.display));
             list.models.push(ModelRef::new(&m.harness, &m.id));
         }
         list.cursor = selected_idx.min(list.rows.len().saturating_sub(1));
@@ -755,7 +758,11 @@ impl Shell {
                 .as_deref()
                 .filter(|t| !t.is_empty())
                 .unwrap_or(s.display_name.as_str());
-            let title = if title.is_empty() { "(untitled)" } else { title };
+            let title = if title.is_empty() {
+                "(untitled)"
+            } else {
+                title
+            };
             let mark = if s.id == self.chat.session.id {
                 current = i + 1;
                 "▸ "
@@ -773,7 +780,11 @@ impl Shell {
     fn activate_overlay_selection(&mut self) {
         match self.overlay {
             Some(Overlay::SlashPalette) => {
-                let Some(name) = self.overlay_list.slash_names.get(self.overlay_list.cursor).cloned()
+                let Some(name) = self
+                    .overlay_list
+                    .slash_names
+                    .get(self.overlay_list.cursor)
+                    .cloned()
                 else {
                     self.close_overlay();
                     return;
@@ -784,7 +795,11 @@ impl Shell {
                 self.close_overlay();
             }
             Some(Overlay::ModelPicker) => {
-                let Some(model) = self.overlay_list.models.get(self.overlay_list.cursor).cloned()
+                let Some(model) = self
+                    .overlay_list
+                    .models
+                    .get(self.overlay_list.cursor)
+                    .cloned()
                 else {
                     self.close_overlay();
                     return;
@@ -874,9 +889,7 @@ impl Shell {
             "up" | "k"
                 if matches!(
                     kind,
-                    Overlay::SlashPalette
-                        | Overlay::ModelPicker
-                        | Overlay::SessionSwitcher
+                    Overlay::SlashPalette | Overlay::ModelPicker | Overlay::SessionSwitcher
                 ) =>
             {
                 self.overlay_list.move_cursor(-1);
@@ -885,9 +898,7 @@ impl Shell {
             "down" | "j"
                 if matches!(
                     kind,
-                    Overlay::SlashPalette
-                        | Overlay::ModelPicker
-                        | Overlay::SessionSwitcher
+                    Overlay::SlashPalette | Overlay::ModelPicker | Overlay::SessionSwitcher
                 ) =>
             {
                 self.overlay_list.move_cursor(1);
@@ -1061,11 +1072,7 @@ impl Shell {
 }
 
 fn short_id(id: &str) -> &str {
-    if id.len() <= 12 {
-        id
-    } else {
-        &id[..12]
-    }
+    if id.len() <= 12 { id } else { &id[..12] }
 }
 
 /// Persist a new inbox idea next to duckboard's idea store layout.
@@ -1093,9 +1100,8 @@ fn write_inbox_idea(body: &str, project_root: Option<&Path>) -> anyhow::Result<P
             .unwrap_or(0);
         path = root.join(format!("{slug}-{n}.md"));
     }
-    let contents = format!(
-        "---\ntitle: {title:?}\ncreated: {created:?}\ntags: []\n---\n\n{body}\n"
-    );
+    let contents =
+        format!("---\ntitle: {title:?}\ncreated: {created:?}\ntags: []\n---\n\n{body}\n");
     std::fs::write(&path, contents)?;
     Ok(path)
 }
@@ -1115,11 +1121,7 @@ fn slugify(title: &str) -> String {
         s = s.replace("--", "-");
     }
     s = s.trim_matches('-').to_string();
-    if s.is_empty() {
-        "idea".into()
-    } else {
-        s
-    }
+    if s.is_empty() { "idea".into() } else { s }
 }
 
 fn iso8601_now() -> String {
@@ -1373,7 +1375,11 @@ mod tests {
             shell.overlay_list.slash_names
         );
         assert!(
-            !shell.overlay_list.slash_names.iter().any(|n| n == "ds-spec"),
+            !shell
+                .overlay_list
+                .slash_names
+                .iter()
+                .any(|n| n == "ds-spec"),
             "no discovery yet"
         );
 
@@ -1398,7 +1404,11 @@ mod tests {
             shell.overlay_list.slash_names
         );
         assert!(
-            shell.overlay_list.slash_names.iter().any(|n| n == "ds-spec"),
+            shell
+                .overlay_list
+                .slash_names
+                .iter()
+                .any(|n| n == "ds-spec"),
             "workflow discovered: {:?}",
             shell.overlay_list.slash_names
         );
@@ -1430,7 +1440,11 @@ mod tests {
         );
         assert_eq!(shell.discovered_commands.len(), 1);
         assert!(
-            shell.overlay_list.slash_names.iter().any(|n| n == "ds-apply"),
+            shell
+                .overlay_list
+                .slash_names
+                .iter()
+                .any(|n| n == "ds-apply"),
             "open palette refreshed: {:?}",
             shell.overlay_list.slash_names
         );

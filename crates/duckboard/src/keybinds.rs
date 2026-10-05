@@ -186,6 +186,9 @@ pub enum ChatLandmarkAction {
 /// True when chat landmark shortcuts may run: chat tab visible with an
 /// active session, terminal not focused. Modal ownership is enforced by
 /// the caller's early-returns (find, file finder, …).
+///
+/// Vertical history jumps (Cmd+↑/↓) use this alone. Horizontal answer jumps
+/// (Cmd+←/→) also require [`chat_landmark_horizontal_allowed`].
 pub fn keybind_chat_landmarks(state: &State) -> bool {
     let Some(scope) = state.active_scope() else {
         return false;
@@ -197,6 +200,24 @@ pub fn keybind_chat_landmarks(state: &State) -> bool {
         return false;
     }
     ix.visible && ix.active_tab == ActiveTab::Chat && ix.active().is_some()
+}
+
+/// Whether Cmd+← / → may claim previous/next Answer landmarks.
+///
+/// When the chat input is focused, horizontal landmarks yield so TextEdit
+/// can move to line start/end. History top/bottom stay on the base gate.
+pub fn chat_landmark_horizontal_allowed(base_eligible: bool, chat_input_focused: bool) -> bool {
+    base_eligible && !chat_input_focused
+}
+
+/// Horizontal answer-jump eligibility for the current app state.
+pub fn keybind_chat_landmark_horizontal(state: &State) -> bool {
+    let chat_input_focused = state
+        .active_scope()
+        .and_then(|scope| state.interactions.get(&scope))
+        .and_then(|ix| ix.active())
+        .is_some_and(|ax| ax.chat_input_focused);
+    chat_landmark_horizontal_allowed(keybind_chat_landmarks(state), chat_input_focused)
 }
 
 // ── List digit switch (Ctrl+1/2/3) ──────────────────────────────────────────
@@ -232,17 +253,12 @@ pub fn keybind_list_digit(state: &State, n: u8) -> Option<ListDigitAction> {
                 state.project.project_root.as_deref(),
                 state.change.changed_files.as_slice(),
             );
-            ids.get(idx)
-                .cloned()
-                .map(ListDigitAction::SelectChange)
+            ids.get(idx).cloned().map(ListDigitAction::SelectChange)
         }
         Area::Ideas => {
             let paths =
                 area::ideas::painted_idea_paths(&state.ideas, &state.project, state.list_prefs());
-            paths
-                .get(idx)
-                .cloned()
-                .map(ListDigitAction::SelectIdea)
+            paths.get(idx).cloned().map(ListDigitAction::SelectIdea)
         }
         _ => None,
     }
@@ -251,11 +267,11 @@ pub fn keybind_list_digit(state: &State, n: u8) -> Option<ListDigitAction> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::area::interaction::{AgentSession, InteractionState};
     use crate::chat_store::Exploration;
     use crate::data::ChangeData;
     use crate::idea_store::{Frontmatter, Idea, IdeaState};
     use crate::scope::{Scope, ScopeKind};
-    use crate::area::interaction::{AgentSession, InteractionState};
     use std::path::PathBuf;
 
     fn change_data(name: &str) -> ChangeData {
@@ -307,10 +323,7 @@ mod tests {
         state.active_area = Area::Change;
         seed_live_change(&mut state, "alpha");
         let action = keybind_list_digit(&state, 1);
-        assert_eq!(
-            action,
-            Some(ListDigitAction::SelectChange("alpha".into()))
-        );
+        assert_eq!(action, Some(ListDigitAction::SelectChange("alpha".into())));
     }
 
     // @spec shell/list-digit-switch Chord and eligibility: Ideas area with project resolves digit
@@ -367,9 +380,7 @@ mod tests {
         ix.sessions.push(ax);
         ix.visible = true;
         ix.active_tab = ActiveTab::Chat;
-        state
-            .interactions
-            .insert(Scope::Change("alpha".into()), ix);
+        state.interactions.insert(Scope::Change("alpha".into()), ix);
         state.focused_column = Some(FocusedColumn::Chat);
         assert_eq!(
             keybind_list_digit(&state, 1),
@@ -412,12 +423,7 @@ mod tests {
         let mut state = State::for_tests();
         with_project(&mut state);
         state.active_area = Area::Ideas;
-        seed_idea(
-            &mut state,
-            "/ideas/inbox/only.md",
-            IdeaState::Inbox,
-            vec![],
-        );
+        seed_idea(&mut state, "/ideas/inbox/only.md", IdeaState::Inbox, vec![]);
         seed_idea(
             &mut state,
             "/ideas/archive/hidden.md",
@@ -443,12 +449,7 @@ mod tests {
         let mut state = State::for_tests();
         with_project(&mut state);
         state.active_area = Area::Ideas;
-        seed_idea(
-            &mut state,
-            "/ideas/inbox/root.md",
-            IdeaState::Inbox,
-            vec![],
-        );
+        seed_idea(&mut state, "/ideas/inbox/root.md", IdeaState::Inbox, vec![]);
         seed_idea(
             &mut state,
             "/ideas/inbox/parser/nested.md",
@@ -480,5 +481,45 @@ mod tests {
         state.active_area = Area::Change;
         seed_live_change(&mut state, "only");
         assert_eq!(keybind_list_digit(&state, 3), None);
+    }
+
+    // @spec chat/answer-landmarks Landmark shortcut eligibility: Horizontal landmarks yield while chat input is focused
+    #[test]
+    fn horizontal_landmarks_yield_while_chat_input_is_focused() {
+        // GIVEN base landmarks eligible AND chat input focused
+        assert!(!chat_landmark_horizontal_allowed(true, true));
+        // History/base gate is independent — vertical still allowed when base holds
+        assert!(chat_landmark_horizontal_allowed(true, false));
+        assert!(!chat_landmark_horizontal_allowed(false, true));
+        assert!(!chat_landmark_horizontal_allowed(false, false));
+    }
+
+    // @spec chat/answer-landmarks Landmark shortcut eligibility: Horizontal landmarks available when chat input is not focused
+    #[test]
+    fn horizontal_landmarks_available_when_chat_input_is_not_focused() {
+        // GIVEN chat tab + session, input not focused
+        let mut state = State::for_tests();
+        with_project(&mut state);
+        state.active_area = Area::Change;
+        seed_live_change(&mut state, "alpha");
+        state.change.selected_change = Some("alpha".into());
+        let mut ax = AgentSession::new("alpha".into(), ScopeKind::Change);
+        ax.chat_input_focused = false;
+        let mut ix = InteractionState::default();
+        ix.sessions.push(ax);
+        ix.visible = true;
+        ix.active_tab = ActiveTab::Chat;
+        state.interactions.insert(Scope::Change("alpha".into()), ix);
+        assert!(keybind_chat_landmarks(&state));
+        assert!(keybind_chat_landmark_horizontal(&state));
+
+        // WHEN chat input is focused, horizontal yields
+        if let Some(ix) = state.interactions.get_mut(&Scope::Change("alpha".into()))
+            && let Some(ax) = ix.active_mut()
+        {
+            ax.chat_input_focused = true;
+        }
+        assert!(keybind_chat_landmarks(&state));
+        assert!(!keybind_chat_landmark_horizontal(&state));
     }
 }

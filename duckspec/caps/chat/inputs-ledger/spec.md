@@ -62,7 +62,7 @@ message order.
 - **AND** the ledger does not contain the non-user content
 
 > test: code
-> - crates/duckcore/src/inputs_ledger.rs:252
+> - crates/duckcore/src/inputs_ledger.rs:248
 
 ### Scenario: Sessions appear in creation order
 
@@ -72,7 +72,7 @@ message order.
 - **THEN** the earlier-created session's user text appears before the later session's
 
 > test: code
-> - crates/duckcore/src/inputs_ledger.rs:292
+> - crates/duckcore/src/inputs_ledger.rs:288
 
 ## Requirement: Empty and missing change
 
@@ -91,7 +91,7 @@ NOT write an inputs ledger for that name under another path.
 - **THEN** `duckspec/changes/<name>/inputs.md` does not exist
 
 > test: code
-> - crates/duckcore/src/inputs_ledger.rs:313
+> - crates/duckcore/src/inputs_ledger.rs:309
 
 ### Scenario: Missing change directory skips export
 
@@ -105,7 +105,7 @@ NOT write an inputs ledger for that name under another path.
 - **AND** no new change directory is created for that name
 
 > test: code
-> - crates/duckcore/src/inputs_ledger.rs:335
+> - crates/duckcore/src/inputs_ledger.rs:331
 
 ## Requirement: Fresh full rebuild
 
@@ -126,7 +126,7 @@ the file already on disk, the export SHALL NOT rewrite the file.
 - **THEN** the inputs ledger contains the user text from both sessions
 
 > test: code
-> - crates/duckcore/src/inputs_ledger.rs:352
+> - crates/duckcore/src/inputs_ledger.rs:348
 
 ### Scenario: Unchanged content does not rewrite the file
 
@@ -135,7 +135,7 @@ the file already on disk, the export SHALL NOT rewrite the file.
 - **THEN** the ledger file's modification time is unchanged
 
 > test: code
-> - crates/duckcore/src/inputs_ledger.rs:372
+> - crates/duckcore/src/inputs_ledger.rs:368
 
 ## Requirement: Promotion export
 
@@ -156,7 +156,7 @@ for that change SHALL include the non-priming user text from the migrated sessio
 - **THEN** the change's inputs ledger contains that user text
 
 > test: code
-> - crates/duckcore/src/inputs_ledger.rs:423
+> - crates/duckcore/src/inputs_ledger.rs:419
 
 ## Requirement: Non-change scopes
 
@@ -173,4 +173,4 @@ Durable saves for exploration, caps, or codex scopes SHALL NOT write
 - **THEN** no new `inputs.md` appears under `duckspec/changes/`
 
 > test: code
-> - crates/duckcore/src/inputs_ledger.rs:394
+> - crates/duckcore/src/inputs_ledger.rs:390

@@ -22,7 +22,7 @@ project-relative file path SHALL resolve against that work root.
 - **AND** it does not include `b.rs` solely because B is dirty on another root
 
 > test: code
-> - crates/duckboard/src/worktree.rs:1299
+> - crates/duckboard/src/worktree.rs:1252
 
 ### Scenario: Agent working directory matches the focused scope’s root
 
@@ -31,7 +31,7 @@ project-relative file path SHALL resolve against that work root.
 - **THEN** the agent’s working directory is that sidecar path
 
 > test: code
-> - crates/duckboard/src/worktree.rs:1319
+> - crates/duckboard/src/worktree.rs:1272
 
 ### Scenario: File open resolves under the focused root
 
@@ -40,7 +40,7 @@ project-relative file path SHALL resolve against that work root.
 - **THEN** the opened content is read from that scope’s work root
 
 > test: code
-> - crates/duckboard/src/worktree.rs:1332
+> - crates/duckboard/src/worktree.rs:1285
 
 ## Requirement: Focus switch
 
@@ -59,7 +59,7 @@ runtime if the previous root differed).
 - **THEN** Changed files shows B’s dirty set
 
 > test: code
-> - crates/duckboard/src/worktree.rs:1356
+> - crates/duckboard/src/worktree.rs:1309
 
 ### Scenario: Cold agent rebinds to the new root on next use
 
@@ -70,7 +70,7 @@ runtime if the previous root differed).
 - **THEN** the agent’s working directory is R2
 
 > test: code
-> - crates/duckboard/src/worktree.rs:1371
+> - crates/duckboard/src/worktree.rs:1324
 
 ## Requirement: No mid-stream rebind
 
@@ -88,7 +88,7 @@ only after the turn ends (or is cancelled) and a later cold turn starts.
 - **THEN** the in-flight agent continues with working directory R1
 
 > test: code
-> - crates/duckboard/src/worktree.rs:1381
+> - crates/duckboard/src/worktree.rs:1334
 
 ## Requirement: Caps and codex on Main
 
@@ -104,4 +104,4 @@ working tree as their work root, regardless of any exploration or change placeme
 - **THEN** that session’s working directory is the project main working tree
 
 > test: code
-> - crates/duckboard/src/worktree.rs:1390
+> - crates/duckboard/src/worktree.rs:1343

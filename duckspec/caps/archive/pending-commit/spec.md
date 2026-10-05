@@ -19,7 +19,7 @@ deletes. An archived package with no dirty path under that directory SHALL NOT b
 - **THEN** the package is pending
 
 > test: code
-> - crates/duckboard/src/area/change.rs:4126
+> - crates/duckboard/src/area/change.rs:4262
 
 ### Scenario: Dirt only outside the archive folder is not pending
 
@@ -29,7 +29,7 @@ deletes. An archived package with no dirty path under that directory SHALL NOT b
 - **THEN** the package is not pending
 
 > test: code
-> - crates/duckboard/src/area/change.rs:4147
+> - crates/duckboard/src/area/change.rs:4281
 
 ## Requirement: Change list placement
 
@@ -49,7 +49,7 @@ row while it remains pending.
 - **AND** it appears after the active changes
 
 > test: code
-> - crates/duckboard/src/area/change.rs:4330
+> - crates/duckboard/src/area/change.rs:4460
 
 ### Scenario: Multiple pending archives order newest-first after actives
 
@@ -60,7 +60,7 @@ row while it remains pending.
 - **AND** among the pending packages the newer archive prefix appears first
 
 > test: code
-> - crates/duckboard/src/area/change.rs:4358
+> - crates/duckboard/src/area/change.rs:4480
 
 ## Requirement: Uncommitted chrome and Commit send
 
@@ -78,7 +78,7 @@ itself perform a VCS commit.
 - **THEN** trailing uncommitted chrome is present
 
 > test: code
-> - crates/duckboard/src/area/change.rs:4384
+> - crates/duckboard/src/area/change.rs:4499
 
 ### Scenario: Activating chrome sends Commit without committing
 
@@ -90,4 +90,4 @@ itself perform a VCS commit.
 - **AND** no VCS commit has run as a result of the activation
 
 > test: code
-> - crates/duckboard/src/area/change.rs:4395
+> - crates/duckboard/src/area/change.rs:4510

@@ -101,11 +101,7 @@ pub fn type_tags_from_idea_tags(tags: &[String]) -> Vec<String> {
 }
 
 /// Project type + phase pillows under list prefs.
-pub fn project_row_pillows(
-    tags: &[String],
-    phase: Option<&str>,
-    prefs: &ListConfig,
-) -> RowPillows {
+pub fn project_row_pillows(tags: &[String], phase: Option<&str>, prefs: &ListConfig) -> RowPillows {
     let type_tags = if prefs.show_type_pillows {
         type_tags_from_idea_tags(tags)
     } else {
@@ -136,7 +132,12 @@ fn pillow_char_cost(pillows: &RowPillows) -> usize {
     let tags: usize = pillows
         .type_tags
         .iter()
-        .map(|t| truncate_tag_display(t, TYPE_TAG_DISPLAY_MAX).chars().count() + 3)
+        .map(|t| {
+            truncate_tag_display(t, TYPE_TAG_DISPLAY_MAX)
+                .chars()
+                .count()
+                + 3
+        })
         .sum();
     let phase = pillows
         .phase
@@ -187,6 +188,7 @@ pub fn mark_glyph(mark: IdeaMark, hovered: bool) -> Option<&'static str> {
 /// Prefer the interactive `after_icon` mark control in list rows; do not also
 /// prefix the label (that double-paints the star). Kept for tests / callers
 /// that want a single-string rendering of title + mark.
+#[cfg(test)]
 pub fn title_with_mark(title: &str, mark: IdeaMark, hovered: bool) -> String {
     match mark_glyph(mark, hovered) {
         Some(g) => format!("{g} {title}"),
@@ -371,10 +373,34 @@ mod tests {
     fn up_to_three_newest_stars_pin_above_non_pinned_rows() {
         let mut rows = vec![
             row(ch("a"), "A", IdeaMark::None, None, Some(100), None, None),
-            row(ch("b"), "B", IdeaMark::Star, Some("2026-01-03"), Some(1), None, None),
+            row(
+                ch("b"),
+                "B",
+                IdeaMark::Star,
+                Some("2026-01-03"),
+                Some(1),
+                None,
+                None,
+            ),
             row(exp("c"), "C", IdeaMark::None, None, Some(200), None, None),
-            row(ch("d"), "D", IdeaMark::Star, Some("2026-01-02"), Some(2), None, None),
-            row(ch("e"), "E", IdeaMark::Star, Some("2026-01-01"), Some(3), None, None),
+            row(
+                ch("d"),
+                "D",
+                IdeaMark::Star,
+                Some("2026-01-02"),
+                Some(2),
+                None,
+                None,
+            ),
+            row(
+                ch("e"),
+                "E",
+                IdeaMark::Star,
+                Some("2026-01-01"),
+                Some(3),
+                None,
+                None,
+            ),
         ];
         sort_queue(&mut rows, SortKey::LastMessage);
         let keys: Vec<String> = rows.iter().map(|r| key_str(&r.key)).collect();
@@ -388,10 +414,42 @@ mod tests {
     #[test]
     fn a_fourth_star_follows_ordinary_sort_among_non_pinned_rows() {
         let mut rows = vec![
-            row(ch("s1"), "S1", IdeaMark::Star, Some("2026-01-04"), Some(10), None, None),
-            row(ch("s2"), "S2", IdeaMark::Star, Some("2026-01-03"), Some(20), None, None),
-            row(ch("s3"), "S3", IdeaMark::Star, Some("2026-01-02"), Some(30), None, None),
-            row(ch("s4"), "S4", IdeaMark::Star, Some("2026-01-01"), Some(50), None, None),
+            row(
+                ch("s1"),
+                "S1",
+                IdeaMark::Star,
+                Some("2026-01-04"),
+                Some(10),
+                None,
+                None,
+            ),
+            row(
+                ch("s2"),
+                "S2",
+                IdeaMark::Star,
+                Some("2026-01-03"),
+                Some(20),
+                None,
+                None,
+            ),
+            row(
+                ch("s3"),
+                "S3",
+                IdeaMark::Star,
+                Some("2026-01-02"),
+                Some(30),
+                None,
+                None,
+            ),
+            row(
+                ch("s4"),
+                "S4",
+                IdeaMark::Star,
+                Some("2026-01-01"),
+                Some(50),
+                None,
+                None,
+            ),
             row(ch("n1"), "N1", IdeaMark::None, None, Some(40), None, None),
         ];
         sort_queue(&mut rows, SortKey::LastMessage);
@@ -406,9 +464,33 @@ mod tests {
     #[test]
     fn pin_ranking_uses_pin_time_newest_first() {
         let mut rows = vec![
-            row(ch("old"), "Old", IdeaMark::Star, Some("2026-01-01T00:00:00Z"), None, None, None),
-            row(ch("new"), "New", IdeaMark::Star, Some("2026-06-01T00:00:00Z"), None, None, None),
-            row(ch("mid"), "Mid", IdeaMark::Star, Some("2026-03-01T00:00:00Z"), None, None, None),
+            row(
+                ch("old"),
+                "Old",
+                IdeaMark::Star,
+                Some("2026-01-01T00:00:00Z"),
+                None,
+                None,
+                None,
+            ),
+            row(
+                ch("new"),
+                "New",
+                IdeaMark::Star,
+                Some("2026-06-01T00:00:00Z"),
+                None,
+                None,
+                None,
+            ),
+            row(
+                ch("mid"),
+                "Mid",
+                IdeaMark::Star,
+                Some("2026-03-01T00:00:00Z"),
+                None,
+                None,
+                None,
+            ),
         ];
         sort_queue(&mut rows, SortKey::LastMessage);
         let titles: Vec<_> = rows.iter().map(|r| r.title.as_str()).collect();
@@ -481,8 +563,24 @@ mod tests {
     #[test]
     fn created_key_orders_by_creation_time() {
         let mut rows = vec![
-            row(ch("a"), "A", IdeaMark::None, None, None, None, Some("2026-01-01")),
-            row(ch("b"), "B", IdeaMark::None, None, None, None, Some("2026-06-01")),
+            row(
+                ch("a"),
+                "A",
+                IdeaMark::None,
+                None,
+                None,
+                None,
+                Some("2026-01-01"),
+            ),
+            row(
+                ch("b"),
+                "B",
+                IdeaMark::None,
+                None,
+                None,
+                None,
+                Some("2026-06-01"),
+            ),
         ];
         sort_queue(&mut rows, SortKey::Created);
         assert_eq!(rows[0].title, "B");
@@ -558,11 +656,8 @@ mod tests {
         );
         let mut off = prefs;
         off.show_phase_pillows = false;
-        let hidden = project_row_pillows(
-            &[],
-            Some("proposal drafted, design not yet written"),
-            &off,
-        );
+        let hidden =
+            project_row_pillows(&[], Some("proposal drafted, design not yet written"), &off);
         assert!(hidden.phase.is_none());
     }
 
@@ -598,14 +693,40 @@ mod tests {
         );
     }
 
+    // @spec ideas/marks Single interactive mark control: Unmarked non-hovered row has no mark glyph
     #[test]
-    fn mark_glyph_and_title_prefix() {
+    fn unmarked_non_hovered_row_has_no_mark_glyph() {
+        // GIVEN mark none and not hovered
+        // WHEN glyph is resolved
+        // THEN no glyph
         assert_eq!(mark_glyph(IdeaMark::None, false), None);
+    }
+
+    // @spec ideas/marks Single interactive mark control: Unmarked hovered row exposes outline control glyph
+    #[test]
+    fn unmarked_hovered_row_exposes_outline_control_glyph() {
+        // GIVEN mark none and hovered
+        // WHEN glyph is resolved
+        // THEN outline star
         assert_eq!(mark_glyph(IdeaMark::None, true), Some("☆"));
+    }
+
+    // @spec ideas/marks Single interactive mark control: Marked row always exposes the mark glyph
+    #[test]
+    fn marked_row_always_exposes_the_mark_glyph() {
+        // GIVEN star / hot / cool
+        // WHEN glyph is resolved with or without hover
+        // THEN the corresponding glyph is always present
+        assert_eq!(mark_glyph(IdeaMark::Star, false), Some("⭐"));
+        assert_eq!(mark_glyph(IdeaMark::Star, true), Some("⭐"));
         assert_eq!(mark_glyph(IdeaMark::Hot, false), Some("🔥"));
-        assert_eq!(
-            title_with_mark("Fix", IdeaMark::Star, false),
-            "⭐ Fix"
-        );
+        assert_eq!(mark_glyph(IdeaMark::Hot, true), Some("🔥"));
+        assert_eq!(mark_glyph(IdeaMark::Cool, false), Some("❄"));
+        assert_eq!(mark_glyph(IdeaMark::Cool, true), Some("❄"));
+    }
+
+    #[test]
+    fn title_with_mark_helper_still_prefixes_for_tests() {
+        assert_eq!(title_with_mark("Fix", IdeaMark::Star, false), "⭐ Fix");
     }
 }

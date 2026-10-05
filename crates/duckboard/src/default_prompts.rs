@@ -1,12 +1,14 @@
 //! Pure helpers for empty-composer next actions and reply-suggestion oneshot.
 //!
 //! Next actions: empty-session inherited list or lifecycle bootstrap, else
-//! trailing `next` meta card. Oneshot: settled parse (agent input hints gated)
-//! may fill fast-response chips when eligible — separate from next actions.
-//! Empty Enter / Tab own next actions only. No under-input oneshot chrome.
+//! trailing `next` meta card, else trailing A–B–C prose options. Oneshot:
+//! settled parse (agent input hints gated) may fill fast-response chips when
+//! eligible — separate from next actions. Empty Enter / Tab·→ fill / Shift-Tab
+//! cycle own next actions only. No under-input oneshot chrome.
 
 use crate::chat_store::{ChatMessage, ChatSession, ContentBlock, Role};
-use crate::meta_card::{NextAction, trailing_next_actions};
+use crate::meta_card::NextAction;
+use duckcore::prose_options::next_actions_from_assistant;
 
 /// Hard cap on oneshot display / chip options (matches duckchat parse cap).
 const ONESHOT_DISPLAY_CAP: usize = 3;
@@ -24,8 +26,8 @@ pub fn oneshot_replies_trimmed(oneshot_replies: &[String]) -> Vec<String> {
 ///
 /// - Empty session + non-empty inherited: that list (outranks bootstrap).
 /// - Empty session otherwise: first lifecycle option in empty-send form (0 or 1).
-/// - Non-empty: trailing next actions from the last assistant message only
-///   (inherited is ignored).
+/// - Non-empty: trailing `next` meta card, else trailing A–B–C prose options
+///   from the last assistant message only (inherited is ignored).
 /// - Never merges oneshot results or post-first-turn disk lifecycle options.
 pub fn next_action_list(
     session_empty: bool,
@@ -45,7 +47,7 @@ pub fn next_action_list(
         };
     }
     match last_assistant {
-        Some(src) if !src.trim().is_empty() => trailing_next_actions(src),
+        Some(src) if !src.trim().is_empty() => next_actions_from_assistant(src),
         _ => Vec::new(),
     }
 }
@@ -118,9 +120,14 @@ pub fn next_empty_submit_text(
     actions.get(active_idx).map(|a| a.send.clone())
 }
 
-/// Whether Tab/Shift-Tab may cycle next actions (idle, empty input, ≥2 actions).
+/// Whether Shift-Tab may cycle next actions (idle, ≥2 actions).
 pub fn can_cycle_next_actions(is_streaming: bool, actions_len: usize) -> bool {
     !is_streaming && actions_len >= 2
+}
+
+/// Whether Tab / → may fill the active next action (idle, ≥1 action).
+pub fn can_fill_next_action(is_streaming: bool, actions_len: usize) -> bool {
+    !is_streaming && actions_len >= 1
 }
 
 /// Ghost (placeholder) text for the empty composer when a next action is armed.
@@ -137,8 +144,12 @@ pub fn next_ghost_text(
     actions.get(active_idx).map(|a| a.send.as_str())
 }
 
-/// Whether to show the tab-available marker for multi next actions.
-pub fn next_tab_marker_visible(input_empty: bool, is_streaming: bool, actions_len: usize) -> bool {
+/// Whether to show the cycle marker (Shift-Tab cue) for multi next actions.
+pub fn next_cycle_marker_visible(
+    input_empty: bool,
+    is_streaming: bool,
+    actions_len: usize,
+) -> bool {
     input_empty && !is_streaming && actions_len > 1
 }
 
@@ -159,8 +170,8 @@ pub fn apply_oneshot_if_current(
     })
 }
 
-/// Advance or reverse the active index with wrap. `delta` is typically `+1`
-/// (Tab) or `-1` (Shift-Tab). Empty list returns `0`.
+/// Advance the active index with wrap. `delta` is typically `+1` (Shift-Tab).
+/// Empty list returns `0`.
 pub fn cycle_active_index(len: usize, active_idx: usize, delta: i8) -> usize {
     if len == 0 {
         return 0;
@@ -181,7 +192,7 @@ pub fn clamp_active_index(len: usize, active_idx: usize) -> usize {
 /// - `after_turn`: always `0` so the ghost matches the first ranked action on
 ///   the card the user just saw.
 /// - Otherwise: `0` when ordered send tokens changed; keep `prev_idx` (clamped)
-///   when the list is unchanged so Tab cycle survives chrome/scope rebuilds.
+///   when the list is unchanged so Shift-Tab cycle survives chrome/scope rebuilds.
 pub fn next_action_idx_after_refresh(
     after_turn: bool,
     prev_sends: &[&str],
@@ -287,10 +298,26 @@ Done.
     // @spec chat/default-prompts Next-action list: Non-empty session without trailing next yields empty
     #[test]
     fn non_empty_session_without_trailing_next_yields_empty() {
-        // GIVEN non-empty session + assistant without trailing next + lifecycle present
+        // GIVEN non-empty session + assistant without trailing next or ABC + lifecycle present
         let assistant = "Just some prose, no meta card.";
         let got = next_action_list(false, Some("/ds-explore"), Some(assistant), None);
         assert!(got.is_empty());
+    }
+
+    // @spec chat/default-prompts Next-action list: Non-empty session uses prose ABC when no meta next
+    #[test]
+    fn non_empty_session_uses_prose_abc_when_no_meta_next() {
+        let assistant = "\
+Pick one:
+
+- **A** — first
+- **B** — second
+";
+        let got = next_action_list(false, Some("/ds-explore"), Some(assistant), None);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].send, "A — first");
+        assert_eq!(got[1].send, "B — second");
+        assert!(!got.iter().any(|a| a.send == "/ds-explore"));
     }
 
     // @spec chat/default-prompts Next-action list: Oneshot results do not enter the next-action list
@@ -371,7 +398,7 @@ Done.
         assert!(!got.iter().any(|a| a.send == "confirm"));
     }
 
-    // @spec chat/default-prompts Next-action empty-input send and cycle: Empty submit sends the active next action
+    // @spec chat/default-prompts Next-action empty-input send, fill, and cycle: Empty submit sends the active next action
     #[test]
     fn empty_submit_sends_the_active_next_action() {
         // GIVEN empty composer, non-empty next-action list, active index 1
@@ -394,7 +421,7 @@ Done.
         );
     }
 
-    // @spec chat/default-prompts Next-action empty-input send and cycle: Empty submit is a no-op when the next-action list is empty
+    // @spec chat/default-prompts Next-action empty-input send, fill, and cycle: Empty submit is a no-op when the next-action list is empty
     #[test]
     fn empty_submit_is_a_no_op_when_the_next_action_list_is_empty() {
         // GIVEN empty composer + empty next-action list
@@ -413,17 +440,17 @@ Done.
             next_action_idx_after_refresh(false, &["a", "b", "c"], &["confirm", "reject"], 2),
             0
         );
-        // Same list, chrome rebuild: preserve Tab index.
+        // Same list, chrome rebuild: preserve cycle index.
         assert_eq!(
             next_action_idx_after_refresh(false, &["a", "b", "c"], &["a", "b", "c"], 2),
             2
         );
     }
 
-    // @spec chat/default-prompts Next-action empty-input send and cycle: Tab cycles next actions with wrap
+    // @spec chat/default-prompts Next-action empty-input send, fill, and cycle: Shift-Tab cycles next actions with wrap
     #[test]
-    fn tab_cycles_next_actions_with_wrap() {
-        // GIVEN empty composer, ≥2 next actions, Tab at last index
+    fn shift_tab_cycles_next_actions_with_wrap() {
+        // GIVEN empty composer, ≥2 next actions, Shift-Tab at last index
         let actions = [
             NextAction {
                 send: "a".into(),
@@ -442,20 +469,45 @@ Done.
         let last = actions.len() - 1;
         let next = cycle_active_index(actions.len(), last, 1);
         assert_eq!(next, 0);
-        assert_eq!(cycle_active_index(actions.len(), 0, -1), last);
         // Composer input remains empty — cycle only mutates the index (caller).
     }
 
-    // @spec chat/default-prompts Next-action empty-input send and cycle: Multi next shows a tab-available marker
+    // @spec chat/default-prompts Next-action empty-input send, fill, and cycle: Tab or right-arrow fills the active next action
     #[test]
-    fn multi_next_shows_a_tab_available_marker() {
+    fn tab_or_right_arrow_fills_the_active_next_action() {
+        // GIVEN empty idle composer, non-empty list, active index 1
+        let actions = [
+            NextAction {
+                send: "/ds-spec".into(),
+                reason: None,
+            },
+            NextAction {
+                send: "/ds-design".into(),
+                reason: None,
+            },
+        ];
+        assert!(can_fill_next_action(false, actions.len()));
+        assert!(!can_fill_next_action(true, actions.len()));
+        assert!(!can_fill_next_action(false, 0));
+        // Fill token is the active send (same source as empty submit); handler
+        // inserts it without starting a turn.
+        assert_eq!(
+            next_empty_submit_text(false, &actions, 1).as_deref(),
+            Some("/ds-design")
+        );
+        assert_eq!(next_empty_submit_text(true, &actions, 1), None);
+    }
+
+    // @spec chat/default-prompts Next-action empty-input send, fill, and cycle: Multi next shows a cycle marker
+    #[test]
+    fn multi_next_shows_a_cycle_marker() {
         // GIVEN empty composer + next-action list of at least two
-        assert!(next_tab_marker_visible(true, false, 2));
-        assert!(!next_tab_marker_visible(true, false, 1));
-        assert!(!next_tab_marker_visible(true, false, 0));
-        assert!(!next_tab_marker_visible(false, false, 2));
-        assert!(!next_tab_marker_visible(true, true, 2));
-        // Ghost text is the active send when idle; tab marker sits before ghost
+        assert!(next_cycle_marker_visible(true, false, 2));
+        assert!(!next_cycle_marker_visible(true, false, 1));
+        assert!(!next_cycle_marker_visible(true, false, 0));
+        assert!(!next_cycle_marker_visible(false, false, 2));
+        assert!(!next_cycle_marker_visible(true, true, 2));
+        // Ghost text is the active send when idle; cycle marker sits before ghost
         // in the view (see agent_chat) when multi next is armed.
         let actions = vec![
             NextAction {
@@ -486,7 +538,7 @@ Done.
             next_empty_submit_text(false, &actions, 0).as_deref(),
             Some("/ds-spec")
         );
-        // Tab still cycles multi next while pending.
+        // Shift-Tab still cycles multi next while pending.
         let multi = [
             NextAction {
                 send: "a".into(),

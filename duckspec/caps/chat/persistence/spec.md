@@ -19,7 +19,7 @@ readable until a write completes in full.
 - **THEN** the session file on disk still parses as the previously-persisted session
 
 > test: code
-> - crates/duckcore/src/chat_store.rs:1148
+> - crates/duckcore/src/chat_store.rs:1164
 
 ## Requirement: Non-destructive scope migration
 
@@ -38,7 +38,7 @@ delete it.
 - **THEN** the target scope afterward holds both sessions
 
 > test: code
-> - crates/duckcore/src/chat_store.rs:1180
+> - crates/duckcore/src/chat_store.rs:1196
 
 ### Scenario: Same-id collision keeps the fuller session and preserves the other
 
@@ -49,7 +49,7 @@ delete it.
 - **AND** the displaced copy is preserved rather than deleted
 
 > test: code
-> - crates/duckcore/src/chat_store.rs:1211
+> - crates/duckcore/src/chat_store.rs:1227
 
 ## Requirement: In-flight turn durability
 
@@ -76,7 +76,7 @@ persisted during the turn, not only when the turn completes.
 - **THEN** the persisted session includes the messages streamed so far
 
 > test: code
-> - crates/duckboard/src/chat_store_integration_tests.rs:129
+> - crates/duckboard/src/chat_store_integration_tests.rs:126
 
 ### Scenario: Eager flush includes pending reasoning as Reasoning content
 
@@ -90,7 +90,7 @@ persisted during the turn, not only when the turn completes.
 - **AND** that body is not stored as Text content
 
 > test: code
-> - crates/duckboard/src/chat_store_integration_tests.rs:159
+> - crates/duckboard/src/chat_store_integration_tests.rs:156
 
 ## Requirement: Reasoning content
 
@@ -107,7 +107,7 @@ that contains only legacy content kinds (no Reasoning) SHALL still load.
 - **THEN** the loaded session includes a Reasoning block with the same body
 
 > test: code
-> - crates/duckcore/src/chat_store.rs:1364
+> - crates/duckcore/src/chat_store.rs:1378
 
 ### Scenario: A legacy session without Reasoning still loads
 
@@ -117,7 +117,7 @@ that contains only legacy content kinds (no Reasoning) SHALL still load.
 - **AND** the loaded messages match the file's content
 
 > test: code
-> - crates/duckcore/src/chat_store.rs:1525
+> - crates/duckcore/src/chat_store.rs:1539
 
 ## Requirement: Last-known context usage
 
@@ -134,7 +134,7 @@ session file that omits context usage SHALL still load, with usage treated as ze
 - **THEN** the loaded session has the same context usage total
 
 > test: code
-> - crates/duckcore/src/chat_store.rs:1398
+> - crates/duckcore/src/chat_store.rs:1412
 
 ### Scenario: A legacy session without context usage still loads
 
@@ -144,7 +144,7 @@ session file that omits context usage SHALL still load, with usage treated as ze
 - **AND** the loaded session's context usage total is zero
 
 > test: code
-> - crates/duckcore/src/chat_store.rs:1421
+> - crates/duckcore/src/chat_store.rs:1435
 
 ## Requirement: Unsynced draft durability
 
@@ -161,7 +161,7 @@ omits the field SHALL still load, with no unsynced draft.
 - **THEN** the loaded session holds the same unsynced draft
 
 > test: code
-> - crates/duckcore/src/chat_store.rs:1460
+> - crates/duckcore/src/chat_store.rs:1474
 
 ### Scenario: A legacy session without an unsynced draft still loads
 
@@ -171,7 +171,7 @@ omits the field SHALL still load, with no unsynced draft.
 - **AND** the loaded session holds no unsynced draft
 
 > test: code
-> - crates/duckcore/src/chat_store.rs:1486
+> - crates/duckcore/src/chat_store.rs:1500
 
 ## Requirement: User choice content
 
@@ -194,7 +194,7 @@ kinds (no user-choice question or answer blocks) SHALL still load.
 - **AND** the loaded session includes a user-choice answer block with the same body
 
 > test: code
-> - crates/duckcore/src/chat_store.rs:1251
+> - crates/duckcore/src/chat_store.rs:1265
 
 ### Scenario: A legacy session without user-choice content still loads
 
@@ -208,4 +208,4 @@ kinds (no user-choice question or answer blocks) SHALL still load.
 - **AND** the loaded messages match the file's content
 
 > test: code
-> - crates/duckcore/src/chat_store.rs:1303
+> - crates/duckcore/src/chat_store.rs:1317

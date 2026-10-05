@@ -22,7 +22,7 @@ Thinking, Activity, User, and System segments SHALL NOT receive this band.
 - **AND** every earlier Answer is not a band target
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:3109
+> - crates/duckboard/src/widget/agent_chat.rs:3285
 
 ### Scenario: Empty latest Answer is not a band target
 
@@ -33,7 +33,7 @@ Thinking, Activity, User, and System segments SHALL NOT receive this band.
 - **AND** the latest non-empty Answer is the band target
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:3129
+> - crates/duckboard/src/widget/agent_chat.rs:3305
 
 ## Requirement: Answer reply anchors
 
@@ -59,7 +59,7 @@ SHALL yield no target. Navigation SHALL NOT wrap.
 - **AND** no Thinking, Activity, or User segment is an anchor
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:3170
+> - crates/duckboard/src/widget/agent_chat.rs:3346
 
 ### Scenario: Prev and next step to adjacent Answer anchors
 
@@ -70,7 +70,7 @@ SHALL yield no target. Navigation SHALL NOT wrap.
 - **AND** next is the Answer immediately after the current one
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:3191
+> - crates/duckboard/src/widget/agent_chat.rs:3367
 
 ### Scenario: Prev at first and next at last yield no target
 
@@ -84,7 +84,7 @@ SHALL yield no target. Navigation SHALL NOT wrap.
 - **AND** there is no next target
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:3216
+> - crates/duckboard/src/widget/agent_chat.rs:3392
 
 ## Requirement: Viewport current for reply jumps
 
@@ -104,7 +104,7 @@ SHALL be no current Answer.
 - **THEN** the current Answer is the last Answer anchor
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:3237
+> - crates/duckboard/src/widget/agent_chat.rs:3413
 
 ### Scenario: Scroll offset selects the Answer at or above the viewport top
 
@@ -115,7 +115,7 @@ SHALL be no current Answer.
 - **THEN** the current Answer is the last Answer whose top is at or above the viewport top
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:3252
+> - crates/duckboard/src/widget/agent_chat.rs:3428
 
 ## Requirement: History end jumps
 
@@ -127,11 +127,42 @@ not snap back to the end while the user is reading.
 
 ## Requirement: Landmark shortcut eligibility
 
-Landmark shortcuts (history top/bottom and previous/next Answer) SHALL be available when
-the chat tab is the active interaction with a session, including while the composer is
-focused. Bare arrow keys SHALL remain available to the focused composer for caret
-movement. When a modal that owns navigation keys is open, landmark shortcuts SHALL NOT
-claim those keys.
+Landmark shortcuts SHALL be available when the chat tab is the active interaction with a
+session (terminal not focused; modals that own navigation keys still suppress all
+landmarks). History-top and history-bottom shortcuts (Cmd+up / Cmd+down) SHALL remain
+available while the composer is focused. Previous/next Answer shortcuts (Cmd+left /
+Cmd+right) SHALL NOT claim those keys while the chat input is focused — the focused
+composer SHALL receive them for caret line navigation. When the chat input is not focused
+and the base landmark gate holds, Cmd+left / Cmd+right SHALL jump previous/next Answer.
+Bare arrow keys SHALL remain available to the focused composer for caret movement.
+
+> test: code
+
+### Scenario: Horizontal landmarks yield while chat input is focused
+
+- **GIVEN** the chat tab is active with a session
+
+- **AND** the chat input is focused
+
+- **WHEN** horizontal landmark eligibility is evaluated
+
+- **THEN** previous/next Answer shortcuts are not eligible
+
+- **AND** history-top/history-bottom shortcuts remain eligible under the base landmark
+  gate
+
+> test: code
+> - crates/duckboard/src/keybinds.rs:486
+
+### Scenario: Horizontal landmarks available when chat input is not focused
+
+- **GIVEN** the chat tab is active with a session
+- **AND** the chat input is not focused
+- **WHEN** horizontal landmark eligibility is evaluated
+- **THEN** previous/next Answer shortcuts are eligible under the base landmark gate
+
+> test: code
+> - crates/duckboard/src/keybinds.rs:497
 
 ## Requirement: Previous reply re-align
 
@@ -152,7 +183,7 @@ NOT re-align to the current Answer; it SHALL always use the next Answer anchor r
 - **THEN** the target is the current Answer
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:3271
+> - crates/duckboard/src/widget/agent_chat.rs:3447
 
 ### Scenario: At current top previous targets prior Answer
 
@@ -163,7 +194,7 @@ NOT re-align to the current Answer; it SHALL always use the next Answer anchor r
 - **THEN** the target is the Answer immediately before the current one
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:3289
+> - crates/duckboard/src/widget/agent_chat.rs:3465
 
 ### Scenario: Next ignores re-align when below current top
 
@@ -174,4 +205,4 @@ NOT re-align to the current Answer; it SHALL always use the next Answer anchor r
 - **THEN** the target is the Answer immediately after the current one
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:3307
+> - crates/duckboard/src/widget/agent_chat.rs:3483

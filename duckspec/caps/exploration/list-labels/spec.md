@@ -3,6 +3,10 @@
 Manual rename and on-demand AI retitle for exploration rows in the CHANGE list, so labels
 stay under user control after the first auto-title.
 
+Manual rename and on-demand AI retitle for exploration rows in the CHANGE list, so labels
+stay under user control after the first auto-title. The retitle control is shown only when
+refresh can do work.
+
 ## Requirement: Manual rename updates the exploration label
 
 When the user commits a non-empty rename for an exploration in the CHANGE list, the system
@@ -24,7 +28,7 @@ leave the existing display name unchanged.
   exploration
 
 > test: code
-> - crates/duckcore/src/chat_store.rs:932
+> - crates/duckcore/src/chat_store.rs:938
 
 ### Scenario: Blank rename leaves the label unchanged
 
@@ -33,7 +37,7 @@ leave the existing display name unchanged.
 - **THEN** the exploration's list label remains `Cloud agent options`
 
 > test: code
-> - crates/duckcore/src/chat_store.rs:957
+> - crates/duckcore/src/chat_store.rs:963
 
 ## Requirement: Refresh retitles from the active session chat
 
@@ -64,7 +68,7 @@ exploration display name SHALL remain unchanged.
 - **AND** the exploration list label is `New direction`
 
 > test: code
-> - crates/duckcore/src/chat_store.rs:1015
+> - crates/duckcore/src/chat_store.rs:1035
 
 ### Scenario: Refresh input includes later user turns when present
 
@@ -74,7 +78,7 @@ exploration display name SHALL remain unchanged.
 - **THEN** the summarizer input includes the later user message, not only `Hello`
 
 > test: code
-> - crates/duckcore/src/chat_store.rs:972
+> - crates/duckcore/src/chat_store.rs:978
 
 ### Scenario: Refresh with no summarizable content leaves labels unchanged
 
@@ -85,7 +89,7 @@ exploration display name SHALL remain unchanged.
 - **AND** the session title is left unchanged
 
 > test: code
-> - crates/duckcore/src/chat_store.rs:990
+> - crates/duckcore/src/chat_store.rs:1015
 
 ### Scenario: Failed or empty refresh leaves labels unchanged
 
@@ -96,4 +100,31 @@ exploration display name SHALL remain unchanged.
 - **AND** the session title remains the prior non-empty title
 
 > test: code
-> - crates/duckcore/src/chat_store.rs:1048
+> - crates/duckcore/src/chat_store.rs:1068
+
+## Requirement: Refresh control visibility
+
+On a CHANGE-list exploration row that shows hover or selected row actions, the
+title-refresh control SHALL be shown only when at least one session for that exploration
+has summarizable content for title refresh (non-priming, non-bare-slash user text, as for
+`title_refresh_target`). When no such session content exists, the control SHALL be absent.
+
+> test: code
+
+### Scenario: Summarizable content shows the refresh control
+
+- **GIVEN** an exploration with a session that has non-priming non-bare-slash user content
+- **WHEN** refresh-control visibility is resolved for that exploration's sessions
+- **THEN** the refresh control is considered available
+
+> test: code
+> - crates/duckcore/src/chat_store.rs:997
+
+### Scenario: No summarizable content hides the refresh control
+
+- **GIVEN** an exploration whose sessions have no non-priming non-bare-slash user content
+- **WHEN** refresh-control visibility is resolved for that exploration's sessions
+- **THEN** the refresh control is not available
+
+> test: code
+> - crates/duckcore/src/chat_store.rs:1004

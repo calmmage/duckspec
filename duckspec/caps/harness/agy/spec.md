@@ -23,7 +23,7 @@ blocks on AGY permission UI.
 - **AND** the host does not drive AGY via an in-host print-mode client
 
 > test: code
-> - crates/duckchat/src/agy.rs:251
+> - crates/duckchat/src/agy.rs:246
 
 ### Scenario: The agent runs headless agy print mode with auto-approved tools
 
@@ -126,7 +126,7 @@ suggestions for the AGY harness SHALL return an empty list without spawning `agy
 - **AND** the request does not spawn `agy`
 
 > test: code
-> - crates/duckchat/src/agy.rs:299
+> - crates/duckchat/src/agy.rs:294
 
 ### Scenario: Reply suggestions are empty without spawning agy
 
@@ -136,7 +136,7 @@ suggestions for the AGY harness SHALL return an empty list without spawning `agy
 - **AND** the request does not spawn `agy`
 
 > test: code
-> - crates/duckchat/src/agy.rs:330
+> - crates/duckchat/src/agy.rs:325
 
 ## Requirement: Agent binary discovery
 
@@ -178,7 +178,10 @@ than panicking.
 ## Requirement: Offered AGY models
 
 Models offered by the AGY harness SHALL be tagged with the AGY harness identity so the
-picker and dispatch can distinguish them from other harnesses' models.
+picker and dispatch can distinguish them from other harnesses' models. Listing models
+SHALL use the live `agy models` catalog when that command yields a non-empty list, with
+each listed model's display name as its id. When live discovery is empty or fails, listing
+SHALL fall back to the curated table.
 
 > test: code
 
@@ -189,4 +192,24 @@ picker and dispatch can distinguish them from other harnesses' models.
 - **THEN** each offered model names the AGY harness
 
 > test: code
-> - crates/duckchat/src/agy.rs:351
+> - crates/duckchat/src/agy.rs:343
+
+### Scenario: Live discovery lists display names from agy models
+
+- **GIVEN** a successful `agy models` listing that includes display names
+- **WHEN** the AGY harness lists models
+- **THEN** each returned model id is the corresponding display name
+- **AND** each returned model names the AGY harness
+
+> test: code
+> - crates/duckchat/src/agy.rs:354
+
+### Scenario: Empty or failed discovery falls back to the curated table
+
+- **GIVEN** live `agy models` discovery that is empty or fails
+- **WHEN** the AGY harness lists models
+- **THEN** the listed models are the curated fallback table
+- **AND** each returned model names the AGY harness
+
+> test: code
+> - crates/duckchat/src/agy.rs:377

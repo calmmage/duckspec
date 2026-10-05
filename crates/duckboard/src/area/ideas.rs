@@ -897,7 +897,9 @@ fn tag_node_key(section: IdeaState, tag_path: &[String]) -> String {
 }
 
 fn tag_node_expanded(state: &State, section: IdeaState, tag_path: &[String]) -> bool {
-    !state.tag_collapsed.contains(&tag_node_key(section, tag_path))
+    !state
+        .tag_collapsed
+        .contains(&tag_node_key(section, tag_path))
 }
 
 /// Sorted idea rows at one tag prefix (queue sort + fav pins). Shared by the
@@ -933,8 +935,10 @@ fn sorted_direct_ideas_at<'a>(
                 type_tags: crate::queue_list::type_tags_from_idea_tags(&idea.frontmatter.tags),
                 phase,
                 last_message_at: idea.scope_key().and_then(|scope| {
-                    let sessions =
-                        crate::chat_store::load_sessions_for(scope, project.project_root.as_deref());
+                    let sessions = crate::chat_store::load_sessions_for(
+                        scope,
+                        project.project_root.as_deref(),
+                    );
                     crate::queue_list::last_message_activity_nanos(&sessions)
                 }),
                 created_at: Some(idea.frontmatter.created.clone()),
@@ -1061,14 +1065,7 @@ fn collect_section_idea_paths(
         let mut next_prefix = prefix.to_vec();
         next_prefix.push(child);
         if tag_node_expanded(state, section, &next_prefix) {
-            collect_section_idea_paths(
-                state,
-                project,
-                section,
-                &next_prefix,
-                list_prefs,
-                out,
-            );
+            collect_section_idea_paths(state, project, section, &next_prefix, list_prefs, out);
         }
     }
 }
@@ -1108,8 +1105,7 @@ fn idea_list_row<'a>(
             .and_then(|n| super::change::change_scope_facts(n, project))
             .map(|f| f.phase)
     };
-    let pillows =
-        crate::queue_list::project_row_pillows(&idea.frontmatter.tags, phase, list_prefs);
+    let pillows = crate::queue_list::project_row_pillows(&idea.frontmatter.tags, phase, list_prefs);
     let mut row = ListRow::new(title_base.clone())
         .icon(icon_bytes)
         .indent(depth)
@@ -1150,10 +1146,8 @@ fn idea_list_row<'a>(
 fn idea_pillow_trail<'a>(pillows: &crate::queue_list::RowPillows) -> Element<'a, Message> {
     let mut r = row![].spacing(theme::SPACING_XS).align_y(iced::Center);
     for tag in &pillows.type_tags {
-        let label = crate::queue_list::truncate_tag_display(
-            tag,
-            crate::queue_list::TYPE_TAG_DISPLAY_MAX,
-        );
+        let label =
+            crate::queue_list::truncate_tag_display(tag, crate::queue_list::TYPE_TAG_DISPLAY_MAX);
         r = r.push(
             container(
                 text(format!("#{label}"))

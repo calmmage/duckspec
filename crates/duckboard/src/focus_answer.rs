@@ -3,7 +3,7 @@
 //! Pure line-oriented helpers (no iced). Meta-card recognition comes from
 //! `duckcore::meta_card`.
 
-use duckcore::meta_card::{MetaCard, MetaCardKind, parse_meta_cards};
+use duckcore::meta_card::{MetaCardKind, parse_meta_cards};
 
 /// Inclusive 0-based line range into the Answer source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,6 +13,8 @@ pub struct LineRange {
 }
 
 impl LineRange {
+    /// Inclusive membership (unit tests / Focus geometry helpers).
+    #[cfg(test)]
     pub fn contains(self, line: usize) -> bool {
         line >= self.start && line <= self.end
     }
@@ -114,29 +116,29 @@ pub fn focus_layout(source: &str) -> FocusLayout {
     FocusLayout::Sectioned { sections, open }
 }
 
-/// Trailing-meta open region, if any.
+/// Last-`next` open region, if any.
 ///
-/// - Trailing `next` only → `next.line_start ..= last line of answer`
-/// - `write` then non-card preview then trailing `next` with no other meta card
+/// - Last `next` only → `next.line_start ..= last line of answer` (footer after
+///   the card stays in the open region)
+/// - `write` then non-card preview then that `next` with no other meta card
 ///   between → `write.line_start ..= next.line_end`
-/// - Other meta card between write and next → open is next only
+/// - Other meta card between write and next → open is next through answer end
 pub fn open_region(source: &str) -> Option<LineRange> {
     let lines: Vec<&str> = source.lines().collect();
     if lines.is_empty() {
         return None;
     }
     let cards = parse_meta_cards(source);
-    let next = cards
-        .iter()
-        .rev()
-        .find(|c| c.kind == MetaCardKind::Next && is_trailing_card(c, &lines))?;
+    // Last next card in the answer — not required to be end-of-message-only.
+    let next = cards.iter().rev().find(|c| c.kind == MetaCardKind::Next)?;
 
     let last_line = lines.len() - 1;
 
-    // Last write that ends before trailing next.
-    let write = cards.iter().rev().find(|c| {
-        c.kind == MetaCardKind::Write && c.line_end < next.line_start
-    });
+    // Last write that ends before that next.
+    let write = cards
+        .iter()
+        .rev()
+        .find(|c| c.kind == MetaCardKind::Write && c.line_end < next.line_start);
 
     if let Some(w) = write {
         let has_card_between = cards.iter().any(|c| {
@@ -220,21 +222,10 @@ pub fn partition_sections(lines: &[&str], open_start: usize) -> Vec<FoldableSect
         };
         sections.push(FoldableSection {
             kind: kind.clone(),
-            lines: LineRange {
-                start: *start,
-                end,
-            },
+            lines: LineRange { start: *start, end },
         });
     }
     sections
-}
-
-fn is_trailing_card(card: &MetaCard, lines: &[&str]) -> bool {
-    let last_non_empty = lines.iter().rposition(|l| !l.trim().is_empty());
-    match last_non_empty {
-        None => false,
-        Some(idx) => card.line_end >= idx,
-    }
 }
 
 fn is_fence_line(line: &str) -> bool {
@@ -316,7 +307,10 @@ Preview body.
         // WHEN the open region is computed
         let open = open_region(src).expect("open region");
         let cards = parse_meta_cards(src);
-        let write = cards.iter().find(|c| c.kind == MetaCardKind::Write).unwrap();
+        let write = cards
+            .iter()
+            .find(|c| c.kind == MetaCardKind::Write)
+            .unwrap();
         let next = cards.iter().find(|c| c.kind == MetaCardKind::Next).unwrap();
 
         // THEN the open region starts at the `write` card start
@@ -355,7 +349,10 @@ More prose after mid next.
             .rev()
             .find(|c| c.kind == MetaCardKind::Next)
             .unwrap();
-        let write = cards.iter().find(|c| c.kind == MetaCardKind::Write).unwrap();
+        let write = cards
+            .iter()
+            .find(|c| c.kind == MetaCardKind::Write)
+            .unwrap();
 
         // THEN the open region starts at the trailing `next` card start
         // AND the open region does not include the earlier `write` card

@@ -250,6 +250,12 @@ pub fn title_refresh_target(session: &ChatSession) -> Option<TitleTarget> {
     })
 }
 
+/// Whether any session has summarizable content for title refresh.
+/// Gates the CHANGE-list exploration ↻ control.
+pub fn any_session_has_title_refresh(sessions: &[ChatSession]) -> bool {
+    sessions.iter().any(|s| title_refresh_target(s).is_some())
+}
+
 /// Commit a manual exploration rename. Non-empty trimmed text becomes the new
 /// `display_name` and returns `true`. Blank or whitespace-only input leaves
 /// the name unchanged and returns `false`.
@@ -979,12 +985,31 @@ mod tests {
         ]);
         let t = title_refresh_target(&s).unwrap();
         assert!(t.message.contains("Hello"));
-        assert!(t
-            .message
-            .contains("Focus on rename and retitle in the CHANGE list"));
+        assert!(
+            t.message
+                .contains("Focus on rename and retitle in the CHANGE list")
+        );
         // First-turn auto path still only returns the first message.
         let first = title_summarization_target(&s).unwrap();
         assert_eq!(first.message, "Hello");
+    }
+
+    // @spec exploration/list-labels Refresh control visibility: Summarizable content shows the refresh control
+    #[test]
+    fn summarizable_content_shows_the_refresh_control() {
+        let sessions = vec![session_with(vec![user_msg("Hello")])];
+        assert!(any_session_has_title_refresh(&sessions));
+    }
+
+    // @spec exploration/list-labels Refresh control visibility: No summarizable content hides the refresh control
+    #[test]
+    fn no_summarizable_content_hides_the_refresh_control() {
+        let sessions = vec![session_with(vec![
+            user_msg("/ds-apply"),
+            priming_msg("AGENTS.md"),
+        ])];
+        assert!(!any_session_has_title_refresh(&sessions));
+        assert!(!any_session_has_title_refresh(&[]));
     }
 
     /// @spec exploration/list-labels Refresh retitles from the active session chat: Refresh with no summarizable content leaves labels unchanged
@@ -1002,12 +1027,7 @@ mod tests {
 
         // WHEN refresh has no summarizable target, the full-write path is not used.
         assert!(title_refresh_target(&session).is_none());
-        assert!(!apply_title_labels(
-            &mut session,
-            Some(&mut exp),
-            "",
-            true
-        ));
+        assert!(!apply_title_labels(&mut session, Some(&mut exp), "", true));
         assert_eq!(exp.display_name, "Keep me");
         assert_eq!(session.title.as_deref(), Some("Keep me"));
     }
@@ -1058,11 +1078,7 @@ mod tests {
         let mut session = session_with(vec![user_msg("content")]);
         session.title = Some("Keep me".into());
 
-        for result in [
-            Err("timeout".into()),
-            Ok(String::new()),
-            Ok("   ".into()),
-        ] {
+        for result in [Err("timeout".into()), Ok(String::new()), Ok("   ".into())] {
             if let Some(title) = accept_title_summary_result(&result) {
                 apply_title_labels(&mut session, Some(&mut exp), &title, true);
             }
@@ -1244,9 +1260,7 @@ mod tests {
 
     // moved to duckboard: in_flight_turn_survives_promotion (needs area::)
 
-
     // moved to duckboard: eager_flush_persists_streamed_messages_before_turn_completion (needs area::)
-
 
     /// @spec chat/persistence User choice content: User-choice question and answer blocks round-trip through persist and load
     #[test]
@@ -1592,7 +1606,6 @@ mod tests {
     }
 
     // moved to duckboard: eager_flush_includes_pending_reasoning_as_reasoning_content (needs area::)
-
 
     #[test]
     fn delete_project_data_removes_chats_and_explorations() {

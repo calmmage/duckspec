@@ -25,7 +25,7 @@ long phase description for that change.
 - **AND** the lifecycle send is `/ds-propose`
 
 > test: code
-> - crates/duckboard/src/area/change.rs:3232
+> - crates/duckboard/src/area/change.rs:3368
 
 ### Scenario: Proposal-only yields proposal short and design send
 
@@ -35,7 +35,7 @@ long phase description for that change.
 - **AND** the lifecycle send is `/ds-design`
 
 > test: code
-> - crates/duckboard/src/area/change.rs:3245
+> - crates/duckboard/src/area/change.rs:3381
 
 ### Scenario: Open steps yield steps short and apply send
 
@@ -45,7 +45,7 @@ long phase description for that change.
 - **AND** the lifecycle send is `/ds-apply`
 
 > test: code
-> - crates/duckboard/src/area/change.rs:3258
+> - crates/duckboard/src/area/change.rs:3394
 
 ### Scenario: Complete steps without review yield ready short and archive send
 
@@ -56,7 +56,7 @@ long phase description for that change.
 - **AND** the lifecycle send is `/ds-archive`
 
 > test: code
-> - crates/duckboard/src/area/change.rs:3276
+> - crates/duckboard/src/area/change.rs:3412
 
 ### Scenario: No open steps with review yield review short and step send
 
@@ -67,7 +67,7 @@ long phase description for that change.
 - **AND** the lifecycle send is `/ds-step`
 
 > test: code
-> - crates/duckboard/src/area/change.rs:3293
+> - crates/duckboard/src/area/change.rs:3429
 
 ### Scenario: Archived yields archived short without lifecycle send
 
@@ -77,7 +77,7 @@ long phase description for that change.
 - **AND** there is no lifecycle send
 
 > test: code
-> - crates/duckboard/src/area/change.rs:3310
+> - crates/duckboard/src/area/change.rs:3446
 
 ### Scenario: Active-change long hover is the recognized phase description
 
@@ -86,7 +86,7 @@ long phase description for that change.
 - **THEN** the lifecycle hover text is that long phase description
 
 > test: code
-> - crates/duckboard/src/area/change.rs:3321
+> - crates/duckboard/src/area/change.rs:3457
 
 ## Requirement: Late-stage VCS pill
 
@@ -109,7 +109,7 @@ committed pill SHALL offer no send. When the short stage is neither `ready` nor
 - **AND** the VCS hover states that the working tree is dirty repo-wide
 
 > test: code
-> - crates/duckboard/src/area/change.rs:3338
+> - crates/duckboard/src/area/change.rs:3474
 
 ### Scenario: Ready with clean tree is committed without send
 
@@ -120,7 +120,7 @@ committed pill SHALL offer no send. When the short stage is neither `ready` nor
 - **AND** there is no VCS send
 
 > test: code
-> - crates/duckboard/src/area/change.rs:3357
+> - crates/duckboard/src/area/change.rs:3493
 
 ### Scenario: Pre-ready stage omits VCS pill
 
@@ -129,7 +129,7 @@ committed pill SHALL offer no send. When the short stage is neither `ready` nor
 - **THEN** there is no VCS pill
 
 > test: code
-> - crates/duckboard/src/area/change.rs:3373
+> - crates/duckboard/src/area/change.rs:3509
 
 ### Scenario: Archived includes VCS pill from tree dirty state
 
@@ -141,7 +141,7 @@ committed pill SHALL offer no send. When the short stage is neither `ready` nor
 - **AND** the VCS send is `Commit`
 
 > test: code
-> - crates/duckboard/src/area/change.rs:3387
+> - crates/duckboard/src/area/change.rs:3523
 
 ## Requirement: Exploration display
 
@@ -159,7 +159,7 @@ be `/ds-explore`. When the session is non-empty, there SHALL be no lifecycle sen
 - **AND** the lifecycle send is `/ds-explore`
 
 > test: code
-> - crates/duckboard/src/area/change.rs:3399
+> - crates/duckboard/src/area/change.rs:3535
 
 ### Scenario: Non-empty exploration is explore short without send
 
@@ -169,7 +169,7 @@ be `/ds-explore`. When the session is non-empty, there SHALL be no lifecycle sen
 - **AND** there is no lifecycle send
 
 > test: code
-> - crates/duckboard/src/area/change.rs:3410
+> - crates/duckboard/src/area/change.rs:3546
 
 ## Requirement: Surface settings
 
@@ -194,7 +194,7 @@ MAY apply as before.
 - **THEN** both are enabled
 
 > test: code
-> - crates/duckboard/src/config.rs:473
+> - crates/duckboard/src/config.rs:475
 
 ### Scenario: Disabled list setting hides list pills
 
@@ -251,7 +251,7 @@ SHALL NOT start exploration rename when the target exploration is already select
 - **THEN** the submitted prompt text is `/ds-design`
 
 > test: code
-> - crates/duckboard/src/area/change.rs:3421
+> - crates/duckboard/src/area/change.rs:3557
 
 ### Scenario: Uncommitted activation submits Commit
 
@@ -260,7 +260,7 @@ SHALL NOT start exploration rename when the target exploration is already select
 - **THEN** the submitted prompt text is `Commit`
 
 > test: code
-> - crates/duckboard/src/area/change.rs:3439
+> - crates/duckboard/src/area/change.rs:3575
 
 ## Requirement: Placement chrome
 

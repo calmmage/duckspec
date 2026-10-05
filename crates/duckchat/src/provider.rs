@@ -34,6 +34,12 @@ pub trait Provider: Send + Sync {
         Vec::new()
     }
 
+    /// Backend-advertised default model id when the provider reports one.
+    /// Must be one of [`Self::list_models`] when `Some`.
+    fn advertised_default(&self) -> Option<String> {
+        None
+    }
+
     /// Slash commands (or other user-triggerable presets) discovered by the
     /// provider, scoped to `project_root`.
     fn list_commands(&self, project_root: &Path) -> Vec<SlashCommand>;

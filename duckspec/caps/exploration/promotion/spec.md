@@ -24,7 +24,7 @@ exploration is currently selected.
 - **AND** the exploration's chat sessions are accessible under the change's scope
 
 > test: code
-> - crates/duckboard/src/main.rs:7139
+> - crates/duckboard/src/main.rs:7252
 
 ### Scenario: Unbound change adopts no exploration
 
@@ -35,7 +35,7 @@ exploration is currently selected.
 - **AND** the selected exploration's chat sessions remain under their own scope
 
 > test: code
-> - crates/duckboard/src/main.rs:7171
+> - crates/duckboard/src/main.rs:7284
 
 ## Requirement: Bindings are single-use
 
@@ -52,7 +52,7 @@ already promoted — does not promote an exploration again.
 - **THEN** no exploration is promoted into the change
 
 > test: code
-> - crates/duckboard/src/main.rs:7262
+> - crates/duckboard/src/main.rs:7375
 
 ## Requirement: Chat focus after bound promotion
 
@@ -72,7 +72,7 @@ binding SHALL NOT force chat input focus as a result of that detection alone.
 - **AND** the chat input has keyboard focus
 
 > test: code
-> - crates/duckboard/src/main.rs:7203
+> - crates/duckboard/src/main.rs:7316
 
 ### Scenario: Unbound new change does not force chat input focus
 
@@ -83,4 +83,42 @@ binding SHALL NOT force chat input focus as a result of that detection alone.
 - **AND** the chat input still does not have keyboard focus
 
 > test: code
-> - crates/duckboard/src/main.rs:7232
+> - crates/duckboard/src/main.rs:7345
+
+## Requirement: Binding key matches create-change folder name
+
+The binding key recorded from an exploration session's `ds create change` tool call SHALL
+be the create-change argument string exactly as it will appear as the change directory
+name under `changes/`. Duckboard SHALL NOT transform that argument (including not
+slugifying it) before recording the binding or looking it up when a new change directory
+is detected.
+
+> test: code
+
+### Scenario: Quoted multi-word argument binds under that exact string
+
+- **GIVEN** a shell tool call whose command runs `ds create change` with a quoted
+  multi-word argument
+
+- **WHEN** the create-change binding key is parsed from that tool input
+
+- **THEN** the binding key is that argument string exactly
+
+- **AND** the binding key is not a slugified form of the argument
+
+> test: code
+> - crates/duckboard/src/main.rs:7424
+
+### Scenario: Spaced title binds as the CLI folder name
+
+- **GIVEN** a shell tool call whose command runs `ds create change` with a quoted argument
+  that contains spaces
+
+- **WHEN** the create-change binding key is parsed from that tool input
+
+- **THEN** the binding key equals that spaced argument
+
+- **AND** a newly present change directory with that same name can match the binding
+
+> test: code
+> - crates/duckboard/src/main.rs:7435

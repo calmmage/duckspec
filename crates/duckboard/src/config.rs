@@ -365,7 +365,9 @@ impl Default for UiConfig {
 }
 
 // Shared on-disk layout with ducktui (same ~/.config/duckboard paths).
-pub use duckcore::paths::{config_dir, config_path, data_dir, project_hash, set_config_dir_override};
+pub use duckcore::paths::{
+    config_dir, config_path, data_dir, project_hash, set_config_dir_override,
+};
 
 pub fn load() -> Config {
     let path = config_path();
@@ -659,6 +661,18 @@ auto_messages = true
         assert!(loaded.model_defaults.is_empty());
     }
 
+    /// @spec harness/selection Global default model setting: Clearing the global default returns to follow-backend
+    #[test]
+    fn clearing_the_global_default_returns_to_follow_backend() {
+        let mut cfg = Config::default();
+        cfg.set_global_model_default(Some(ModelRef::new("claude-code", "opus")));
+        cfg.set_global_model_default(None);
+        assert!(cfg.global_model_default().is_none());
+        assert!(duckcore::agent::is_follow_backend(
+            cfg.global_model_default()
+        ));
+    }
+
     // @spec shell/vcs-workflow Global workflow choice: Default workflow is plain git
     #[test]
     fn default_vcs_workflow_is_git() {
@@ -686,23 +700,14 @@ auto_messages = true
     fn standing_instructions_name_vcs_tool_for_each_workflow() {
         let git = VcsWorkflow::Git.standing_instructions();
         assert!(git.contains("`git`"), "git names git: {git}");
-        assert!(
-            git.contains("Do NOT use `jj`"),
-            "git forbids jj: {git}"
-        );
+        assert!(git.contains("Do NOT use `jj`"), "git forbids jj: {git}");
 
         let jj = VcsWorkflow::Jj.standing_instructions();
         assert!(jj.contains("`jj`"), "jj names jj: {jj}");
-        assert!(
-            jj.contains("Do NOT use `git`"),
-            "jj forbids bare git: {jj}"
-        );
+        assert!(jj.contains("Do NOT use `git`"), "jj forbids bare git: {jj}");
 
         let wt = VcsWorkflow::Worktrees.standing_instructions();
-        assert!(
-            wt.contains("worktree"),
-            "worktrees names worktrees: {wt}"
-        );
+        assert!(wt.contains("worktree"), "worktrees names worktrees: {wt}");
         assert!(
             wt.contains("not `jj`") || wt.contains("— not `jj`"),
             "worktrees forbids jj: {wt}"

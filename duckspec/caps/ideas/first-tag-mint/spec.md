@@ -21,7 +21,7 @@ exploration SHALL still appear as a row on the CHANGE list.
 - **AND** the idea's tags include `ui`
 
 > test: code
-> - crates/duckboard/src/idea_store.rs:1224
+> - crates/duckboard/src/idea_store.rs:1222
 
 ### Scenario: Exploration record points at the new idea
 
@@ -30,7 +30,7 @@ exploration SHALL still appear as a row on the CHANGE list.
 - **THEN** the exploration is linked to the newly created idea
 
 > test: code
-> - crates/duckboard/src/idea_store.rs:1225
+> - crates/duckboard/src/idea_store.rs:1223
 
 ### Scenario: Linked exploration remains on the CHANGE list
 
@@ -39,7 +39,7 @@ exploration SHALL still appear as a row on the CHANGE list.
 - **THEN** that exploration still appears as a row on the CHANGE list
 
 > test: code
-> - crates/duckboard/src/idea_store.rs:1226
+> - crates/duckboard/src/idea_store.rs:1224
 
 ## Requirement: First tag on unlinked change mints a linked idea
 
@@ -63,7 +63,7 @@ that already has a linked idea SHALL NOT create another idea for that change.
 - **AND** the idea's tags include `queue`
 
 > test: code
-> - crates/duckboard/src/idea_store.rs:1257
+> - crates/duckboard/src/idea_store.rs:1251
 
 ### Scenario: Idea links to the change name
 
@@ -72,7 +72,7 @@ that already has a linked idea SHALL NOT create another idea for that change.
 - **THEN** the new idea is linked to the change name `list-marks-tags-sort`
 
 > test: code
-> - crates/duckboard/src/idea_store.rs:1258
+> - crates/duckboard/src/idea_store.rs:1252
 
 ### Scenario: Second tag on already-linked change does not mint another idea
 
@@ -81,7 +81,7 @@ that already has a linked idea SHALL NOT create another idea for that change.
 - **THEN** no additional idea is created for that change
 
 > test: code
-> - crates/duckboard/src/idea_store.rs:1285
+> - crates/duckboard/src/idea_store.rs:1279
 
 ## Requirement: Chat message does not create an idea
 
@@ -98,7 +98,7 @@ annotation gestures (mark cycle or first tag), not chat traffic.
 - **THEN** no idea is created for that exploration
 
 > test: code
-> - crates/duckboard/src/idea_store.rs:1311
+> - crates/duckboard/src/idea_store.rs:1305
 
 ## Requirement: First mark cycle mints when unlinked
 
@@ -118,4 +118,4 @@ list after the link.
 - **AND** the exploration is linked to that idea
 
 > test: code
-> - crates/duckboard/src/idea_store.rs:1322
+> - crates/duckboard/src/idea_store.rs:1316

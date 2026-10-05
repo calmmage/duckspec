@@ -7,10 +7,12 @@ use std::path::Path;
 
 use duckcore::chat_store::{ChatMessage, ChatSession, ContentBlock, Role};
 use duckcore::fast_response::{self, FastResponse};
-use duckcore::meta_card::{NextAction, trailing_next_actions};
+use duckcore::meta_card::NextAction;
+use duckcore::prose_options::next_actions_from_assistant;
 use duckcore::session_sharing::{self, DriveRole, PersistOutcome};
 use duckcore::transcript::{
-    self, TranscriptSeg, activity_collapsed_label, build_transcript_segments, thinking_collapsed_label,
+    self, TranscriptSeg, activity_collapsed_label, build_transcript_segments,
+    thinking_collapsed_label,
 };
 
 use crate::md_render::{self, StyledLine};
@@ -211,7 +213,9 @@ impl ChatPane {
         self.segments = segs
             .iter()
             .enumerate()
-            .filter_map(|(i, seg)| present_from_transcript(seg, collapse.get(i).map(|c| c.collapsed)))
+            .filter_map(|(i, seg)| {
+                present_from_transcript(seg, collapse.get(i).map(|c| c.collapsed))
+            })
             .collect();
         self.session = session;
         self.recompute_next_hints();
@@ -357,7 +361,7 @@ impl ChatPane {
             .flat_map(|s| s.body_lines.iter().cloned())
             .collect::<Vec<_>>()
             .join("\n");
-        let actions = trailing_next_actions(&answer_text);
+        let actions = next_actions_from_assistant(&answer_text);
         self.next_hints = actions
             .into_iter()
             .take(9)
@@ -451,8 +455,7 @@ impl ChatPane {
     fn on_composer_changed(&mut self) {
         // Slash palette: open for `/…` at line start; not for `//` pass-through.
         let line_start = self.composer.rsplit('\n').next().unwrap_or(&self.composer);
-        self.slash_palette_open =
-            line_start.starts_with('/') && !line_start.starts_with("//");
+        self.slash_palette_open = line_start.starts_with('/') && !line_start.starts_with("//");
     }
 
     /// Clear the composer and return the submitted text. Session mutation and
@@ -558,14 +561,15 @@ fn present_from_transcript(seg: &TranscriptSeg, collapsed: Option<bool>) -> Opti
             expanded: true,
             live: false,
         }),
-        TranscriptSeg::UserChoiceQuestion { text }
-        | TranscriptSeg::UserChoiceAnswer { text } => Some(PresentSeg {
-            kind: SegKind::Answer,
-            summary: "message".into(),
-            body_lines: vec![text.clone()],
-            expanded: true,
-            live: false,
-        }),
+        TranscriptSeg::UserChoiceQuestion { text } | TranscriptSeg::UserChoiceAnswer { text } => {
+            Some(PresentSeg {
+                kind: SegKind::Answer,
+                summary: "message".into(),
+                body_lines: vec![text.clone()],
+                expanded: true,
+                live: false,
+            })
+        }
     }
 }
 
@@ -693,6 +697,17 @@ mod tests {
         assert_eq!(pane.next_hints[1].label, "/ds-apply");
     }
 
+    // @spec chat/default-prompts Prose option next-actions: Prose fills when no meta next
+    #[test]
+    fn trailing_prose_abc_options_appear_as_numbered_hints() {
+        let mut pane = ChatPane::new("s");
+        let body = "Pick:\n\n- **A** — first\n- **B** — second\n";
+        pane.set_settled_segments(vec![answer_seg(body)]);
+        assert_eq!(pane.next_hints.len(), 2);
+        assert_eq!(pane.next_hints[0].label, "A — first");
+        assert_eq!(pane.next_hints[1].label, "B — second");
+    }
+
     // @spec tui/chat Numbered action hints: Number key activates the matching next token
     #[test]
     fn number_key_activates_the_matching_next_token() {
@@ -712,10 +727,7 @@ mod tests {
         let fr = from_user_choice(
             1,
             Some("Pick?".into()),
-            [
-                ("a".into(), "Alpha".into()),
-                ("b".into(), "Beta".into()),
-            ],
+            [("a".into(), "Alpha".into()), ("b".into(), "Beta".into())],
         );
         pane.set_fast_response(fr, true);
         assert_eq!(pane.fast_hints.len(), 2);
@@ -733,10 +745,7 @@ mod tests {
         pane.set_fast_response(fr, true);
         // Prefer fast hints over next
         let action = pane.activate_number(1);
-        assert_eq!(
-            action,
-            ChatAction::ActivatedFastResponse("opt-a".into())
-        );
+        assert_eq!(action, ChatAction::ActivatedFastResponse("opt-a".into()));
         // Semantics align with duckcore resolve
         let fr = from_user_choice(7, None, [("opt-a".into(), "Alpha".into())]);
         let pick = fast_response::resolve_cmd_digit(&fr, 1);
@@ -827,11 +836,7 @@ mod tests {
                 .iter()
                 .any(|s| s.kind == SegKind::Thinking && !s.expanded)
         );
-        assert!(
-            pane.segments
-                .iter()
-                .any(|s| s.kind == SegKind::Answer
-                    && s.body_lines.iter().any(|l| l.contains("hello answer")))
-        );
+        assert!(pane.segments.iter().any(|s| s.kind == SegKind::Answer
+            && s.body_lines.iter().any(|l| l.contains("hello answer"))));
     }
 }

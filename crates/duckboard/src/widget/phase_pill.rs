@@ -61,26 +61,27 @@ fn inert_pill_style(tint: iced::Color) -> impl Fn(&iced::Theme) -> container::St
     }
 }
 
-fn hover_tip<'a, Msg: 'a>(
-    content: Element<'a, Msg>,
-    hover: String,
-) -> Element<'a, Msg> {
+fn hover_tip<'a, Msg: 'a>(content: Element<'a, Msg>, hover: String) -> Element<'a, Msg> {
     if hover.is_empty() {
         return content;
     }
     tooltip(
         content,
-        container(text(hover).size(theme::font_sm()).color(theme::text_primary()))
-            .padding([theme::SPACING_XS, theme::SPACING_SM])
-            .style(|_t: &iced::Theme| container::Style {
-                background: Some(iced::Background::Color(theme::bg_elevated())),
-                border: iced::Border {
-                    color: theme::border_color(),
-                    width: 1.0,
-                    radius: 4.0.into(),
-                },
-                ..Default::default()
-            }),
+        container(
+            text(hover)
+                .size(theme::font_sm())
+                .color(theme::text_primary()),
+        )
+        .padding([theme::SPACING_XS, theme::SPACING_SM])
+        .style(|_t: &iced::Theme| container::Style {
+            background: Some(iced::Background::Color(theme::bg_elevated())),
+            border: iced::Border {
+                color: theme::border_color(),
+                width: 1.0,
+                radius: 4.0.into(),
+            },
+            ..Default::default()
+        }),
         tooltip::Position::Top,
     )
     .into()

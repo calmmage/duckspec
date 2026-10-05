@@ -7,8 +7,8 @@ paint, and open-region-only last-answer band.
 
 Focus layout SHALL apply to an Answer only when the effective viewer style is focus and
 that Answer is not live. When Focus layout does not apply, the Answer SHALL use classic
-presentation — including when the effective style is focus but the Answer has no trailing
-`next` meta card (classic passthrough).
+presentation — including when the effective style is focus but the Answer has no `next`
+meta card (classic passthrough).
 
 > test: code
 
@@ -20,35 +20,36 @@ presentation — including when the effective style is focus but the Answer has 
 - **THEN** the Answer uses classic presentation
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2847
+> - crates/duckboard/src/widget/agent_chat.rs:3018
 
 ### Scenario: Settled Answer without trailing next uses classic passthrough
 
 - **GIVEN** the effective viewer style is focus
-- **AND** a settled Answer with no trailing `next` meta card
+- **AND** a settled Answer with no `next` meta card
 - **WHEN** the Answer is presented
 - **THEN** the Answer uses classic presentation
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2859
+> - crates/duckboard/src/widget/agent_chat.rs:3030
 
 ### Scenario: Settled Answer with trailing next uses Focus layout
 
 - **GIVEN** the effective viewer style is focus
-- **AND** a settled Answer that ends with a trailing `next` meta card
+- **AND** a settled Answer that contains a `next` meta card
 - **WHEN** the Answer is presented
 - **THEN** the Answer uses Focus layout
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2871
+> - crates/duckboard/src/widget/agent_chat.rs:3042
 
 ## Requirement: Open region
 
-When Focus layout applies, the open region SHALL cover the trailing `next` meta card. When
-a `write` meta card ends before that trailing `next` and no other meta card lies strictly
-between them, the open region SHALL start at that `write` card and include all lines
-through the trailing `next` (preview prose between the cards included). Meta cards earlier
-in the Answer SHALL NOT extend or replace the open region.
+When Focus layout applies, the open region SHALL cover the **last** `next` meta card in
+the Answer (prose after that card is allowed). When a `write` meta card ends before that
+`next` and no other meta card lies strictly between them, the open region SHALL start at
+that `write` card and include all lines through the `next` (preview prose between the
+cards included). Meta cards earlier in the Answer SHALL NOT extend or replace the open
+region.
 
 > test: code
 
@@ -60,7 +61,7 @@ in the Answer SHALL NOT extend or replace the open region.
 - **AND** the open region ends at the last line of the Answer
 
 > test: code
-> - crates/duckboard/src/focus_answer.rs:268
+> - crates/duckboard/src/focus_answer.rs:259
 
 ### Scenario: Write then preview then trailing next opens from write through next
 
@@ -76,7 +77,7 @@ in the Answer SHALL NOT extend or replace the open region.
 - **AND** the open region ends at the `next` card end
 
 > test: code
-> - crates/duckboard/src/focus_answer.rs:293
+> - crates/duckboard/src/focus_answer.rs:284
 
 ### Scenario: Meta card between write and trailing next leaves only next open
 
@@ -90,7 +91,7 @@ in the Answer SHALL NOT extend or replace the open region.
 - **AND** the open region does not include the earlier `write` card
 
 > test: code
-> - crates/duckboard/src/focus_answer.rs:328
+> - crates/duckboard/src/focus_answer.rs:322
 
 ## Requirement: Section partition
 
@@ -116,7 +117,7 @@ ranges SHALL NOT include any open-region line.
 - **AND** the H1 does not start a foldable section
 
 > test: code
-> - crates/duckboard/src/focus_answer.rs:366
+> - crates/duckboard/src/focus_answer.rs:363
 
 ### Scenario: Heading-like lines inside fences do not start sections
 
@@ -128,7 +129,7 @@ ranges SHALL NOT include any open-region line.
 - **THEN** that line does not start a foldable section
 
 > test: code
-> - crates/duckboard/src/focus_answer.rs:406
+> - crates/duckboard/src/focus_answer.rs:403
 
 ### Scenario: Preamble before first H2 or H3 is one foldable section
 
@@ -137,7 +138,7 @@ ranges SHALL NOT include any open-region line.
 - **THEN** those leading lines form exactly one preamble section
 
 > test: code
-> - crates/duckboard/src/focus_answer.rs:429
+> - crates/duckboard/src/focus_answer.rs:426
 
 ### Scenario: No headings with open region yields one body section plus open region
 
@@ -151,7 +152,7 @@ ranges SHALL NOT include any open-region line.
 - **AND** the open region remains separate from that section
 
 > test: code
-> - crates/duckboard/src/focus_answer.rs:454
+> - crates/duckboard/src/focus_answer.rs:451
 
 ### Scenario: Section ranges exclude open-region lines
 
@@ -160,7 +161,7 @@ ranges SHALL NOT include any open-region line.
 - **THEN** no section range includes a line that belongs to the open region
 
 > test: code
-> - crates/duckboard/src/focus_answer.rs:482
+> - crates/duckboard/src/focus_answer.rs:479
 
 ## Requirement: Fold defaults and toggles
 
@@ -189,7 +190,7 @@ collapsed state.
 - **AND** the open region is shown
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2883
+> - crates/duckboard/src/widget/agent_chat.rs:3057
 
 ### Scenario: User expand survives rematerialize for the same section key
 
@@ -198,7 +199,7 @@ collapsed state.
 - **THEN** that section remains expanded
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2917
+> - crates/duckboard/src/widget/agent_chat.rs:3091
 
 ### Scenario: Leaving Focus clears section fold state
 
@@ -207,7 +208,7 @@ collapsed state.
 - **THEN** all Focus section fold state is cleared
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2945
+> - crates/duckboard/src/widget/agent_chat.rs:3119
 
 ## Requirement: Focus slice presentation (Hybrid C)
 
@@ -226,7 +227,7 @@ line count for the preamble section.
 - **THEN** the open region uses classic Answer body paint
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2972
+> - crates/duckboard/src/widget/agent_chat.rs:3146
 
 ### Scenario: Expanded foldable section uses plain content presentation
 
@@ -236,7 +237,7 @@ line count for the preamble section.
 - **AND** the section body does not use classic Answer body paint
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2999
+> - crates/duckboard/src/widget/agent_chat.rs:3178
 
 ### Scenario: Collapsed preamble label uses line count form
 
@@ -245,7 +246,7 @@ line count for the preamble section.
 - **THEN** the label includes that line count
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:3020
+> - crates/duckboard/src/widget/agent_chat.rs:3199
 
 ## Requirement: Last-answer band under Focus
 
@@ -263,7 +264,7 @@ that Answer SHALL NOT receive last-answer band styling.
 - **THEN** the open region has last-answer band styling
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:3041
+> - crates/duckboard/src/widget/agent_chat.rs:3217
 
 ### Scenario: Expanded section of last Focus Answer is not banded
 
@@ -273,4 +274,4 @@ that Answer SHALL NOT receive last-answer band styling.
 - **THEN** the section body does not have last-answer band styling
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:3063
+> - crates/duckboard/src/widget/agent_chat.rs:3239

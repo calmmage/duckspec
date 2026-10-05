@@ -22,7 +22,7 @@ apply.
 - **AND** no sidecar worktree is created for it
 
 > test: code
-> - crates/duckboard/src/worktree.rs:1042
+> - crates/duckboard/src/worktree.rs:1005
 
 ### Scenario: Jj or Worktrees may use placement
 
@@ -32,7 +32,7 @@ apply.
 - **THEN** the scope is allowed to use a dedicated sidecar worktree under this capability
 
 > test: code
-> - crates/duckboard/src/worktree.rs:1069
+> - crates/duckboard/src/worktree.rs:1032
 
 ## Requirement: Placement modes
 
@@ -62,7 +62,7 @@ Worktree SHALL use a sidecar even when Main is clean.
 - **AND** no sidecar is created for it
 
 > test: code
-> - crates/duckboard/src/worktree.rs:1099
+> - crates/duckboard/src/worktree.rs:1062
 
 ### Scenario: Worktree always has a sidecar
 
@@ -74,7 +74,7 @@ Worktree SHALL use a sidecar even when Main is clean.
 - **AND** the scope’s work root is that sidecar
 
 > test: code
-> - crates/duckboard/src/worktree.rs:1116
+> - crates/duckboard/src/worktree.rs:1079
 
 ### Scenario: Auto stays on Main when Main is free
 
@@ -86,7 +86,7 @@ Worktree SHALL use a sidecar even when Main is clean.
 - **AND** no sidecar is created for it
 
 > test: code
-> - crates/duckboard/src/worktree.rs:1140
+> - crates/duckboard/src/worktree.rs:1103
 
 ### Scenario: Auto forks when Main is in use and dirty
 
@@ -99,7 +99,7 @@ Worktree SHALL use a sidecar even when Main is clean.
 - **AND** scope A remains on main
 
 > test: code
-> - crates/duckboard/src/worktree.rs:1154
+> - crates/duckboard/src/worktree.rs:1117
 
 ### Scenario: Main pin wins over Auto fork pressure
 
@@ -111,7 +111,7 @@ Worktree SHALL use a sidecar even when Main is clean.
 - **AND** no sidecar is created for scope B
 
 > test: code
-> - crates/duckboard/src/worktree.rs:1179
+> - crates/duckboard/src/worktree.rs:1142
 
 ## Requirement: Stable naming
 
@@ -133,7 +133,7 @@ change the worktree identity.
 - **AND** the sidecar path is under `.duckboard/worktrees/duck-session-worktrees`
 
 > test: code
-> - crates/duckboard/src/worktree.rs:1197
+> - crates/duckboard/src/worktree.rs:1160
 
 ### Scenario: Display rename does not rename the worktree id
 
@@ -142,7 +142,7 @@ change the worktree identity.
 - **THEN** the worktree identity remains `duck-exp-123`
 
 > test: code
-> - crates/duckboard/src/worktree.rs:1224
+> - crates/duckboard/src/worktree.rs:1180
 
 ## Requirement: Placement persists
 
@@ -159,7 +159,7 @@ exploration’s placement.
 - **THEN** that scope’s placement is still Worktree
 
 > test: code
-> - crates/duckboard/src/worktree.rs:1238
+> - crates/duckboard/src/worktree.rs:1194
 
 ### Scenario: Promotion keeps placement on the change
 
@@ -168,4 +168,4 @@ exploration’s placement.
 - **THEN** the change’s placement is Worktree
 
 > test: code
-> - crates/duckboard/src/worktree.rs:1256
+> - crates/duckboard/src/worktree.rs:1209

@@ -43,7 +43,7 @@ report completion.
 - **AND** it suggests the apply stage as the next step
 
 > test: code
-> - crates/duckboard/src/area/change.rs:3754
+> - crates/duckboard/src/area/change.rs:3890
 
 ### Scenario: A change with only a proposal reports the design next-stage
 
@@ -52,7 +52,7 @@ report completion.
 - **THEN** it suggests the design stage as the next step
 
 > test: code
-> - crates/duckboard/src/area/change.rs:3804
+> - crates/duckboard/src/area/change.rs:3940
 
 ### Scenario: A change with all steps complete reports completion and the archive next-stage
 
@@ -63,7 +63,7 @@ report completion.
 - **AND** it suggests the archive stage as the next step
 
 > test: code
-> - crates/duckboard/src/area/change.rs:3772
+> - crates/duckboard/src/area/change.rs:3908
 
 ### Scenario: All steps complete with a review suggests the step next-stage
 
@@ -73,7 +73,7 @@ report completion.
 - **THEN** it suggests the step stage as the next step
 
 > test: code
-> - crates/duckboard/src/area/change.rs:3789
+> - crates/duckboard/src/area/change.rs:3925
 
 ## Requirement: Non-change scope orientation
 
@@ -129,8 +129,8 @@ the same session.
 - **THEN** the orientation is part of the message body sent on that turn
 
 > test: code
-> - crates/duckboard/src/area/interaction.rs:1445
-> - crates/ducktui/src/runtime.rs:731
+> - crates/duckboard/src/area/interaction.rs:1690
+> - crates/ducktui/src/runtime.rs:732
 
 ### Scenario: Orientation is present when the project has no AGENTS.md
 
@@ -139,7 +139,7 @@ the same session.
 - **THEN** the orientation is part of the message body sent on that turn
 
 > test: code
-> - crates/duckboard/src/area/interaction.rs:1463
+> - crates/duckboard/src/area/interaction.rs:1708
 
 ### Scenario: A resumed session does not repeat the orientation
 
@@ -148,8 +148,8 @@ the same session.
 - **THEN** the orientation is not included again
 
 > test: code
-> - crates/duckboard/src/area/interaction.rs:1504
-> - crates/ducktui/src/runtime.rs:766
+> - crates/duckboard/src/area/interaction.rs:1749
+> - crates/ducktui/src/runtime.rs:764
 
 ## Requirement: Current review in orientation
 
@@ -173,7 +173,7 @@ reviews.
   `duckspec/changes/{name}/reviews/{filename}`
 
 > test: code
-> - crates/duckboard/src/area/change.rs:3829
+> - crates/duckboard/src/area/change.rs:3965
 
 ### Scenario: A change with no reviews reports no current review
 
@@ -182,7 +182,7 @@ reviews.
 - **THEN** it does not report a current review
 
 > test: code
-> - crates/duckboard/src/area/change.rs:3854
+> - crates/duckboard/src/area/change.rs:3990
 
 ### Scenario: Adding a review does not change reported step progress
 
@@ -192,7 +192,7 @@ reviews.
 - **THEN** both report the same step progress (done and total)
 
 > test: code
-> - crates/duckboard/src/area/change.rs:3869
+> - crates/duckboard/src/area/change.rs:4005
 
 ## Requirement: Inputs ledger pointer
 

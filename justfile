@@ -2,18 +2,37 @@
 help:
     @just --list
 
+# One release build for every binary install + app bundle need.
+# Shared by install, bundle, and run so deploys do not recompile the same graph.
+build-release:
+    cargo build --release \
+        -p duckspec \
+        -p duckboard \
+        -p duckchat-claude-acp \
+        -p duckchat-codex-acp \
+        -p duckchat-agy-acp
+
 # Install CLI tools to ~/.cargo/bin and deploy Duckboard.app to /Applications.
 # Quit a running Duckboard first so the Applications copy can be replaced.
 install:
     #!/usr/bin/env bash
     set -euo pipefail
     echo "==> Quit Duckboard if it is running (Applications replace needs a free path)."
-    cargo install --path crates/duckspec
-    cargo install --path crates/duckboard
-    cargo install --path crates/duckchat-claude-acp
-    cargo install --path crates/duckchat-codex-acp
-    cargo install --path crates/duckchat-agy-acp
-    just bundle
+    just build-release
+
+    BIN="${CARGO_HOME:-$HOME/.cargo}/bin"
+    mkdir -p "${BIN}"
+    echo "==> Installing release bins → ${BIN}"
+    # Workspace build produces ds (duckspec) + duckboard + harness ACP agents.
+    install -m 755 target/release/ds                  "${BIN}/ds"
+    install -m 755 target/release/duckboard           "${BIN}/duckboard"
+    install -m 755 target/release/duckchat-claude-acp "${BIN}/duckchat-claude-acp"
+    install -m 755 target/release/duckchat-codex-acp  "${BIN}/duckchat-codex-acp"
+    install -m 755 target/release/duckchat-agy-acp    "${BIN}/duckchat-agy-acp"
+
+    # Assemble from the same target/release tree (no second cargo build).
+    just bundle-app
+
     APP_SRC="dist/Duckboard.app"
     APP_DST="/Applications/Duckboard.app"
     echo "==> Deploying ${APP_SRC} → ${APP_DST}"
@@ -25,8 +44,7 @@ install:
 
 # Run duckboard from source (release build). Builds ACP agents into the same
 # target/ tree so sibling binary discovery works.
-run:
-    cargo build --release -p duckchat-claude-acp -p duckchat-codex-acp -p duckchat-agy-acp -p duckboard
+run: build-release
     cargo run --release -p duckboard
 
 # Push main bookmark to origin (jj).
@@ -123,7 +141,12 @@ rerelease:
     echo "   https://github.com/squareduck/duckspec/actions"
 
 # Build a macOS Duckboard.app bundle at dist/Duckboard.app.
-bundle:
+bundle: build-release bundle-app
+
+# Assemble dist/Duckboard.app from already-built target/release binaries.
+# Callers must run build-release first (install and bundle do).
+[private]
+bundle-app:
     #!/usr/bin/env bash
     set -euo pipefail
 
@@ -135,14 +158,18 @@ bundle:
     APP="${OUT_DIR}/${APP_NAME}.app"
     CONTENTS="${APP}/Contents"
 
-    echo "==> Building release binaries (duckboard ${VERSION} + ACP agents)"
-    # Agents ship as siblings of duckboard so Finder-launched apps (skeletal
-    # PATH) still resolve harness turns via sibling-of-exe discovery.
-    cargo build --release -p duckchat-claude-acp -p duckchat-codex-acp -p duckchat-agy-acp -p duckboard
+    for bin in duckboard duckchat-claude-acp duckchat-codex-acp duckchat-agy-acp; do
+        if [[ ! -x "target/release/${bin}" ]]; then
+            echo "Error: missing target/release/${bin}. Run: just build-release" >&2
+            exit 1
+        fi
+    done
 
-    echo "==> Assembling ${APP}"
+    echo "==> Assembling ${APP} (duckboard ${VERSION} + ACP agents)"
     rm -rf "${APP}"
     mkdir -p "${CONTENTS}/MacOS" "${CONTENTS}/Resources"
+    # Agents ship as siblings of duckboard so Finder-launched apps (skeletal
+    # PATH) still resolve harness turns via sibling-of-exe discovery.
     cp target/release/duckboard "${CONTENTS}/MacOS/duckboard"
     cp target/release/duckchat-claude-acp "${CONTENTS}/MacOS/duckchat-claude-acp"
     cp target/release/duckchat-codex-acp "${CONTENTS}/MacOS/duckchat-codex-acp"

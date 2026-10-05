@@ -52,9 +52,8 @@ fn evaluate_with(
         _ => false,
     };
 
-    let source_ahead = !running_source.is_empty()
-        && !disk_source.is_empty()
-        && running_source != disk_source;
+    let source_ahead =
+        !running_source.is_empty() && !disk_source.is_empty() && running_source != disk_source;
 
     if !version_ahead && !source_ahead {
         return None;
@@ -126,11 +125,7 @@ fn read_disk_version(project_root: &Path) -> Option<String> {
 /// Same rules as bake-time (`source_fingerprint` via `build.rs`).
 fn read_disk_source_id(project_root: &Path) -> Option<String> {
     let id = source_fingerprint::resolve_source_id(project_root);
-    if id.is_empty() {
-        None
-    } else {
-        Some(id)
-    }
+    if id.is_empty() { None } else { Some(id) }
 }
 
 fn read_toml_table(path: &Path) -> Option<toml::Table> {
@@ -218,11 +213,7 @@ fn install_recipe_body(justfile: &str) -> Option<String> {
         body.push('\n');
     }
     let body = body.trim().to_string();
-    if body.is_empty() {
-        None
-    } else {
-        Some(body)
-    }
+    if body.is_empty() { None } else { Some(body) }
 }
 
 #[cfg(test)]
@@ -266,12 +257,7 @@ mod tests {
         running_source: &str,
         disk_source: &str,
     ) -> Option<StaleBuildInfo> {
-        evaluate_with(
-            root,
-            running_version,
-            running_source,
-            Some(disk_source),
-        )
+        evaluate_with(root, running_version, running_source, Some(disk_source))
     }
 
     // @spec shell/stale-build Self-project only: Non-duckboard project yields no stale signal
@@ -386,23 +372,33 @@ mod tests {
         let path = project_justfile_path();
         let justfile = fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read justfile at {}: {e}", path.display()));
-        let body = install_recipe_body(&justfile)
-            .expect("justfile should contain an install: recipe");
+        let body =
+            install_recipe_body(&justfile).expect("justfile should contain an install: recipe");
 
+        // One workspace release build, then copy into cargo bin — not five
+        // separate `cargo install --path` graphs.
         assert!(
-            body.contains("cargo install --path crates/duckspec"),
-            "install must cargo-install duckspec: {body}"
+            body.contains("just build-release") || body.contains("build-release"),
+            "install must build release binaries once: {body}"
         );
         assert!(
-            body.contains("cargo install --path crates/duckboard"),
-            "install must cargo-install duckboard: {body}"
+            body.contains("target/release/ds") && body.contains("${BIN}/ds"),
+            "install must place ds in the cargo bin directory: {body}"
         );
         assert!(
-            body.contains("cargo install --path crates/duckchat-claude-acp"),
-            "install must cargo-install duckchat-claude-acp: {body}"
+            body.contains("target/release/duckboard") && body.contains("${BIN}/duckboard"),
+            "install must place duckboard in the cargo bin directory: {body}"
         );
         assert!(
-            body.contains("just bundle") || body.contains("bundle"),
+            body.contains("target/release/duckchat-claude-acp")
+                && body.contains("${BIN}/duckchat-claude-acp"),
+            "install must place duckchat-claude-acp in the cargo bin directory: {body}"
+        );
+        assert!(
+            body.contains("just bundle-app")
+                || body.contains("bundle-app")
+                || body.contains("just bundle")
+                || body.contains("bundle"),
             "install must assemble the macOS app bundle: {body}"
         );
         assert!(

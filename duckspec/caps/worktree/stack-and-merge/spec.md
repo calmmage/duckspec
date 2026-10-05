@@ -23,7 +23,7 @@ ordinary trunk-based placement policy.
 - **AND** not solely from the project trunk tip independent of A
 
 > test: code
-> - crates/duckboard/src/worktree.rs:1411
+> - crates/duckboard/src/worktree.rs:1358
 
 ### Scenario: Cyclic base is rejected
 
@@ -33,7 +33,7 @@ ordinary trunk-based placement policy.
 - **AND** B’s base is unchanged
 
 > test: code
-> - crates/duckboard/src/worktree.rs:1440
+> - crates/duckboard/src/worktree.rs:1387
 
 ### Scenario: Clearing base returns create policy to trunk
 
@@ -44,7 +44,7 @@ ordinary trunk-based placement policy.
 - **AND** not from A’s work-tree revision
 
 > test: code
-> - crates/duckboard/src/worktree.rs:1455
+> - crates/duckboard/src/worktree.rs:1405
 
 ## Requirement: Require base merged
 
@@ -65,7 +65,7 @@ integrated to Main, agent turns SHALL be allowed with the flag still set.
 - **AND** the UI indicates that A must be merged first
 
 > test: code
-> - crates/duckboard/src/worktree.rs:1483
+> - crates/duckboard/src/worktree.rs:1433
 
 ### Scenario: Send allowed when flag unset even if base unmerged
 
@@ -75,7 +75,7 @@ integrated to Main, agent turns SHALL be allowed with the flag still set.
 - **THEN** the turn is allowed
 
 > test: code
-> - crates/duckboard/src/worktree.rs:1498
+> - crates/duckboard/src/worktree.rs:1448
 
 ### Scenario: Send allowed after base integrated to Main
 
@@ -85,7 +85,7 @@ integrated to Main, agent turns SHALL be allowed with the flag still set.
 - **THEN** the turn is allowed
 
 > test: code
-> - crates/duckboard/src/worktree.rs:1510
+> - crates/duckboard/src/worktree.rs:1460
 
 ## Requirement: Integrate to Main
 
@@ -110,7 +110,7 @@ NOT report success or drop the sidecar as if merged.
   command
 
 > test: code
-> - crates/duckboard/src/worktree.rs:1527
+> - crates/duckboard/src/worktree.rs:1477
 
 ### Scenario: Clean integrate forgets the sidecar
 
@@ -120,7 +120,7 @@ NOT report success or drop the sidecar as if merged.
 - **AND** the scope no longer binds to that sidecar path
 
 > test: code
-> - crates/duckboard/src/worktree.rs:1553
+> - crates/duckboard/src/worktree.rs:1497
 
 ### Scenario: Conflict stops without claiming success
 
@@ -131,7 +131,7 @@ NOT report success or drop the sidecar as if merged.
 - **AND** the sidecar binding remains
 
 > test: code
-> - crates/duckboard/src/worktree.rs:1575
+> - crates/duckboard/src/worktree.rs:1513
 
 ### Scenario: Explicit merge to main uses the same integrate path
 
@@ -140,7 +140,7 @@ NOT report success or drop the sidecar as if merged.
 - **THEN** the same integrate-to-Main behavior applies as on archive success
 
 > test: code
-> - crates/duckboard/src/worktree.rs:1605
+> - crates/duckboard/src/worktree.rs:1537
 
 ## Requirement: Stack after parent merge
 
@@ -161,4 +161,4 @@ claiming the dependent is on Main.
 - **AND** the update is not left claiming success if it would conflict
 
 > test: code
-> - crates/duckboard/src/worktree.rs:1635
+> - crates/duckboard/src/worktree.rs:1557

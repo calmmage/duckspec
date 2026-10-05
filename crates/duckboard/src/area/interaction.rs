@@ -389,6 +389,10 @@ pub struct AgentSession {
     /// into the session file. Survives exploration→change promotion with the
     /// session value.
     pub pilot: crate::build_pilot::PilotState,
+    /// Test-only: treat preferred model as catalog-available so send paths can
+    /// start turns with a stub handle without a process model catalog.
+    #[cfg(test)]
+    pub force_model_available: bool,
     /// Donor list for empty-session ghost continuity after NewSession.
     /// Ephemeral — not persisted. Cleared when the session is no longer empty.
     pub inherited_next_actions: Option<Vec<crate::meta_card::NextAction>>,
@@ -417,6 +421,21 @@ pub struct AgentSession {
     /// (offset unchanged but content bounds grew). Without this distinction
     /// the latter would race the auto-snap task and unstick us.
     pub last_chat_offset_y: Option<f32>,
+    /// Cached content-space top of the last non-priming User block for sticky
+    /// last-user visibility. `None` when unknown, no source, or after layout
+    /// invalidation — sticky stays hidden until remeasured. Ephemeral.
+    pub sticky_last_user_content_top: Option<f32>,
+    /// Last sticky source block index used to decide content-top invalidation.
+    /// Compared with the re-resolved last non-priming User idx on materialize.
+    /// Ephemeral.
+    pub sticky_last_user_source_idx: Option<usize>,
+    /// When true, schedule a sticky content-top layout measure even if a top
+    /// is already cached (rematerialize refresh after auto-collapse, etc.).
+    /// Cleared when a measure result is applied. Ephemeral.
+    pub sticky_last_user_remeasure: bool,
+    /// Read-only body editor for the sticky last-user panel. Synced from the
+    /// source User block text on materialize. Ephemeral.
+    pub sticky_last_user_editor: EditorState,
     /// Spacer above fast response so short history pins chips above the
     /// composer inside the scroll column. Recomputed from scroll/measure
     /// bounds via [`crate::fast_response::bottom_pad`]. Ephemeral.
@@ -530,12 +549,18 @@ impl AgentSession {
             next_actions: Vec::new(),
             next_action_idx: 0,
             pilot: crate::build_pilot::PilotState::Off,
+            #[cfg(test)]
+            force_model_available: false,
             inherited_next_actions: None,
             scope_facts: None,
             queue_editor: None,
             idea_description: None,
             stick_to_bottom: true,
             last_chat_offset_y: None,
+            sticky_last_user_content_top: None,
+            sticky_last_user_source_idx: None,
+            sticky_last_user_remeasure: false,
+            sticky_last_user_editor: EditorState::new(""),
             fast_response_top_pad: 0.0,
             pending_snap_to_bottom: false,
             pending_chat_autoscroll: None,
@@ -565,11 +590,7 @@ impl AgentSession {
     /// a write completed. Displayed-only sessions are skipped without error.
     pub fn persist(&self, project_root: Option<&std::path::Path>) -> bool {
         matches!(
-            duckcore::session_sharing::persist_driven(
-                &self.session,
-                self.drive_role,
-                project_root
-            ),
+            duckcore::session_sharing::persist_driven(&self.session, self.drive_role, project_root),
             duckcore::session_sharing::PersistOutcome::Written
         )
     }
@@ -618,8 +639,8 @@ impl AgentSession {
     }
 
     /// Rebuild `next_actions` from empty-session inherited list or lifecycle
-    /// bootstrap, or the trailing `next` card on the last non-priming
-    /// assistant message.
+    /// bootstrap, or trailing `next` / A–B–C prose options on the last
+    /// non-priming assistant message.
     ///
     /// `after_turn`: pass true from TurnComplete so the ghost starts at the
     /// first ranked action. Chrome/scope rebuilds pass false so Tab cycle is
@@ -673,6 +694,13 @@ impl AgentSession {
 
     /// Effective model: preferred + process-catalog availability.
     pub(crate) fn effective_model(&self) -> EffectiveModel {
+        #[cfg(test)]
+        if self.force_model_available {
+            return match self.preferred_model() {
+                Some(m) => EffectiveModel::Available(m),
+                None => EffectiveModel::Available(ModelRef::new("test", "test-model")),
+            };
+        }
         resolve_effective_model(self.preferred_model().as_ref(), model_in_process_catalog)
     }
 
@@ -726,7 +754,7 @@ pub fn free_content_chat_width_for(window_w: f32, list_w: f32) -> f32 {
 
 /// Uncustomized interaction column width: half of free space, floored at min.
 pub fn equal_interaction_width(window_w: f32) -> f32 {
-    equal_interaction_width_for(window_w, theme::LIST_COLUMN_WIDTH)
+    (free_content_chat_width(window_w) / 2.0).max(interaction_toggle::MIN_PANEL_WIDTH)
 }
 
 /// Uncustomized interaction width with an explicit list-column width.
@@ -1146,9 +1174,8 @@ mod tests {
 
         let mut ix = InteractionState::default();
         let mut ax = AgentSession::new("exp-1".into(), ScopeKind::Exploration);
-        ax.pilot = crate::build_pilot::PilotState::Armed(
-            crate::slash_commands::BuildPilotMode::Auto,
-        );
+        ax.pilot =
+            crate::build_pilot::PilotState::Armed(crate::slash_commands::BuildPilotMode::Auto);
         ax.session.is_streaming = true;
         ix.sessions.push(ax);
         ix.active_session = 0;
@@ -1178,9 +1205,8 @@ mod tests {
 
         let mut ix = InteractionState::default();
         let mut ax = AgentSession::new("exp-1".into(), ScopeKind::Exploration);
-        ax.pilot = crate::build_pilot::PilotState::Armed(
-            crate::slash_commands::BuildPilotMode::Fast,
-        );
+        ax.pilot =
+            crate::build_pilot::PilotState::Armed(crate::slash_commands::BuildPilotMode::Fast);
         ax.session.is_streaming = false;
         ix.sessions.push(ax);
         ix.active_session = 0;
@@ -1204,9 +1230,8 @@ mod tests {
     fn thrash_cancel_leaves_pilot_off_and_blocks_auto_send() {
         // GIVEN armed pilot mid-stream
         let mut ax = AgentSession::new("exp-1".into(), ScopeKind::Exploration);
-        ax.pilot = crate::build_pilot::PilotState::Armed(
-            crate::slash_commands::BuildPilotMode::Auto,
-        );
+        ax.pilot =
+            crate::build_pilot::PilotState::Armed(crate::slash_commands::BuildPilotMode::Auto);
         ax.session.is_streaming = true;
         apply_answer_content_delta(&mut ax.session, "half-written");
         // WHEN thrash cancel path runs (notice + disarm + cancel flags)
@@ -1221,12 +1246,12 @@ mod tests {
             reason: None,
         }];
         let pilot_send = if !was_cancel {
-            crate::build_pilot::maybe_auto_send(&mut ax.pilot, &safe_next)
+            crate::build_pilot::maybe_auto_send(&mut ax.pilot, &safe_next, None)
         } else {
             None
         };
         assert!(pilot_send.is_none());
-        assert!(crate::build_pilot::maybe_auto_send(&mut ax.pilot, &safe_next).is_none());
+        assert!(crate::build_pilot::maybe_auto_send(&mut ax.pilot, &safe_next, None).is_none());
     }
 
     /// Failed/no-op kick send leaves pilot Off (atomic arm+kick).
@@ -1251,15 +1276,214 @@ mod tests {
         assert!(ax.session.messages.is_empty());
     }
 
+    /// @spec chat/build-pilot Focus independence: Hop after TurnComplete does not require active session
+    #[test]
+    fn hop_after_turncomplete_does_not_require_active_session() {
+        use crate::chat_store::{ContentBlock, Role};
+        use duckchat::{AgentCommand, stub_handle};
+
+        // GIVEN two sessions; active is 0; background session 1 is armed with a stub handle
+        let mut ix = InteractionState::default();
+        let mut foreground = AgentSession::new("change-a".into(), ScopeKind::Change);
+        foreground.session.id = "sess-fg".into();
+        let mut background = AgentSession::new("change-a".into(), ScopeKind::Change);
+        background.session.id = "sess-bg".into();
+        // Prior messages so hop is not AGENTS.md priming (display would not be `confirm`).
+        background
+            .session
+            .messages
+            .push(crate::chat_store::ChatMessage {
+                role: Role::User,
+                content: vec![ContentBlock::Text("prior".into())],
+                timestamp: String::new(),
+                is_priming: false,
+            });
+        background.pilot =
+            crate::build_pilot::PilotState::Armed(crate::slash_commands::BuildPilotMode::Auto);
+        let (handle, mut cmd_rx) = stub_handle(std::env::temp_dir());
+        background.agent_handle = Some(handle);
+        background.force_model_available = true;
+        ix.sessions.push(foreground);
+        ix.sessions.push(background);
+        ix.active_session = 0;
+
+        let hl = SyntaxHighlighter::new();
+        let next = [crate::meta_card::NextAction {
+            send: "confirm".into(),
+            reason: None,
+        }];
+
+        // WHEN TurnComplete hop runs on the non-active session by id (product path shape)
+        let ax = ix
+            .find_session_mut("sess-bg")
+            .expect("background session by id");
+        let send = crate::build_pilot::maybe_auto_send(&mut ax.pilot, &next, None);
+        assert_eq!(send.as_deref(), Some("confirm"));
+        let started = dispatch_pilot_auto_send(ax, send.expect("hop"), &hl);
+
+        // THEN a new agent turn is started on that background session
+        assert!(
+            started,
+            "dispatch must start a turn on the background session"
+        );
+        assert!(ax.session.is_streaming);
+        assert!(ax.session.messages.iter().any(|m| {
+            m.role == Role::User
+                && m.content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Text(t) if t == "confirm"))
+        }));
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(AgentCommand::RunTurn(req)) if req.prompt.contains("confirm")
+        ));
+        // AND the pilot remains armed; active selection is still foreground
+        assert!(ax.pilot.is_armed());
+        assert_eq!(ix.active_session, 0);
+        assert_eq!(ix.active().map(|a| a.session.id.as_str()), Some("sess-fg"));
+        // Foreground was not hopped
+        let fg = &ix.sessions[0];
+        assert!(!fg.session.is_streaming);
+        assert!(fg.session.messages.is_empty());
+    }
+
+    /// @spec chat/build-pilot Failed hop disarms: Failed hop with no handle disarms and notices
+    #[test]
+    fn failed_hop_with_no_handle_disarms_and_notices() {
+        use crate::chat_store::{ContentBlock, Role};
+
+        // GIVEN a session armed in auto mode with no agent handle
+        let mut ax = AgentSession::new("change-a".into(), ScopeKind::Change);
+        ax.pilot =
+            crate::build_pilot::PilotState::Armed(crate::slash_commands::BuildPilotMode::Auto);
+        assert!(ax.agent_handle.is_none());
+        let hl = SyntaxHighlighter::new();
+        // AND rank-1 is auto-sendable — WHEN dispatch attempts the hop
+        dispatch_pilot_auto_send(&mut ax, "confirm".into(), &hl);
+        // THEN pilot is disarmed AND a system notice is recorded AND no turn started
+        assert!(!ax.pilot.is_armed());
+        assert!(ax.session.messages.iter().any(|m| {
+            m.role == Role::System
+                && m.content.iter().any(|b| {
+                    matches!(
+                        b,
+                        ContentBlock::Text(t) if t.contains("Pilot stopped")
+                    )
+                })
+        }));
+        assert!(!ax.session.is_streaming);
+    }
+
+    /// @spec chat/build-pilot Mid-turn choice auto-answer: Armed pilot auto-selects first chip when none marked recommended
+    #[test]
+    fn armed_pilot_auto_selects_first_chip_when_none_marked_recommended() {
+        use crate::chat_store::{ContentBlock, Role};
+        use crate::scope::ScopeKind;
+        use duckchat::stub_handle;
+
+        // GIVEN a session armed in auto mode with an agent handle (in-band answer path)
+        let mut ax = AgentSession::new("foo".into(), ScopeKind::Change);
+        ax.pilot =
+            crate::build_pilot::PilotState::Armed(crate::slash_commands::BuildPilotMode::Auto);
+        let (handle, _rx) = stub_handle(std::env::temp_dir());
+        ax.agent_handle = Some(handle);
+        // AND a live mid-turn user-choice request with two options and no recommended mark
+        // WHEN that user-choice request is applied
+        apply_user_choice_request(
+            &mut ax,
+            11,
+            Some("Pick?".into()),
+            vec![
+                ("opt-a".into(), "Alpha".into()),
+                ("opt-b".into(), "Beta".into()),
+            ],
+            false,
+        );
+        // THEN the first option is answered in-band
+        assert!(matches!(
+            ax.session.messages.last().map(|m| (&m.role, m.content.as_slice())),
+            Some((
+                Role::User,
+                [ContentBlock::UserChoiceAnswer { text }]
+            )) if text == "Alpha"
+        ));
+        assert!(!ax.is_awaiting_user);
+        // AND the session pilot remains armed
+        assert!(ax.pilot.is_armed());
+    }
+
+    /// @spec chat/build-pilot Mid-turn choice auto-answer: Armed pilot auto-selects recommended-marked chip over first
+    #[test]
+    fn armed_pilot_auto_selects_recommended_marked_chip_over_first() {
+        use crate::chat_store::{ContentBlock, Role};
+        use crate::scope::ScopeKind;
+        use duckchat::stub_handle;
+
+        // GIVEN a session armed in auto mode with an agent handle
+        let mut ax = AgentSession::new("foo".into(), ScopeKind::Change);
+        ax.pilot =
+            crate::build_pilot::PilotState::Armed(crate::slash_commands::BuildPilotMode::Auto);
+        let (handle, _rx) = stub_handle(std::env::temp_dir());
+        ax.agent_handle = Some(handle);
+        // AND a live mid-turn user-choice whose second option label is marked recommended
+        // WHEN that user-choice request is applied
+        apply_user_choice_request(
+            &mut ax,
+            12,
+            Some("Pick?".into()),
+            vec![
+                ("opt-a".into(), "Alpha".into()),
+                ("opt-b".into(), "Beta (recommended)".into()),
+            ],
+            false,
+        );
+        // THEN the recommended option is answered in-band
+        assert!(matches!(
+            ax.session.messages.last().map(|m| (&m.role, m.content.as_slice())),
+            Some((
+                Role::User,
+                [ContentBlock::UserChoiceAnswer { text }]
+            )) if text == "Beta (recommended)"
+        ));
+        assert!(!ax.is_awaiting_user);
+        // AND the session pilot remains armed
+        assert!(ax.pilot.is_armed());
+    }
+
+    /// Armed pilot without handle leaves choice awaiting (no fake settle).
+    #[test]
+    fn armed_pilot_without_handle_leaves_user_choice_awaiting() {
+        use crate::scope::ScopeKind;
+
+        let mut ax = AgentSession::new("foo".into(), ScopeKind::Change);
+        ax.pilot =
+            crate::build_pilot::PilotState::Armed(crate::slash_commands::BuildPilotMode::Auto);
+        assert!(ax.agent_handle.is_none());
+        apply_user_choice_request(
+            &mut ax,
+            13,
+            Some("Pick?".into()),
+            vec![
+                ("opt-a".into(), "Alpha".into()),
+                ("opt-b".into(), "Beta".into()),
+            ],
+            false,
+        );
+        // THEN still awaiting; no host Q→A settle; pilot still armed
+        assert!(ax.is_awaiting_user);
+        assert!(ax.session.messages.is_empty());
+        assert_eq!(ax.fast_response.options.len(), 2);
+        assert!(ax.pilot.is_armed());
+    }
+
     /// @spec chat/build-pilot Disarm controls: User cancel of main turn disarms without pilot auto-send on that completion
     #[test]
     fn user_cancel_of_main_turn_disarms_without_pilot_auto_send_on_that_completion() {
         // GIVEN a session armed in auto mode with a main agent turn streaming
         // AND the completed turn would otherwise expose a safe rank-1 next
         let mut ax = AgentSession::new("exp-1".into(), ScopeKind::Exploration);
-        ax.pilot = crate::build_pilot::PilotState::Armed(
-            crate::slash_commands::BuildPilotMode::Auto,
-        );
+        ax.pilot =
+            crate::build_pilot::PilotState::Armed(crate::slash_commands::BuildPilotMode::Auto);
         ax.session.is_streaming = true;
         let safe_next = [crate::meta_card::NextAction {
             send: "confirm".into(),
@@ -1274,7 +1498,7 @@ mod tests {
         ax.cancel_in_flight = false;
         ax.pilot = crate::build_pilot::PilotState::Off;
         let pilot_send = if !was_cancel {
-            crate::build_pilot::maybe_auto_send(&mut ax.pilot, &safe_next)
+            crate::build_pilot::maybe_auto_send(&mut ax.pilot, &safe_next, None)
         } else {
             None
         };
@@ -1283,7 +1507,7 @@ mod tests {
         assert!(!ax.pilot.is_armed());
         assert!(pilot_send.is_none());
         // And even if someone forgot was_cancel, pilot Off still blocks send
-        assert!(crate::build_pilot::maybe_auto_send(&mut ax.pilot, &safe_next).is_none());
+        assert!(crate::build_pilot::maybe_auto_send(&mut ax.pilot, &safe_next, None).is_none());
     }
 
     // @spec chat/default-prompts Agent input hints gate: Empty-session next actions remain when agent input hints disabled
@@ -1431,13 +1655,11 @@ mod tests {
         );
     }
 
-    /// @spec harness/selection Default model resolution: With no preferred model at any cascade level, the model is not available
+    /// @spec harness/selection Default model resolution: Follow-backend with an empty catalog is not available
     #[test]
-    fn with_no_preferred_model_at_any_cascade_level_the_model_is_not_available() {
-        // GIVEN no per-chat pin
-        // AND no project override
-        // AND no global default
-        // WHEN the effective model for a turn is resolved
+    fn follow_backend_with_an_empty_catalog_is_not_available() {
+        // GIVEN no per-chat pin, no project override, follow-backend global
+        // AND an empty process model catalog (resolve yields None)
         let preferred = preferred_turn_model(None, None, None);
         let effective = resolve_effective_model(preferred.as_ref(), |_| true);
         // THEN the model for the turn is not available
@@ -2965,6 +3187,56 @@ preview body
         assert_eq!(ix.width, free_content_chat_width(new_w) / 2.0);
     }
 
+    // @spec layout/content-chat-split Uncustomized equal width: List width change rebalances uncustomized half free space
+    #[test]
+    fn list_width_change_rebalances_uncustomized_half_free_space() {
+        // GIVEN an uncustomized panel at stock list width
+        let window_w = theme::DEFAULT_WINDOW_WIDTH;
+        let mut ix = InteractionState::default();
+        assert!(!ix.width_customized);
+        let stock_list = theme::LIST_COLUMN_WIDTH;
+        let wider_list = stock_list + 80.0;
+        assert!(
+            free_content_chat_width_for(window_w, wider_list) / 2.0
+                > interaction_toggle::MIN_PANEL_WIDTH
+        );
+        // WHEN the list column width grows and uncustomized width is rebalanced
+        rebalance_uncustomized_for(&mut ix, window_w, wider_list);
+        // THEN interaction width is half free with the new list width
+        assert_eq!(ix.width, equal_interaction_width_for(window_w, wider_list));
+        assert_eq!(
+            ix.width,
+            free_content_chat_width_for(window_w, wider_list) / 2.0
+        );
+    }
+
+    // @spec layout/content-chat-split List column width: Free space uses live list width
+    #[test]
+    fn free_space_uses_live_list_width() {
+        // GIVEN a fixed window and free space at stock list width
+        let window_w = theme::DEFAULT_WINDOW_WIDTH;
+        let stock = free_content_chat_width(window_w);
+        // WHEN free space is computed with a larger list width
+        let larger = free_content_chat_width_for(window_w, theme::LIST_COLUMN_WIDTH + 100.0);
+        // THEN free space is strictly smaller
+        assert!(larger < stock);
+    }
+
+    // @spec layout/content-chat-split List column width: Grip sets list width within clamps
+    #[test]
+    fn grip_sets_list_width_within_clamps() {
+        // GIVEN stock list width and a chosen in-range value
+        let stock = theme::LIST_COLUMN_WIDTH;
+        let chosen = stock + 40.0;
+        let min = crate::widget::list_resize::MIN_LIST_WIDTH;
+        let max = crate::widget::list_resize::MAX_LIST_WIDTH;
+        assert!(chosen > min && chosen < max);
+        // WHEN the grip applies the chosen width (clamp as main does)
+        let applied = chosen.clamp(min, max);
+        // THEN the session list width equals the chosen value
+        assert_eq!(applied, chosen);
+    }
+
     // @spec layout/content-chat-split Uncustomized equal width: Half floors at minimum panel width
     #[test]
     fn half_floors_at_minimum_panel_width() {
@@ -3437,6 +3709,8 @@ fn handle_agent_chat(
                 .map(|b| b.is_priming)
                 .unwrap_or(false);
             agent_chat::toggle_collapse(&mut ax.chat_collapse, idx);
+            // Collapse changes layout above later blocks — remeasure sticky top.
+            ax.sticky_last_user_content_top = None;
             if is_priming {
                 let now_collapsed = ax
                     .chat_collapse
@@ -3456,6 +3730,8 @@ fn handle_agent_chat(
         agent_chat::Msg::ToggleFocusSection { block_idx, key } => {
             let folds = ax.focus_folds.entry(block_idx).or_default();
             crate::focus_answer::toggle_section_fold(folds, &key);
+            // Focus folds change Answer height; remeasure sticky top.
+            ax.sticky_last_user_content_top = None;
         }
         agent_chat::Msg::ActivateFastResponse(pick) => {
             // Fast response only — never the oneshot default-prompt list.
@@ -3554,8 +3830,32 @@ fn handle_agent_chat(
                 ax.next_action_idx,
                 delta,
             );
-            // Heuristic: Tab was handled for the chat input — keep Cmd-R etc.
-            // working and signal focus for the follow-up focus task.
+            // Keep Cmd-R etc. working; signal focus for the follow-up focus task.
+            ax.chat_input_focused = true;
+        }
+        agent_chat::Msg::FillNextAction => {
+            if !ax.chat_input.text().trim().is_empty() {
+                return;
+            }
+            if !crate::default_prompts::can_fill_next_action(
+                ax.session.is_streaming,
+                ax.next_actions.len(),
+            ) {
+                return;
+            }
+            let Some(text) = crate::default_prompts::next_empty_submit_text(
+                ax.session.is_streaming,
+                &ax.next_actions,
+                ax.next_action_idx,
+            ) else {
+                return;
+            };
+            let mut new_state = EditorState::new(&text);
+            let last_line = new_state.lines.len().saturating_sub(1);
+            let last_col = new_state.lines[last_line].len();
+            new_state.cursor = text_edit::Pos::new(last_line, last_col);
+            ax.chat_input = new_state;
+            rehighlight_input(&mut ax.chat_input, highlighter);
             ax.chat_input_focused = true;
         }
         agent_chat::Msg::CancelPressed => {
@@ -3635,6 +3935,14 @@ fn handle_agent_chat(
             // Operation-based measure — works even when content fits the
             // viewport and iced suppresses on_scroll.
             recompute_fast_response_top_pad(ax, viewport_h, content_h);
+        }
+        agent_chat::Msg::StickyLastUserLayout { content_top } => {
+            ax.sticky_last_user_content_top = content_top;
+            ax.sticky_last_user_remeasure = false;
+        }
+        agent_chat::Msg::StickyLastUserAction(action) => {
+            // Read-only sticky body — swallow editor actions without mutating.
+            let _ = action;
         }
     }
 
@@ -3845,7 +4153,11 @@ pub fn recover_from_lost_session(ax: &mut AgentSession, highlighter: &SyntaxHigh
         })
     else {
         ax.session.is_streaming = false;
-        if let Some(root) = ax.agent_handle.as_ref().map(|h| h.working_dir().to_path_buf()) {
+        if let Some(root) = ax
+            .agent_handle
+            .as_ref()
+            .map(|h| h.working_dir().to_path_buf())
+        {
             if !ax.mark_driven_and_persist(Some(root.as_path())) {
                 tracing::error!("failed to persist cleared session id");
             }
@@ -3858,7 +4170,11 @@ pub fn recover_from_lost_session(ax: &mut AgentSession, highlighter: &SyntaxHigh
     // Local system messages never needed an agent turn — do not re-dispatch.
     let Some(agent_text) = crate::slash_commands::agent_prompt_for_recovery(&text) else {
         ax.session.is_streaming = false;
-        if let Some(root) = ax.agent_handle.as_ref().map(|h| h.working_dir().to_path_buf()) {
+        if let Some(root) = ax
+            .agent_handle
+            .as_ref()
+            .map(|h| h.working_dir().to_path_buf())
+        {
             if !ax.mark_driven_and_persist(Some(root.as_path())) {
                 tracing::error!("failed to persist cleared session id");
             }
@@ -4080,6 +4396,9 @@ pub fn plan_freeform_while_awaiting(
 }
 
 /// Fill shell from a mid-turn user-choice event (options + prompt; no cancel chip).
+///
+/// When the build pilot is armed, immediately auto-answers recommended (else first)
+/// option via the same in-band path as chip activation — no UI focus required.
 pub fn apply_user_choice_request(
     ax: &mut AgentSession,
     correlation_id: u64,
@@ -4090,15 +4409,47 @@ pub fn apply_user_choice_request(
     // UI ignores allow_cancel — shell has no cancel chip; esc/freeform cancel on wire.
     ax.fast_response = crate::fast_response::from_user_choice(correlation_id, prompt, options);
     ax.is_awaiting_user = true;
+    try_pilot_auto_answer_user_choice(ax);
+}
+
+/// While pilot is armed, auto-select recommended/first mid-turn chip (M1).
+/// Settles only when an agent handle can answer in-band; otherwise leaves
+/// awaiting (no fake transcript settle). Pilot stays armed either way.
+fn try_pilot_auto_answer_user_choice(ax: &mut AgentSession) {
+    if !ax.pilot.is_armed() {
+        return;
+    }
+    // No wire path — leave chips parked; do not fake-settle.
+    let Some(handle) = ax.agent_handle.as_ref() else {
+        return;
+    };
+    let options: Vec<(String, String)> = ax
+        .fast_response
+        .options
+        .iter()
+        .map(|o| (o.id.clone(), o.label.clone()))
+        .collect();
+    let Some((id, label)) =
+        crate::build_pilot::pick_user_choice_option(&options).map(|(i, l)| (i.clone(), l.clone()))
+    else {
+        return;
+    };
+    use crate::fast_response::FastResponseSource;
+    use duckchat::UserChoiceAnswer;
+
+    let FastResponseSource::UserChoice { correlation_id, .. } = ax.fast_response.source.clone()
+    else {
+        return;
+    };
+    handle.answer_user_choice(correlation_id, UserChoiceAnswer::Selected { option_id: id });
+    settle_user_choice_transcript(ax, label);
+    ax.chat_input = EditorState::new("");
+    ax.chat_completion.visible = false;
 }
 
 /// Route a user submit: local system commands (`/help`) or agent turns
 /// (including `//name` escape where display and prompt may differ).
-pub fn dispatch_user_submit(
-    ax: &mut AgentSession,
-    text: String,
-    highlighter: &SyntaxHighlighter,
-) {
+pub fn dispatch_user_submit(ax: &mut AgentSession, text: String, highlighter: &SyntaxHighlighter) {
     match crate::slash_commands::parse_submit_slash(&text) {
         crate::slash_commands::SubmitSlash::LocalHelp => {
             run_system_help(ax, highlighter);
@@ -4140,6 +4491,55 @@ pub fn send_prompt_text(ax: &mut AgentSession, text: String, highlighter: &Synta
     dispatch_user_submit(ax, text, highlighter);
 }
 
+/// System notice when a decided pilot hop cannot start an agent turn.
+pub const PILOT_FAILED_HOP_NOTICE: &str = "Pilot stopped: could not start the next agent turn.";
+
+/// Disarm the pilot and record a short system notice (failed hop).
+pub fn fail_pilot_hop(ax: &mut AgentSession) {
+    use crate::chat_store::{ChatMessage, ContentBlock, Role};
+
+    ax.pilot = crate::build_pilot::PilotState::Off;
+    ax.session.messages.push(ChatMessage {
+        role: Role::System,
+        content: vec![ContentBlock::Text(PILOT_FAILED_HOP_NOTICE.into())],
+        timestamp: String::new(),
+        is_priming: false,
+    });
+    ax.needs_flush = true;
+    ax.chat_ui_dirty = true;
+}
+
+/// Dispatch a pilot auto-send as a normal user/agent turn. On failure to start
+/// the turn (no handle, blocked model, stack gate, etc.), disarms and notices.
+///
+/// Returns `true` when an agent turn was started.
+pub fn dispatch_pilot_auto_send(
+    ax: &mut AgentSession,
+    text: String,
+    highlighter: &SyntaxHighlighter,
+) -> bool {
+    ax.mark_driven();
+    match crate::slash_commands::parse_submit_slash(&text) {
+        crate::slash_commands::SubmitSlash::LocalHelp => {
+            // Pilot should not hop to local /help; treat as failed hop.
+            fail_pilot_hop(ax);
+            false
+        }
+        crate::slash_commands::SubmitSlash::LocalBuildPilot { .. } => {
+            fail_pilot_hop(ax);
+            false
+        }
+        crate::slash_commands::SubmitSlash::Agent { display, prompt } => {
+            if send_agent_turn(ax, display, prompt, highlighter) {
+                true
+            } else {
+                fail_pilot_hop(ax);
+                false
+            }
+        }
+    }
+}
+
 /// Local `/help`: user + system messages, no agent turn, no selection consume.
 pub fn run_system_help(ax: &mut AgentSession, highlighter: &SyntaxHighlighter) {
     use crate::chat_store::{ChatMessage, ContentBlock, Role};
@@ -4147,10 +4547,8 @@ pub fn run_system_help(ax: &mut AgentSession, highlighter: &SyntaxHighlighter) {
     ax.clear_agent_default_prompts();
 
     let harness = ax.effective_harness();
-    let body = crate::slash_commands::build_system_help_body(
-        &ax.chat_commands,
-        Some(harness.as_str()),
-    );
+    let body =
+        crate::slash_commands::build_system_help_body(&ax.chat_commands, Some(harness.as_str()));
 
     ax.session.messages.push(ChatMessage {
         role: Role::User,
@@ -4256,7 +4654,9 @@ fn send_agent_turn(
             .compute(&send_root)
             .map(|o| o.text);
         let scope = session_scope_for_ax(ax, Some(send_root.as_path()));
-        let scope_blurb = crate::scope::CurrentScopeHook.compute(&scope).map(|o| o.text);
+        let scope_blurb = crate::scope::CurrentScopeHook
+            .compute(&scope)
+            .map(|o| o.text);
         let vcs_instructions = ax.vcs_workflow.standing_instructions();
         let priming_text = assemble_priming_body(
             agents_md.as_deref(),
@@ -4737,6 +5137,36 @@ pub fn rebuild_chat_editor(ax: &mut AgentSession, highlighter: &SyntaxHighlighte
 pub fn materialize_chat_ui(ax: &mut AgentSession, highlighter: &SyntaxHighlighter) {
     rebuild_chat_editor(ax, highlighter);
     ax.chat_ui_dirty = false;
+    sync_sticky_last_user(ax);
+}
+
+/// Sync sticky last-user body editor; selectively invalidate content-top cache.
+///
+/// Called after transcript materialize. Re-resolves last non-priming User idx
+/// and body. Clears `sticky_last_user_content_top` only when source idx or body
+/// text changed (or there is no source) — not on every rematerialize — so
+/// streaming rebuilds do not force-hide a sticky that was already shown.
+/// Always requests a background remeasure when a source exists so auto-collapse
+/// of earlier Thinking/Activity can refresh the cached top without a clear.
+/// Collapse and focus-fold handlers still clear the top directly.
+fn sync_sticky_last_user(ax: &mut AgentSession) {
+    let new_idx = agent_chat::last_non_priming_user_idx(&ax.chat_blocks);
+    let new_body = agent_chat::sticky_last_user_body(&ax.chat_blocks).unwrap_or_default();
+    let prev_idx = ax.sticky_last_user_source_idx;
+    let prev_body = ax.sticky_last_user_editor.text();
+    let source_changed = new_idx != prev_idx || new_body != prev_body;
+
+    if new_body != prev_body {
+        ax.sticky_last_user_editor = EditorState::new(&new_body);
+    }
+    ax.sticky_last_user_source_idx = new_idx;
+
+    if new_idx.is_none() || source_changed {
+        ax.sticky_last_user_content_top = None;
+    }
+    // Remeasure after every materialize that has a source (overwrite top;
+    // clear only when source_changed above).
+    ax.sticky_last_user_remeasure = new_idx.is_some();
 }
 
 /// Stamp effective viewer style and rematerialize when it changes.
@@ -5064,16 +5494,31 @@ pub fn handle_agent_chat_key(
         }
     }
 
-    // Empty-input next-action cycle (only when completion is not consuming Tab).
+    // Empty-input next-action cycle / fill (only when completion is not consuming Tab).
+    let input_empty = ax.chat_input.text().trim().is_empty();
+    let bare_mods = !mods.command() && !mods.alt() && !mods.control();
     if *key == keyboard::Key::Named(Named::Tab)
-        && ax.chat_input.text().trim().is_empty()
+        && mods.shift()
+        && input_empty
         && crate::default_prompts::can_cycle_next_actions(
             ax.session.is_streaming,
             ax.next_actions.len(),
         )
     {
-        let delta: i8 = if mods.shift() { -1 } else { 1 };
-        return AgentChatKeyResult::Dispatch(agent_chat::Msg::CycleNextAction(delta));
+        return AgentChatKeyResult::Dispatch(agent_chat::Msg::CycleNextAction(1));
+    }
+    if matches!(
+        key,
+        keyboard::Key::Named(Named::Tab) | keyboard::Key::Named(Named::ArrowRight)
+    ) && bare_mods
+        && !mods.shift()
+        && input_empty
+        && crate::default_prompts::can_fill_next_action(
+            ax.session.is_streaming,
+            ax.next_actions.len(),
+        )
+    {
+        return AgentChatKeyResult::Dispatch(agent_chat::Msg::FillNextAction);
     }
 
     // Fast response hotkeys — only when chrome is visible (idle + empty input).
@@ -5359,10 +5804,7 @@ pub fn ensure_sessions_with_label(
 }
 
 /// Set effective viewer style on a newly loaded or created session (no rebuild).
-fn stamp_viewer_style_for_load(
-    ax: &mut AgentSession,
-    style: crate::config::ViewerStyle,
-) {
+fn stamp_viewer_style_for_load(ax: &mut AgentSession, style: crate::config::ViewerStyle) {
     ax.viewer_style = style;
     if style != crate::config::ViewerStyle::Focus {
         ax.focus_folds.clear();
@@ -5444,7 +5886,9 @@ pub fn apply_external_session_event(
 
     let (scope, session_id) = match event {
         ExternalSessionEvent::Modified { scope, session_id }
-        | ExternalSessionEvent::Removed { scope, session_id } => (scope.as_str(), session_id.as_str()),
+        | ExternalSessionEvent::Removed { scope, session_id } => {
+            (scope.as_str(), session_id.as_str())
+        }
     };
 
     let idx = ix
@@ -5675,6 +6119,9 @@ pub fn view_column<'a, M: 'a + Clone>(
                     ax.pilot.plaque_label(),
                     viewer_style,
                     &ax.focus_folds,
+                    ax.sticky_last_user_content_top,
+                    ax.last_chat_offset_y,
+                    &ax.sticky_last_user_editor,
                 )
                 .map(move |m| w(Msg::AgentChat(m)));
 

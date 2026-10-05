@@ -508,19 +508,11 @@ fn view_items_panel<'a>(
                 ));
             }
             "Archived" => {
-                content = content.push(view_archived_section(
-                    state,
-                    project,
-                    explorations,
-                    dirty,
-                ));
+                content = content.push(view_archived_section(state, project, explorations, dirty));
             }
             other => {
                 // Refuse unknown headings — section plan is the sole allowlist.
-                debug_assert!(
-                    false,
-                    "unexpected dashboard left section {other:?}"
-                );
+                debug_assert!(false, "unexpected dashboard left section {other:?}");
             }
         }
     }
@@ -544,11 +536,8 @@ fn view_changes_section<'a>(
         .iter()
         .map(|c| (c.name.as_str(), c))
         .collect();
-    let slice = crate::dashboard_digest::filter_law_slice(
-        ranked_changes,
-        state.expanded_changes,
-        day_seed,
-    );
+    let slice =
+        crate::dashboard_digest::filter_law_slice(ranked_changes, state.expanded_changes, day_seed);
     let mut list = column![].spacing(2.0);
     for name in &slice.visible {
         let Some(change) = change_by_name.get(name.as_str()) else {
@@ -581,8 +570,7 @@ fn view_changes_section<'a>(
             format!("\u{2026} {n} more"),
             Message::ToggleExpandChanges,
         ));
-    } else if state.expanded_changes
-        && ranked_changes.len() > crate::dashboard_digest::SHORTLIST_N
+    } else if state.expanded_changes && ranked_changes.len() > crate::dashboard_digest::SHORTLIST_N
     {
         list = list.push(overflow_row(
             "show less".into(),
@@ -686,10 +674,8 @@ fn view_archived_section<'a>(
 
     let mut body = column![header];
     if state.archived_open {
-        let slice = crate::dashboard_digest::archive_filter_law_slice(
-            &ranked_ids,
-            state.expanded_archived,
-        );
+        let slice =
+            crate::dashboard_digest::archive_filter_law_slice(&ranked_ids, state.expanded_archived);
         let by_id: HashMap<&str, &crate::area::change::ArchivedEntry<'_>> = entries
             .iter()
             .map(|e| {
@@ -730,9 +716,7 @@ fn view_archived_section<'a>(
                 Message::ToggleExpandArchived,
             ));
         }
-        body = body
-            .push(Space::new().height(theme::SPACING_SM))
-            .push(list);
+        body = body.push(Space::new().height(theme::SPACING_SM)).push(list);
     }
     body.spacing(0.0).into()
 }

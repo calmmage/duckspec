@@ -9,7 +9,7 @@ use iced::Subscription;
 use tokio::sync::mpsc;
 
 pub use duckcore::agent::{
-    AgentEvent, AgentHandle, ModelInfo, SlashCommand, available_models, drive_harness,
+    AgentEvent, AgentHandle, ModelInfo, ModelRef, SlashCommand, available_models, drive_harness,
     model_context_window, models_for_harness, refresh_model_catalog, resolve_oneshot_model,
     resolved_oneshot_model_for,
 };
@@ -62,10 +62,14 @@ fn agent_stream(
     )
 }
 
-/// Seed an unset global default on `config` from the catalog.
-pub fn seed_global_default_if_unset(
-    config: &mut crate::config::Config,
+/// Resolve the stored global default against the catalog (follow-backend or pin).
+pub fn resolve_global_default(
+    stored: Option<&ModelRef>,
     catalog: &[ModelInfo],
-) -> bool {
-    duckcore::agent::seed_global_default_if_unset(&mut config.default_model, catalog)
+) -> Option<ModelRef> {
+    duckcore::agent::resolve_global_default(
+        stored,
+        catalog,
+        duckcore::agent::grok_advertised_default().as_deref(),
+    )
 }

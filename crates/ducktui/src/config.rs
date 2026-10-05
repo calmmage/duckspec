@@ -38,6 +38,15 @@ pub struct ChatConfig {
     pub oneshot_models: HashMap<String, String>,
 }
 
+/// Resolve the stored global default: follow-backend when unset or former built-in.
+pub fn resolve_default_model(cfg: &SharedConfig) -> Option<ModelRef> {
+    duckcore::agent::resolve_global_default(
+        cfg.default_model.as_ref(),
+        &duckcore::agent::available_models(),
+        duckcore::agent::grok_advertised_default().as_deref(),
+    )
+}
+
 impl ChatConfig {
     pub fn oneshot_model(&self, harness: &str) -> Option<&str> {
         self.oneshot_models.get(harness).map(String::as_str)
@@ -111,10 +120,7 @@ pub fn save(config: &SharedConfig) -> anyhow::Result<()> {
                 "harness".to_string(),
                 toml::Value::String(m.harness.clone()),
             );
-            table.insert(
-                "model".to_string(),
-                toml::Value::String(m.model.clone()),
-            );
+            table.insert("model".to_string(), toml::Value::String(m.model.clone()));
             root.insert("default_model".to_string(), toml::Value::Table(table));
         }
         None => {

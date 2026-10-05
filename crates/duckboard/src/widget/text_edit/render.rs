@@ -1202,16 +1202,26 @@ impl<'a, M: Clone> Widget<M, Theme, iced::Renderer> for TextEdit<'a, M> {
                 ..
             }) if internal.focused => {
                 let cmd = modifiers.command();
+                let alt = modifiers.alt();
                 let shift = modifiers.shift();
                 let mut handled = true;
 
                 match key {
                     // Navigation — always allowed.
-                    keyboard::Key::Named(Named::ArrowLeft) if cmd => {
-                        shell.publish((self.on_action)(EditorAction::MoveWordLeft(shift)));
+                    // Cmd = line ends; Option = word; Cmd+Option unbound.
+                    keyboard::Key::Named(Named::ArrowLeft) if cmd || alt => {
+                        if let Some(action) =
+                            EditorAction::resolve_modified_horizontal_arrow(false, cmd, alt, shift)
+                        {
+                            shell.publish((self.on_action)(action));
+                        }
                     }
-                    keyboard::Key::Named(Named::ArrowRight) if cmd => {
-                        shell.publish((self.on_action)(EditorAction::MoveWordRight(shift)));
+                    keyboard::Key::Named(Named::ArrowRight) if cmd || alt => {
+                        if let Some(action) =
+                            EditorAction::resolve_modified_horizontal_arrow(true, cmd, alt, shift)
+                        {
+                            shell.publish((self.on_action)(action));
+                        }
                     }
                     keyboard::Key::Named(Named::ArrowLeft) => {
                         shell.publish((self.on_action)(EditorAction::MoveLeft(shift)));

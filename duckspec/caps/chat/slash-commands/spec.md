@@ -27,7 +27,7 @@ second entry for that name. The catalog SHALL NOT list Claude interactive builti
 - **AND** that entry's kind is System
 
 > test: code
-> - crates/duckcore/src/slash_commands.rs:283
+> - crates/duckcore/src/slash_commands.rs:278
 
 ### Scenario: Discovered ds-* names are Workflow
 
@@ -37,7 +37,7 @@ second entry for that name. The catalog SHALL NOT list Claude interactive builti
 - **AND** that entry's kind is Workflow
 
 > test: code
-> - crates/duckcore/src/slash_commands.rs:295
+> - crates/duckcore/src/slash_commands.rs:290
 
 ### Scenario: Other discovered names are Agent
 
@@ -51,7 +51,7 @@ second entry for that name. The catalog SHALL NOT list Claude interactive builti
 - **AND** that entry's kind is Agent
 
 > test: code
-> - crates/duckcore/src/slash_commands.rs:307
+> - crates/duckcore/src/slash_commands.rs:305
 
 ### Scenario: System name wins on collision with discovery
 
@@ -62,7 +62,7 @@ second entry for that name. The catalog SHALL NOT list Claude interactive builti
 - **AND** that entry's kind is System
 
 > test: code
-> - crates/duckcore/src/slash_commands.rs:319
+> - crates/duckcore/src/slash_commands.rs:317
 
 ### Scenario: Claude interactive builtins are not Agent catalog entries
 
@@ -74,7 +74,7 @@ second entry for that name. The catalog SHALL NOT list Claude interactive builti
   `model` that exists only as a Claude interactive builtin
 
 > test: code
-> - crates/duckcore/src/slash_commands.rs:334
+> - crates/duckcore/src/slash_commands.rs:332
 
 ### Scenario: build-auto and build-fast are System
 
@@ -84,7 +84,7 @@ second entry for that name. The catalog SHALL NOT list Claude interactive builti
 - **AND** the catalog includes an entry named `build-fast` whose kind is System
 
 > test: code
-> - crates/duckcore/src/slash_commands.rs:363
+> - crates/duckcore/src/slash_commands.rs:361
 
 ## Requirement: Local system submit
 
@@ -105,8 +105,8 @@ ties by name ascending.
 - **THEN** no agent turn is started for that submit
 
 > test: code
-> - crates/duckcore/src/slash_commands.rs:425
-> - crates/ducktui/src/runtime.rs:642
+> - crates/duckcore/src/slash_commands.rs:423
+> - crates/ducktui/src/runtime.rs:643
 
 ### Scenario: Bare /help records user then system messages
 
@@ -116,8 +116,8 @@ ties by name ascending.
 - **AND** a system message immediately after that user message
 
 > test: code
-> - crates/duckboard/src/area/interaction.rs:1283
-> - crates/ducktui/src/runtime.rs:656
+> - crates/duckboard/src/area/interaction.rs:1530
+> - crates/ducktui/src/runtime.rs:657
 
 ### Scenario: Local /help leaves selection attachments intact
 
@@ -126,7 +126,7 @@ ties by name ascending.
 - **THEN** the selection attachment is still pending for a later agent turn
 
 > test: code
-> - crates/duckboard/src/area/interaction.rs:1320
+> - crates/duckboard/src/area/interaction.rs:1567
 
 ### Scenario: System reply prefix names the command and teaches //help
 
@@ -140,7 +140,7 @@ ties by name ascending.
 - **AND** includes guidance to use `//help` for agent help
 
 > test: code
-> - crates/duckcore/src/slash_commands.rs:476
+> - crates/duckcore/src/slash_commands.rs:471
 
 ### Scenario: Help body lists non-empty kind sections from the live catalog
 
@@ -156,7 +156,7 @@ ties by name ascending.
 - **AND** does not include an Agent section
 
 > test: code
-> - crates/duckcore/src/slash_commands.rs:493
+> - crates/duckcore/src/slash_commands.rs:488
 
 ### Scenario: Help Workflow section lists by order key then name
 
@@ -168,7 +168,7 @@ ties by name ascending.
 - **THEN** the Workflow section lists those entries in ascending order-key order
 
 > test: code
-> - crates/duckcore/src/slash_commands.rs:519
+> - crates/duckcore/src/slash_commands.rs:514
 
 ## Requirement: Double-slash agent escape
 
@@ -186,8 +186,8 @@ the typed double-slash form.
 - **AND** the turn prompt is `/help`
 
 > test: code
-> - crates/duckcore/src/slash_commands.rs:436
-> - crates/ducktui/src/runtime.rs:689
+> - crates/duckcore/src/slash_commands.rs:434
+> - crates/ducktui/src/runtime.rs:690
 
 ### Scenario: Escape keeps typed //help as the user message text
 
@@ -196,8 +196,8 @@ the typed double-slash form.
 - **THEN** the user message text recorded for that submit is `//help`
 
 > test: code
-> - crates/duckcore/src/slash_commands.rs:463
-> - crates/ducktui/src/runtime.rs:708
+> - crates/duckcore/src/slash_commands.rs:458
+> - crates/ducktui/src/runtime.rs:709
 
 ## Requirement: Kind cues in completion
 
@@ -216,7 +216,7 @@ that have a key; equal order keys SHALL break ties by name ascending.
 - **THEN** the three kinds resolve to three different colors
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:1896
+> - crates/duckboard/src/widget/agent_chat.rs:2070
 
 ### Scenario: System rows include a sys tag
 
@@ -225,7 +225,7 @@ that have a key; equal order keys SHALL break ties by name ascending.
 - **THEN** the row includes a `sys` tag
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:1910
+> - crates/duckboard/src/widget/agent_chat.rs:2084
 
 ### Scenario: Equal fuzzy scores order System, Workflow, Agent
 
@@ -237,7 +237,7 @@ that have a key; equal order keys SHALL break ties by name ascending.
 - **THEN** those three appear in order System, then Workflow, then Agent
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:1924
+> - crates/duckboard/src/widget/agent_chat.rs:2095
 
 ### Scenario: Equal scores order Workflow by order key then name
 
@@ -251,7 +251,7 @@ that have a key; equal order keys SHALL break ties by name ascending.
   order key
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:1952
+> - crates/duckboard/src/widget/agent_chat.rs:2123
 
 ### Scenario: Workflow without order key sorts after ordered Workflow
 
@@ -261,7 +261,7 @@ that have a key; equal order keys SHALL break ties by name ascending.
 - **THEN** the entry with an order key appears before the entry without an order key
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:1969
+> - crates/duckboard/src/widget/agent_chat.rs:2140
 
 ## Requirement: Frontmatter order and description
 
@@ -348,7 +348,7 @@ build-pilot capability, not this one.
 - **AND** the classified arguments are `add pilot that auto-sends next`
 
 > test: code
-> - crates/duckcore/src/slash_commands.rs:393
+> - crates/duckcore/src/slash_commands.rs:391
 
 ### Scenario: bare build-fast classifies as local build pilot
 
@@ -358,7 +358,7 @@ build-pilot capability, not this one.
 - **AND** the classified arguments are empty
 
 > test: code
-> - crates/duckcore/src/slash_commands.rs:409
+> - crates/duckcore/src/slash_commands.rs:407
 
 ### Scenario: build pilot names are system registry commands
 
@@ -367,4 +367,4 @@ build-pilot capability, not this one.
 - **THEN** both names are system registry commands
 
 > test: code
-> - crates/duckcore/src/slash_commands.rs:383
+> - crates/duckcore/src/slash_commands.rs:381

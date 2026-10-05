@@ -217,8 +217,12 @@ pub enum IntegrateOutcome {
     /// Merged cleanly; sidecar forgotten and binding cleared to main.
     Clean,
     /// Stopped; paths (or equivalent) for the human.
-    Conflict { paths: Vec<String> },
-    Failed { message: String },
+    Conflict {
+        paths: Vec<String>,
+    },
+    Failed {
+        message: String,
+    },
 }
 
 /// Operations that create or remove sidecars. Production uses [`CliWorktreeOps`].
@@ -416,13 +420,7 @@ impl WorktreeOps for CliWorktreeOps {
                 // Squash workspace WC onto main @ when possible.
                 let identity = worktree_identity(scope_key);
                 let status = Command::new("jj")
-                    .args([
-                        "squash",
-                        "--from",
-                        &format!("{identity}@"),
-                        "--into",
-                        "@",
-                    ])
+                    .args(["squash", "--from", &format!("{identity}@"), "--into", "@"])
                     .current_dir(project_root)
                     .status()
                     .map_err(|e| IntegrateError::Failed {
@@ -510,12 +508,7 @@ pub fn activate_scope(
                 .and_then(|b| b.base_scope.as_ref())
                 .and_then(|base_key| store.scopes.get(base_key))
                 .map(|b| b.work_root.clone());
-            let root = ops.ensure(
-                project_root,
-                scope_key,
-                backend,
-                base_root.as_deref(),
-            )?;
+            let root = ops.ensure(project_root, scope_key, backend, base_root.as_deref())?;
             let name = worktree_identity(scope_key);
             let binding = ScopeBinding {
                 placement,
@@ -586,10 +579,7 @@ fn base_chain_reaches(store: &BindingStore, start: &str, target: &str) -> bool {
         if !seen.insert(k.clone()) {
             return true;
         }
-        cur = store
-            .scopes
-            .get(&k)
-            .and_then(|b| b.base_scope.clone());
+        cur = store.scopes.get(&k).and_then(|b| b.base_scope.clone());
     }
     false
 }
@@ -610,8 +600,7 @@ pub fn set_base_scope(
             return Err(SetBaseError::Cycle);
         }
     }
-    ensure_binding_entry(store, project_root, scope_key).base_scope =
-        base.map(str::to_string);
+    ensure_binding_entry(store, project_root, scope_key).base_scope = base.map(str::to_string);
     let _ = save_bindings(project_root, store);
     Ok(())
 }
@@ -654,10 +643,7 @@ pub fn agent_send_blocked(
 }
 
 /// Next stack-base candidate in a cycle: None → candidates[0] → … → None.
-pub fn cycle_stack_base(
-    current: Option<&str>,
-    candidates: &[String],
-) -> Option<String> {
+pub fn cycle_stack_base(current: Option<&str>, candidates: &[String]) -> Option<String> {
     if candidates.is_empty() {
         return None;
     }
@@ -709,13 +695,7 @@ pub fn integrate_to_main(
                 },
             );
             let _ = save_bindings(project_root, store);
-            update_dependents_after_base_merge(
-                store,
-                project_root,
-                scope_key,
-                backend,
-                ops,
-            );
+            update_dependents_after_base_merge(store, project_root, scope_key, backend, ops);
             IntegrateOutcome::Clean
         }
         Err(IntegrateError::Conflict { paths }) => IntegrateOutcome::Conflict { paths },
@@ -737,9 +717,7 @@ pub fn update_dependents_after_base_merge(
     let n = store
         .scopes
         .iter()
-        .filter(|(k, b)| {
-            *k != base_key && b.base_scope.as_deref() == Some(base_key) && !b.is_main
-        })
+        .filter(|(k, b)| *k != base_key && b.base_scope.as_deref() == Some(base_key) && !b.is_main)
         .count();
     if n > 0 {
         tracing::debug!(
@@ -752,10 +730,7 @@ pub fn update_dependents_after_base_merge(
 
 /// Whether archive/explicit merge should attempt integrate for this scope.
 pub fn scope_has_sidecar(store: &BindingStore, scope_key: &str) -> bool {
-    store
-        .scopes
-        .get(scope_key)
-        .is_some_and(|b| !b.is_main)
+    store.scopes.get(scope_key).is_some_and(|b| !b.is_main)
 }
 
 /// Human-readable text for integrate conflict/fail (UI / system message).
@@ -839,11 +814,7 @@ pub fn transfer_scope_binding(
 // ── Active root (focused scope authority) ────────────────────────────────────
 
 /// Work root recorded for an exploration/change scope key, or main if unbound.
-pub fn scope_work_root(
-    store: &BindingStore,
-    project_root: &Path,
-    scope_key: &str,
-) -> PathBuf {
+pub fn scope_work_root(store: &BindingStore, project_root: &Path, scope_key: &str) -> PathBuf {
     store
         .scopes
         .get(scope_key)
@@ -858,11 +829,7 @@ pub fn scope_kind_forces_main(scope_key: &str) -> bool {
 }
 
 /// Desired agent/file work root for a scope key (caps/codex → main).
-pub fn desired_work_root(
-    store: &BindingStore,
-    project_root: &Path,
-    scope_key: &str,
-) -> PathBuf {
+pub fn desired_work_root(store: &BindingStore, project_root: &Path, scope_key: &str) -> PathBuf {
     if scope_kind_forces_main(scope_key) {
         project_root.to_path_buf()
     } else {
@@ -888,11 +855,7 @@ pub fn agent_runtime_root(
 /// Resolve a project-relative path under the focused work root. Absolute paths
 /// that already live under `work_root` or `project_root` are remapped by
 /// relative suffix onto `work_root` when possible.
-pub fn resolve_under_work_root(
-    work_root: &Path,
-    project_root: &Path,
-    path: &Path,
-) -> PathBuf {
+pub fn resolve_under_work_root(work_root: &Path, project_root: &Path, path: &Path) -> PathBuf {
     if path.is_absolute() {
         if let Ok(rel) = path.strip_prefix(work_root) {
             return work_root.join(rel);
@@ -1206,15 +1169,8 @@ mod tests {
         let mut store = BindingStore::default();
         set_placement(&mut store, &root, key, ScopePlacement::Worktree);
         let ops = FakeOps::new();
-        let work = activate_scope(
-            &mut store,
-            &root,
-            key,
-            VcsWorkflow::Worktrees,
-            false,
-            &ops,
-        )
-        .unwrap();
+        let work =
+            activate_scope(&mut store, &root, key, VcsWorkflow::Worktrees, false, &ops).unwrap();
         assert_eq!(store.scopes[key].name, "duck-session-worktrees");
         assert_eq!(work, path);
         assert!(work.starts_with(root.join(".duckboard/worktrees")));
@@ -1245,10 +1201,7 @@ mod tests {
             save_bindings(&root, &store).unwrap();
 
             let reloaded = load_bindings(&root);
-            assert_eq!(
-                reloaded.scopes["exp-a"].placement,
-                ScopePlacement::Worktree
-            );
+            assert_eq!(reloaded.scopes["exp-a"].placement, ScopePlacement::Worktree);
             let _ = std::fs::remove_dir_all(&root);
         });
     }
@@ -1393,14 +1346,8 @@ mod tests {
         let project = temp_project();
         let mut store = BindingStore::default();
         let _side = bind_sidecar(&mut store, &project, "exp-a");
-        assert_eq!(
-            desired_work_root(&store, &project, "caps"),
-            project
-        );
-        assert_eq!(
-            desired_work_root(&store, &project, "codex"),
-            project
-        );
+        assert_eq!(desired_work_root(&store, &project, "caps"), project);
+        assert_eq!(desired_work_root(&store, &project, "codex"), project);
         assert!(scope_kind_forces_main("caps"));
         assert!(scope_kind_forces_main("codex"));
         let _ = std::fs::remove_dir_all(&project);
@@ -1446,7 +1393,10 @@ mod tests {
         let err = set_base_scope(&mut store, &project, "scope-b", Some("scope-a"));
         assert_eq!(err, Err(SetBaseError::Cycle));
         assert_eq!(
-            store.scopes.get("scope-b").and_then(|b| b.base_scope.clone()),
+            store
+                .scopes
+                .get("scope-b")
+                .and_then(|b| b.base_scope.clone()),
             None
         );
         let _ = std::fs::remove_dir_all(&project);
@@ -1535,13 +1485,7 @@ mod tests {
         let ops = FakeOps::new();
         // Simulate archive hook: always attempt when sidecar present.
         let outcome = if scope_has_sidecar(&store, "feat-a") {
-            integrate_to_main(
-                &mut store,
-                &project,
-                "feat-a",
-                WorktreeBackend::Git,
-                &ops,
-            )
+            integrate_to_main(&mut store, &project, "feat-a", WorktreeBackend::Git, &ops)
         } else {
             IntegrateOutcome::NoopMain
         };
@@ -1557,13 +1501,7 @@ mod tests {
         let mut store = BindingStore::default();
         let side = bind_sidecar(&mut store, &project, "feat-a");
         let ops = FakeOps::new();
-        let outcome = integrate_to_main(
-            &mut store,
-            &project,
-            "feat-a",
-            WorktreeBackend::Git,
-            &ops,
-        );
+        let outcome = integrate_to_main(&mut store, &project, "feat-a", WorktreeBackend::Git, &ops);
         assert_eq!(outcome, IntegrateOutcome::Clean);
         assert!(!side.exists());
         assert!(store.scopes["feat-a"].is_main);
@@ -1580,13 +1518,7 @@ mod tests {
         let side = bind_sidecar(&mut store, &project, "feat-a");
         std::fs::write(side.join(".conflict"), "src/lib.rs\n").unwrap();
         let ops = FakeOps::new();
-        let outcome = integrate_to_main(
-            &mut store,
-            &project,
-            "feat-a",
-            WorktreeBackend::Git,
-            &ops,
-        );
+        let outcome = integrate_to_main(&mut store, &project, "feat-a", WorktreeBackend::Git, &ops);
         assert!(matches!(
             outcome,
             IntegrateOutcome::Conflict { ref paths } if paths.iter().any(|p| p.contains("lib"))
@@ -1610,23 +1542,13 @@ mod tests {
         let mut store = BindingStore::default();
         let _side = bind_sidecar(&mut store, &project, "feat-a");
         let ops = FakeOps::new();
-        let archive_path = integrate_to_main(
-            &mut store,
-            &project,
-            "feat-a",
-            WorktreeBackend::Git,
-            &ops,
-        );
+        let archive_path =
+            integrate_to_main(&mut store, &project, "feat-a", WorktreeBackend::Git, &ops);
         // Fresh sidecar for explicit path comparison of function identity.
         let mut store2 = BindingStore::default();
         let _side2 = bind_sidecar(&mut store2, &project, "feat-b");
-        let explicit_path = integrate_to_main(
-            &mut store2,
-            &project,
-            "feat-b",
-            WorktreeBackend::Git,
-            &ops,
-        );
+        let explicit_path =
+            integrate_to_main(&mut store2, &project, "feat-b", WorktreeBackend::Git, &ops);
         assert_eq!(archive_path, IntegrateOutcome::Clean);
         assert_eq!(explicit_path, IntegrateOutcome::Clean);
         let _ = std::fs::remove_dir_all(&project);
@@ -1643,13 +1565,8 @@ mod tests {
         let side_b = bind_sidecar(&mut store, &project, "scope-b");
         set_base_scope(&mut store, &project, "scope-b", Some("scope-a")).unwrap();
         let ops = FakeOps::new();
-        let outcome = integrate_to_main(
-            &mut store,
-            &project,
-            "scope-a",
-            WorktreeBackend::Git,
-            &ops,
-        );
+        let outcome =
+            integrate_to_main(&mut store, &project, "scope-a", WorktreeBackend::Git, &ops);
         assert_eq!(outcome, IntegrateOutcome::Clean);
         assert!(store.scopes["scope-a"].is_main);
         assert!(

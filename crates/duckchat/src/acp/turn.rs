@@ -56,6 +56,8 @@ pub struct AcpTurn {
 pub struct InitResult {
     pub load_session: bool,
     pub models: Vec<AcpModel>,
+    /// Handshake `modelState.currentModelId` when the agent advertises one.
+    pub current_model_id: Option<String>,
 }
 
 /// A model an agent advertises in its `modelState.availableModels`.
@@ -792,9 +794,16 @@ impl InitResult {
             .and_then(Value::as_array)
             .map(|arr| arr.iter().filter_map(AcpModel::from_value).collect())
             .unwrap_or_default();
+        let current_model_id = v
+            .pointer("/_meta/modelState/currentModelId")
+            .or_else(|| v.pointer("/modelState/currentModelId"))
+            .and_then(Value::as_str)
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty());
         Self {
             load_session,
             models,
+            current_model_id,
         }
     }
 }
@@ -948,6 +957,7 @@ mod tests {
         assert!(init.load_session);
         let ids: Vec<&str> = init.models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, ["grok-4.5", "grok-composer-2.5-fast"]);
+        assert_eq!(init.current_model_id.as_deref(), Some("grok-4.5"));
         assert_eq!(init.models[0].name, "Grok 4.5");
         assert_eq!(init.models[0].context_window, Some(500_000));
         assert_eq!(init.models[1].context_window, Some(200_000));

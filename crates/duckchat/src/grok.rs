@@ -31,20 +31,27 @@ const HARNESS: &str = "grok";
 /// (see [`pick_title_model`]).
 const TITLE_MODEL: &str = "grok-composer-2.5-fast";
 
+/// Handshake memo: listed models plus the advertised default id when present.
+#[derive(Clone)]
+struct GrokDiscovery {
+    models: Vec<ModelInfo>,
+    advertised_default: Option<String>,
+}
+
 /// [`Provider`] over the `grok` CLI. Models and their context windows are
 /// discovered once from the ACP handshake and cached for the provider's
 /// lifetime.
 #[derive(Clone)]
 pub struct GrokProvider {
     launch: AgentLaunch,
-    models: OnceLock<Vec<ModelInfo>>,
+    discovery: OnceLock<GrokDiscovery>,
 }
 
 impl GrokProvider {
     pub fn new() -> Self {
         Self {
             launch: grok_agent_launch(),
-            models: OnceLock::new(),
+            discovery: OnceLock::new(),
         }
     }
 
@@ -54,8 +61,12 @@ impl GrokProvider {
     fn with_launch(launch: AgentLaunch) -> Self {
         Self {
             launch,
-            models: OnceLock::new(),
+            discovery: OnceLock::new(),
         }
+    }
+
+    fn discovery(&self) -> &GrokDiscovery {
+        self.discovery.get_or_init(|| self.discover())
     }
 
     /// Discover models from a fresh `initialize` handshake. Synchronous to fit
@@ -63,7 +74,7 @@ impl GrokProvider {
     /// on a dedicated thread with its own runtime — never nesting inside a
     /// caller's runtime. Any failure (missing binary, absent auth, malformed
     /// handshake) degrades to an empty list rather than panicking.
-    fn discover_models(&self) -> Vec<ModelInfo> {
+    fn discover(&self) -> GrokDiscovery {
         let launch = self.launch.clone();
         std::thread::spawn(move || {
             let rt = match tokio::runtime::Builder::new_current_thread()
@@ -71,24 +82,49 @@ impl GrokProvider {
                 .build()
             {
                 Ok(rt) => rt,
-                Err(_) => return Vec::new(),
+                Err(_) => {
+                    return GrokDiscovery {
+                        models: Vec::new(),
+                        advertised_default: None,
+                    };
+                }
             };
             rt.block_on(async move {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
                 let mut turn = match AcpTurn::spawn_with(&launch, &cwd).await {
                     Ok(turn) => turn,
-                    Err(_) => return Vec::new(),
+                    Err(_) => {
+                        return GrokDiscovery {
+                            models: Vec::new(),
+                            advertised_default: None,
+                        };
+                    }
                 };
-                let models = match turn.initialize().await {
-                    Ok(init) => init.models.into_iter().map(to_model_info).collect(),
-                    Err(_) => Vec::new(),
+                let discovered = match turn.initialize().await {
+                    Ok(init) => {
+                        let models: Vec<ModelInfo> =
+                            init.models.into_iter().map(to_model_info).collect();
+                        let advertised_default =
+                            advertised_default_from(init.current_model_id.as_deref(), &models);
+                        GrokDiscovery {
+                            models,
+                            advertised_default,
+                        }
+                    }
+                    Err(_) => GrokDiscovery {
+                        models: Vec::new(),
+                        advertised_default: None,
+                    },
                 };
                 turn.cancel().await;
-                models
+                discovered
             })
         })
         .join()
-        .unwrap_or_default()
+        .unwrap_or(GrokDiscovery {
+            models: Vec::new(),
+            advertised_default: None,
+        })
     }
 }
 
@@ -115,7 +151,11 @@ impl Provider for GrokProvider {
     }
 
     fn list_models(&self) -> Vec<ModelInfo> {
-        self.models.get_or_init(|| self.discover_models()).clone()
+        self.discovery().models.clone()
+    }
+
+    fn advertised_default(&self) -> Option<String> {
+        self.discovery().advertised_default.clone()
     }
 
     fn list_commands(&self, project_root: &Path) -> Vec<SlashCommand> {
@@ -179,6 +219,13 @@ pub fn grok_agent_launch() -> AgentLaunch {
         cmd.arg("agent").arg("--always-approve").arg("stdio");
         cmd
     })
+}
+
+/// Advertised default is the handshake current id when that id is listed.
+fn advertised_default_from(current_model_id: Option<&str>, models: &[ModelInfo]) -> Option<String> {
+    current_model_id
+        .filter(|id| models.iter().any(|m| m.id == *id))
+        .map(str::to_string)
 }
 
 /// Map a handshake-advertised model onto a neutral [`ModelInfo`], tagging it
@@ -345,6 +392,23 @@ mod tests {
         let blocks = assemble_content(&req);
         assert_eq!(blocks.len(), 1);
         assert_eq!(text_block(&blocks, 0), "see [thing](attach:missing)");
+    }
+
+    /// @spec harness/grok Model discovery: Advertised default is the handshake current model when that id is listed
+    #[test]
+    fn advertised_default_is_the_handshake_current_model_when_that_id_is_listed() {
+        let handshake = vec![
+            model("grok-4.5", Some(256_000)),
+            model("grok-composer-2.5-fast", Some(128_000)),
+        ];
+        let listed: Vec<ModelInfo> = handshake.into_iter().map(to_model_info).collect();
+
+        assert_eq!(
+            advertised_default_from(Some("grok-4.5"), &listed).as_deref(),
+            Some("grok-4.5")
+        );
+        assert_eq!(advertised_default_from(Some("missing-id"), &listed), None);
+        assert_eq!(advertised_default_from(None, &listed), None);
     }
 
     /// @spec harness/grok Model discovery: Discovered models are tagged with the grok harness and a window

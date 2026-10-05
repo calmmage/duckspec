@@ -10,6 +10,7 @@ pub mod fast_response;
 pub mod inputs_ledger;
 pub mod meta_card;
 pub mod paths;
+pub mod prose_options;
 pub mod scope;
 pub mod session_sharing;
 pub mod slash_commands;

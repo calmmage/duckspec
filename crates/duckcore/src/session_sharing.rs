@@ -72,10 +72,7 @@ pub fn persist_driven(
 }
 
 /// If `path` is a session file under the shared chats root, return `(scope, session_id)`.
-pub fn classify_session_path(
-    path: &Path,
-    project_root: Option<&Path>,
-) -> Option<(String, String)> {
+pub fn classify_session_path(path: &Path, project_root: Option<&Path>) -> Option<(String, String)> {
     let chats = paths::data_dir(project_root).join("chats");
     let rel = path.strip_prefix(&chats).ok()?;
     let mut comps = rel.components();
@@ -117,7 +114,9 @@ pub fn apply_external_to_list(
 ) -> ApplyResult {
     let (scope, session_id) = match event {
         ExternalSessionEvent::Modified { scope, session_id }
-        | ExternalSessionEvent::Removed { scope, session_id } => (scope.as_str(), session_id.as_str()),
+        | ExternalSessionEvent::Removed { scope, session_id } => {
+            (scope.as_str(), session_id.as_str())
+        }
     };
 
     let idx = sessions
@@ -272,7 +271,11 @@ mod tests {
             assert!(!is_in_flight(&list[0]));
 
             // WHEN another process writes that session file
-            let external = session("scope-c", "3", vec![user_msg("old"), user_msg("from-other")]);
+            let external = session(
+                "scope-c",
+                "3",
+                vec![user_msg("old"), user_msg("from-other")],
+            );
             chat_store::save_session(&external, Some(&root)).unwrap();
             let event = ExternalSessionEvent::Modified {
                 scope: "scope-c".into(),

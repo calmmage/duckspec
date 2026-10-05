@@ -120,7 +120,10 @@ fn render_meta_card(kind: MetaCardKind, lines: &[&str], width: usize) -> Vec<Sty
     };
     let inner_w = width.saturating_sub(4).max(8);
     let mut out = Vec::new();
-    let top = format!("┌─{title}{}", "─".repeat(inner_w.saturating_sub(title.len())));
+    let top = format!(
+        "┌─{title}{}",
+        "─".repeat(inner_w.saturating_sub(title.len()))
+    );
     out.push(StyledLine::styled(
         truncate_fit(&top, width),
         SpanStyle {
@@ -562,10 +565,7 @@ fn wrap_spans(spans: &[StyledSpan], width: usize) -> Vec<StyledLine> {
         }];
     }
     // Word-wrap plain text; re-apply first span style for simplicity.
-    let style = spans
-        .first()
-        .map(|s| s.style)
-        .unwrap_or_default();
+    let style = spans.first().map(|s| s.style).unwrap_or_default();
     wrap_text(&plain, width)
         .into_iter()
         .map(|t| StyledLine::styled(t, style))
@@ -575,7 +575,10 @@ fn wrap_spans(spans: &[StyledSpan], width: usize) -> Vec<StyledLine> {
 fn pad_truncate(s: &str, width: usize) -> String {
     let n = s.chars().count();
     if n > width {
-        s.chars().take(width.saturating_sub(1).max(1)).collect::<String>() + "…"
+        s.chars()
+            .take(width.saturating_sub(1).max(1))
+            .collect::<String>()
+            + "…"
     } else {
         format!("{s}{}", " ".repeat(width - n))
     }
@@ -586,6 +589,9 @@ fn truncate_fit(s: &str, width: usize) -> String {
     if n <= width {
         s.to_string()
     } else {
-        s.chars().take(width.saturating_sub(1).max(1)).collect::<String>() + "…"
+        s.chars()
+            .take(width.saturating_sub(1).max(1))
+            .collect::<String>()
+            + "…"
     }
 }

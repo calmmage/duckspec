@@ -3,6 +3,10 @@
 Exclusive boost marks on ideas — none, star, hot, or cool — with a pin time for stars,
 inherited by linked CHANGE and exploration list rows.
 
+Exclusive boost marks on ideas — none, star, hot, or cool — with a pin time for stars,
+inherited by linked CHANGE and exploration list rows, and shown as a single interactive
+control on CHANGE and Ideas lists.
+
 ## Requirement: Exclusive mark on the idea
 
 An idea SHALL carry exactly one boost mark among *none*, *star*, *hot*, and *cool*.
@@ -19,7 +23,7 @@ that is not one of those four marks SHALL load as *none*.
 - **THEN** the marks after each cycle are star, hot, cool, and none in that order
 
 > test: code
-> - crates/duckboard/src/idea_store.rs:1054
+> - crates/duckboard/src/idea_store.rs:1059
 
 ### Scenario: Mark persists across idea reload
 
@@ -29,7 +33,7 @@ that is not one of those four marks SHALL load as *none*.
 - **THEN** the idea's mark is hot
 
 > test: code
-> - crates/duckboard/src/idea_store.rs:1068
+> - crates/duckboard/src/idea_store.rs:1073
 
 ### Scenario: Unknown stored mark loads as none
 
@@ -38,7 +42,7 @@ that is not one of those four marks SHALL load as *none*.
 - **THEN** the idea's mark is none
 
 > test: code
-> - crates/duckboard/src/idea_store.rs:1082
+> - crates/duckboard/src/idea_store.rs:1087
 
 ## Requirement: Star pin time
 
@@ -56,7 +60,7 @@ previous star's pin time.
 - **THEN** the idea has a pin time
 
 > test: code
-> - crates/duckboard/src/idea_store.rs:1090
+> - crates/duckboard/src/idea_store.rs:1095
 
 ### Scenario: Leaving star clears pin time
 
@@ -65,7 +69,7 @@ previous star's pin time.
 - **THEN** the idea has no pin time
 
 > test: code
-> - crates/duckboard/src/idea_store.rs:1105
+> - crates/duckboard/src/idea_store.rs:1110
 
 ### Scenario: Re-entering star refreshes pin time
 
@@ -75,7 +79,7 @@ previous star's pin time.
 - **THEN** the idea's pin time is later than the earlier pin time
 
 > test: code
-> - crates/duckboard/src/idea_store.rs:1121
+> - crates/duckboard/src/idea_store.rs:1126
 
 ## Requirement: Linked rows inherit the idea mark
 
@@ -92,7 +96,7 @@ mark-cycle (or other mint) creates a linked idea.
 - **THEN** the row's mark is cool
 
 > test: code
-> - crates/duckboard/src/idea_store.rs:1162
+> - crates/duckboard/src/idea_store.rs:1167
 
 ### Scenario: Exploration-linked row exposes the idea's mark
 
@@ -101,7 +105,7 @@ mark-cycle (or other mint) creates a linked idea.
 - **THEN** the row's mark is star
 
 > test: code
-> - crates/duckboard/src/idea_store.rs:1183
+> - crates/duckboard/src/idea_store.rs:1185
 
 ### Scenario: Unlinked row has no mark until mark cycle mints
 
@@ -110,4 +114,44 @@ mark-cycle (or other mint) creates a linked idea.
 - **THEN** the row has no mark
 
 > test: code
-> - crates/duckboard/src/idea_store.rs:1197
+> - crates/duckboard/src/idea_store.rs:1195
+
+## Requirement: Single interactive mark control
+
+On CHANGE and Ideas list rows, the mark SHALL appear as at most one interactive control
+and SHALL NOT also appear as a prefix of the row title. When the mark is *none*, the
+outline control SHALL appear only while the row is hovered; when the mark is not *none*,
+the control SHALL be shown regardless of hover. The row title text SHALL be the plain
+display name without an embedded mark glyph. Activating the control SHALL cycle the mark
+(including minting a linked idea when the row is unlinked).
+
+> test: code
+
+### Scenario: Unmarked non-hovered row has no mark glyph
+
+- **GIVEN** a list row whose mark is none
+- **AND** the row is not hovered
+- **WHEN** the mark control glyph is resolved for paint
+- **THEN** no mark glyph is produced
+
+> test: code
+> - crates/duckboard/src/queue_list.rs:696
+
+### Scenario: Unmarked hovered row exposes outline control glyph
+
+- **GIVEN** a list row whose mark is none
+- **AND** the row is hovered
+- **WHEN** the mark control glyph is resolved for paint
+- **THEN** the outline star glyph is produced
+
+> test: code
+> - crates/duckboard/src/queue_list.rs:705
+
+### Scenario: Marked row always exposes the mark glyph
+
+- **GIVEN** a list row whose mark is star, hot, or cool
+- **WHEN** the mark control glyph is resolved for paint with or without hover
+- **THEN** the corresponding mark glyph is produced
+
+> test: code
+> - crates/duckboard/src/queue_list.rs:714

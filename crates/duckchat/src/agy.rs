@@ -6,10 +6,12 @@
 //! `agy` (main-only v1).
 
 mod agent_bin;
+mod models;
 
 pub use agent_bin::{AGY_ACP_BIN, AGY_ACP_ENV, agy_acp_launch, resolve_agy_acp_binary};
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 use async_trait::async_trait;
 
@@ -20,38 +22,33 @@ use crate::request::{ReplySuggestionRequest, TitleRequest};
 use crate::runtime::{MainRuntime, OneshotKind, OneshotRuntime};
 use crate::title::clean_title;
 
-/// Stable harness id shared by every model this provider owns.
-const HARNESS: &str = "agy";
+use models::{discover_agy_models, resolve_listed_models};
 
-/// Curated AGY model labels (`agy --model` accepts display labels).
-const AGY_MODELS: &[(&str, &str)] = &[
-    ("Gemini 3.5 Flash (Low)", "Gemini 3.5 Flash (Low)"),
-    ("Gemini 3.5 Flash (Medium)", "Gemini 3.5 Flash (Medium)"),
-    ("Gemini 3.5 Flash (High)", "Gemini 3.5 Flash (High)"),
-    ("Gemini 3.1 Pro (Low)", "Gemini 3.1 Pro (Low)"),
-    ("Gemini 3.1 Pro (High)", "Gemini 3.1 Pro (High)"),
-    ("Claude Sonnet 4.6 (Thinking)", "Claude Sonnet 4.6 (Thinking)"),
-    ("Claude Opus 4.6 (Thinking)", "Claude Opus 4.6 (Thinking)"),
-    ("GPT-OSS 120B (Medium)", "GPT-OSS 120B (Medium)"),
-];
+/// Stable harness id shared by every model this provider owns.
+pub(crate) const HARNESS: &str = "agy";
 
 /// [`Provider`] over the owned AGY ACP agent (`duckchat-agy-acp`).
 #[derive(Clone)]
 pub struct AgyProvider {
     launch: AgentLaunch,
+    models: OnceLock<Vec<ModelInfo>>,
 }
 
 impl AgyProvider {
     pub fn new() -> Self {
         Self {
             launch: agy_acp_launch(),
+            models: OnceLock::new(),
         }
     }
 
     /// Construct with a custom launch. Test-only seam.
     #[cfg(test)]
     fn with_launch(launch: AgentLaunch) -> Self {
-        Self { launch }
+        Self {
+            launch,
+            models: OnceLock::new(),
+        }
     }
 }
 
@@ -78,15 +75,13 @@ impl Provider for AgyProvider {
     }
 
     fn list_models(&self) -> Vec<ModelInfo> {
-        AGY_MODELS
-            .iter()
-            .map(|(id, display)| ModelInfo {
-                harness: self.id().to_string(),
-                id: (*id).to_string(),
-                display: (*display).to_string(),
-                context_window: None,
-            })
-            .collect()
+        self.models
+            .get_or_init(|| resolve_listed_models(discover_agy_models()))
+            .clone()
+    }
+
+    fn advertised_default(&self) -> Option<String> {
+        self.list_models().into_iter().next().map(|m| m.id)
     }
 
     fn list_commands(&self, _project_root: &Path) -> Vec<SlashCommand> {
@@ -339,10 +334,7 @@ for line in sys.stdin:
         assert!(raw.is_empty(), "local reply oneshot must return empty text");
 
         let suggestions = provider
-            .reply_suggestions(
-                ReplySuggestionRequest::new("What next?"),
-                Path::new("/tmp"),
-            )
+            .reply_suggestions(ReplySuggestionRequest::new("What next?"), Path::new("/tmp"))
             .await
             .unwrap();
         assert!(suggestions.is_empty());
@@ -357,5 +349,43 @@ for line in sys.stdin:
         for m in models {
             assert_eq!(m.harness, "agy", "model {} has harness {}", m.id, m.harness);
         }
+    }
+
+    /// @spec harness/agy Offered AGY models: Live discovery lists display names from agy models
+    #[test]
+    fn live_discovery_lists_display_names_from_agy_models() {
+        let stdout = "\
+Fetching available models...
+gemini-3.7-flash-high\tGemini 3.7 Flash (High)
+gemini-3.7-flash-medium\tGemini 3.7 Flash (Medium)
+gemini-3.5-flash-high\tGemini 3.5 Flash (High)
+";
+        let rows = super::models::parse_agy_models_output(stdout);
+        let listed = super::models::resolve_listed_models(Some(rows));
+        assert_eq!(
+            listed.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            [
+                "Gemini 3.7 Flash (High)",
+                "Gemini 3.7 Flash (Medium)",
+                "Gemini 3.5 Flash (High)",
+            ]
+        );
+        assert!(listed.iter().all(|m| m.harness == "agy"));
+        assert!(listed.iter().all(|m| m.display == m.id));
+    }
+
+    /// @spec harness/agy Offered AGY models: Empty or failed discovery falls back to the curated table
+    #[test]
+    fn empty_or_failed_discovery_falls_back_to_the_curated_table() {
+        let curated = super::models::curated_models();
+        assert!(!curated.is_empty());
+        let none = super::models::resolve_listed_models(None);
+        let empty = super::models::resolve_listed_models(Some(Vec::new()));
+        let none_ids: Vec<&str> = none.iter().map(|m| m.id.as_str()).collect();
+        let empty_ids: Vec<&str> = empty.iter().map(|m| m.id.as_str()).collect();
+        let curated_ids: Vec<&str> = curated.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(none_ids, curated_ids);
+        assert_eq!(empty_ids, curated_ids);
+        assert!(curated.iter().all(|m| m.harness == "agy"));
     }
 }

@@ -88,8 +88,7 @@ pub fn apply_file_events(shell: &mut Shell, events: &[FileEvent]) {
             FileEvent::Removed(p) => (p.as_path(), true),
             FileEvent::VcsStateChanged(_) => continue,
         };
-        let Some(ext) = session_sharing::external_event_for_path(path, removed, Some(&root))
-        else {
+        let Some(ext) = session_sharing::external_event_for_path(path, removed, Some(&root)) else {
             continue;
         };
         // Only apply when the event targets the active session scope/id.
@@ -114,11 +113,7 @@ pub fn apply_file_events(shell: &mut Shell, events: &[FileEvent]) {
 }
 
 /// Apply one agent event to shell chat state. Returns true if UI should rebuild.
-pub fn apply_agent_event(
-    shell: &mut Shell,
-    runtime: &mut AgentRuntime,
-    event: AgentEvent,
-) -> bool {
+pub fn apply_agent_event(shell: &mut Shell, runtime: &mut AgentRuntime, event: AgentEvent) -> bool {
     match event {
         AgentEvent::Ready(handle) => {
             runtime.handle = Some(handle);
@@ -300,8 +295,8 @@ pub fn dispatch_user_submit(
 
 /// Local `/help`: user + system messages, driven persist, no agent turn.
 fn run_local_help(shell: &mut Shell) {
-    use duckcore::slash_commands::build_system_help_body;
     use duckcore::session_sharing::DriveRole;
+    use duckcore::slash_commands::build_system_help_body;
 
     let catalog = shell.slash_catalog();
     let harness = shell.model.as_ref().map(|m| m.harness.as_str());
@@ -425,10 +420,9 @@ pub fn session_scope_for_shell(shell: &Shell) -> SessionScope {
                 .project_root
                 .as_deref()
                 .and_then(|root| load_change_facts(root, &scope_key));
-            let has_inputs = shell
-                .project_root
-                .as_deref()
-                .is_some_and(|root| duckcore::inputs_ledger::inputs_ledger_is_present(root, &scope_key));
+            let has_inputs = shell.project_root.as_deref().is_some_and(|root| {
+                duckcore::inputs_ledger::inputs_ledger_is_present(root, &scope_key)
+            });
             (facts, has_inputs)
         }
         _ => (None, false),
@@ -483,12 +477,21 @@ fn load_change_facts(project_root: &Path, name: &str) -> Option<ChangeScopeFacts
     let current_review = highest_review_name(&dir.join("reviews"));
 
     let (phase, next): (&'static str, &[&str]) = if step_count > 0 && steps_done < step_count {
-        ("implementing steps", &["ds-apply", "ds-review", "ds-followup"])
+        (
+            "implementing steps",
+            &["ds-apply", "ds-review", "ds-followup"],
+        )
     } else if step_count > 0 && steps_done == step_count {
         if current_review.is_some() {
             (
                 "all steps complete, review on file",
-                &["ds-step", "ds-spec", "ds-review", "ds-followup", "ds-archive"],
+                &[
+                    "ds-step",
+                    "ds-spec",
+                    "ds-review",
+                    "ds-followup",
+                    "ds-archive",
+                ],
             )
         } else {
             (
@@ -497,7 +500,10 @@ fn load_change_facts(project_root: &Path, name: &str) -> Option<ChangeScopeFacts
             )
         }
     } else if has_caps {
-        ("specs drafted, steps not yet written", &["ds-step", "ds-archive"])
+        (
+            "specs drafted, steps not yet written",
+            &["ds-step", "ds-archive"],
+        )
     } else if has_design {
         ("designing", &["ds-spec", "ds-design"])
     } else if has_proposal {
@@ -566,10 +572,7 @@ pub fn activate_hint(
                 runtime.handle.clone(),
                 shell.chat.pending_choice_correlation,
             ) {
-                handle.answer_user_choice(
-                    corr,
-                    UserChoiceAnswer::Selected { option_id: id },
-                );
+                handle.answer_user_choice(corr, UserChoiceAnswer::Selected { option_id: id });
                 shell.chat.awaiting_user = false;
                 shell.chat.pending_choice_correlation = None;
                 shell.chat.fast_hints.clear();
@@ -605,9 +608,7 @@ mod tests {
         let dirty = apply_agent_event(
             &mut shell,
             &mut rt,
-            AgentEvent::ContentDelta {
-                text: "hi".into(),
-            },
+            AgentEvent::ContentDelta { text: "hi".into() },
         );
         assert!(dirty);
         assert!(rt.chat_dirty);
@@ -753,10 +754,7 @@ mod tests {
             body.contains("Change-acting commands"),
             "orientation must assert default command target: {body}"
         );
-        assert!(
-            body.contains("hello"),
-            "user prompt still present: {body}"
-        );
+        assert!(body.contains("hello"), "user prompt still present: {body}");
         assert!(
             body.contains("When referencing project files"),
             "path-reference note rides first turn: {body}"

@@ -927,6 +927,70 @@ mod tests {
         ed.apply_action(EditorAction::Drag(Pos::new(0, 5))); // mid '—'
         let _ = ed.selection_text(); // must not panic
     }
+
+    // @spec editor/line-word-nav Line and word arrow navigation: Cmd+arrow moves to line start or end
+    #[test]
+    fn cmd_arrow_moves_to_line_start_or_end() {
+        // GIVEN caret mid-line; WHEN Cmd+←/→ without Option
+        let left = EditorAction::resolve_modified_horizontal_arrow(false, true, false, false);
+        let right = EditorAction::resolve_modified_horizontal_arrow(true, true, false, false);
+        assert!(matches!(left, Some(EditorAction::MoveHome(false))));
+        assert!(matches!(right, Some(EditorAction::MoveEnd(false))));
+        // Cmd+Option unbound
+        assert!(EditorAction::resolve_modified_horizontal_arrow(true, true, true, false).is_none());
+
+        let mut ed = EditorState::new("hello world");
+        ed.cursor = Pos::new(0, 5);
+        ed.apply_action(left.unwrap());
+        assert_eq!(ed.cursor, Pos::new(0, 0));
+        ed.cursor = Pos::new(0, 5);
+        ed.apply_action(right.unwrap());
+        assert_eq!(ed.cursor, Pos::new(0, "hello world".len()));
+    }
+
+    // @spec editor/line-word-nav Line and word arrow navigation: Option+arrow moves by word
+    #[test]
+    fn option_arrow_moves_by_word() {
+        // GIVEN caret mid-line; WHEN Option+←/→ without Cmd
+        let left = EditorAction::resolve_modified_horizontal_arrow(false, false, true, false);
+        let right = EditorAction::resolve_modified_horizontal_arrow(true, false, true, false);
+        assert!(matches!(left, Some(EditorAction::MoveWordLeft(false))));
+        assert!(matches!(right, Some(EditorAction::MoveWordRight(false))));
+
+        let mut ed = EditorState::new("hello world");
+        ed.cursor = Pos::new(0, 6); // start of "world"
+        ed.apply_action(left.unwrap());
+        assert_eq!(ed.cursor.col, 0); // start of "hello"
+        ed.cursor = Pos::new(0, 0);
+        ed.apply_action(right.unwrap());
+        assert_eq!(ed.cursor.col, 6); // after "hello " → start of "world"
+    }
+
+    // @spec editor/line-word-nav Line and word arrow navigation: Shift with Cmd or Option arrow extends selection
+    #[test]
+    fn shift_with_cmd_or_option_arrow_extends_selection() {
+        // GIVEN caret, no selection; WHEN Shift+Cmd or Shift+Option arrow
+        let cmd = EditorAction::resolve_modified_horizontal_arrow(true, true, false, true);
+        let opt = EditorAction::resolve_modified_horizontal_arrow(false, false, true, true);
+        assert!(matches!(cmd, Some(EditorAction::MoveEnd(true))));
+        assert!(matches!(opt, Some(EditorAction::MoveWordLeft(true))));
+
+        let mut ed = EditorState::new("hello world");
+        ed.cursor = Pos::new(0, 5);
+        ed.apply_action(cmd.unwrap());
+        assert!(ed.selection_range().is_some());
+        let (a, b) = ed.selection_range().unwrap();
+        assert_eq!(a, Pos::new(0, 5));
+        assert_eq!(b, Pos::new(0, "hello world".len()));
+
+        let mut ed2 = EditorState::new("hello world");
+        ed2.cursor = Pos::new(0, 5);
+        ed2.apply_action(opt.unwrap());
+        assert!(ed2.selection_range().is_some());
+        let (a, b) = ed2.selection_range().unwrap();
+        assert_eq!(a.col.min(b.col), 0);
+        assert_eq!(a.col.max(b.col), 5);
+    }
 }
 
 // ── Messages ───────────────────────────────────────────────────────────────
@@ -999,6 +1063,35 @@ pub enum EditorAction {
 }
 
 impl EditorAction {
+    /// Map Cmd/Option + horizontal arrow to line or word movement.
+    ///
+    /// - Cmd without Option → line start/end
+    /// - Option without Cmd → word left/right
+    /// - Cmd+Option → unbound (`None`)
+    /// - neither → not this path (`None`; caller uses plain char move)
+    ///
+    /// `right` is true for →, false for ←. `shift` extends selection.
+    pub fn resolve_modified_horizontal_arrow(
+        right: bool,
+        command: bool,
+        alt: bool,
+        shift: bool,
+    ) -> Option<EditorAction> {
+        match (command, alt) {
+            (true, false) => Some(if right {
+                EditorAction::MoveEnd(shift)
+            } else {
+                EditorAction::MoveHome(shift)
+            }),
+            (false, true) => Some(if right {
+                EditorAction::MoveWordRight(shift)
+            } else {
+                EditorAction::MoveWordLeft(shift)
+            }),
+            _ => None,
+        }
+    }
+
     /// Whether this action mutates text content (insert, delete, undo/redo).
     pub fn is_mutating(&self) -> bool {
         matches!(

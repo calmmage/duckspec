@@ -148,43 +148,61 @@ pub fn available_models() -> Vec<ModelInfo> {
     process_catalog().all()
 }
 
-/// Former compile-time cascade floor — preferred seed when still in the catalog.
+/// Former compile-time cascade floor — treated as follow-backend, not a pin.
 pub const FORMER_BUILTIN_HARNESS: &str = "grok";
 pub const FORMER_BUILTIN_MODEL: &str = "grok-4.5";
 
-/// Choose a seed for an unset global default from catalog contents.
-///
-/// Prefer the former built-in when present; otherwise the first model in catalog
-/// order. Empty catalog → `None`.
-pub fn seed_global_default_model(catalog: &[ModelInfo]) -> Option<ModelRef> {
+/// Stored global default is follow-backend when unset or still the former built-in.
+pub fn is_follow_backend(stored: Option<&ModelRef>) -> bool {
+    match stored {
+        None => true,
+        Some(m) => m.harness == FORMER_BUILTIN_HARNESS && m.model == FORMER_BUILTIN_MODEL,
+    }
+}
+
+/// Grok handshake advertised default, when that provider has discovered one.
+pub fn grok_advertised_default() -> Option<String> {
+    grok_provider().advertised_default()
+}
+
+/// Follow-backend choice: Grok advertised default when that id is in `catalog`,
+/// otherwise the first catalog model. Empty catalog → `None`.
+pub fn follow_backend_default(
+    catalog: &[ModelInfo],
+    grok_default: Option<&str>,
+) -> Option<ModelRef> {
     if catalog.is_empty() {
         return None;
     }
-    if let Some(m) = catalog
-        .iter()
-        .find(|m| m.harness == FORMER_BUILTIN_HARNESS && m.id == FORMER_BUILTIN_MODEL)
+    if let Some(id) = grok_default
+        && let Some(m) = catalog
+            .iter()
+            .find(|m| m.harness == FORMER_BUILTIN_HARNESS && m.id == id)
     {
         return Some(ModelRef::new(&m.harness, &m.id));
     }
     catalog.first().map(|m| ModelRef::new(&m.harness, &m.id))
 }
 
-/// If `config.default_model` is unset, seed it from `catalog` and return whether
-/// a value was written. Caller persists when this returns `true`.
-pub fn seed_global_default_if_unset(
-    default_model: &mut Option<ModelRef>,
+/// Resolve the global default: follow-backend or the stored pin.
+pub fn resolve_global_default(
+    stored: Option<&ModelRef>,
     catalog: &[ModelInfo],
+    grok_default: Option<&str>,
+) -> Option<ModelRef> {
+    if is_follow_backend(stored) {
+        follow_backend_default(catalog, grok_default)
+    } else {
+        stored.cloned()
+    }
+}
+
+/// Follow-backend must not be written as a concrete model. Always returns false.
+pub fn seed_global_default_if_unset(
+    _default_model: &mut Option<ModelRef>,
+    _catalog: &[ModelInfo],
 ) -> bool {
-    if default_model.is_some() {
-        return false;
-    }
-    match seed_global_default_model(catalog) {
-        Some(m) => {
-            *default_model = Some(m);
-            true
-        }
-        None => false,
-    }
+    false
 }
 
 /// Lookup helper used by the usage meter (catalog entry for the selected model).
@@ -695,50 +713,72 @@ mod tests {
         let _ = available_models();
     }
 
-    /// @spec harness/selection Global default model setting: An unset global default is seeded from the former built-in when that model is in the catalog
+    /// @spec harness/selection Default model resolution: Unset global follows the Grok advertised default when that model is in the catalog
     #[test]
-    fn unset_global_default_is_seeded_from_the_former_built_in_when_that_model_is_in_the_catalog() {
-        // GIVEN no configured global default
-        let mut default_model: Option<ModelRef> = None;
-        assert!(default_model.is_none());
-
-        // AND a non-empty process model catalog that includes grok / grok-4.5
+    fn unset_global_follows_the_grok_advertised_default_when_that_model_is_in_the_catalog() {
         let catalog = vec![
             mi("claude-code", "sonnet", None),
-            mi("grok", "grok-4.5", Some(256_000)),
+            mi("grok", "grok-next", Some(256_000)),
         ];
-
-        // WHEN the global default is seeded
-        assert!(seed_global_default_if_unset(&mut default_model, &catalog));
-
-        // THEN the global default is grok / grok-4.5
-        assert_eq!(
-            default_model.as_ref(),
-            Some(&ModelRef::new("grok", "grok-4.5"))
-        );
+        let resolved = resolve_global_default(None, &catalog, Some("grok-next"));
+        assert_eq!(resolved, Some(ModelRef::new("grok", "grok-next")));
     }
 
-    /// @spec harness/selection Global default model setting: An unset global default is seeded from the first catalog model when the former built-in is absent
+    /// @spec harness/selection Default model resolution: Unset global follows the first catalog model when the Grok advertised default is absent
     #[test]
-    fn unset_global_default_is_seeded_from_the_first_catalog_model_when_the_former_built_in_is_absent()
-     {
-        // GIVEN no configured global default
-        let mut default_model: Option<ModelRef> = None;
-        assert!(default_model.is_none());
-
-        // AND a non-empty process model catalog that does not include grok / grok-4.5
+    fn unset_global_follows_the_first_catalog_model_when_the_grok_advertised_default_is_absent() {
         let catalog = vec![
             mi("claude-code", "opus", None),
             mi("claude-code", "sonnet", None),
         ];
+        let resolved = resolve_global_default(None, &catalog, Some("grok-next"));
+        assert_eq!(resolved, Some(ModelRef::new("claude-code", "opus")));
+    }
 
-        // WHEN the global default is seeded
-        assert!(seed_global_default_if_unset(&mut default_model, &catalog));
+    /// @spec harness/selection Default model resolution: A former built-in stored global follows the advertised default
+    #[test]
+    fn a_former_built_in_stored_global_follows_the_advertised_default() {
+        let stored = ModelRef::new(FORMER_BUILTIN_HARNESS, FORMER_BUILTIN_MODEL);
+        let catalog = vec![
+            mi("claude-code", "sonnet", None),
+            mi("grok", "grok-next", Some(256_000)),
+        ];
+        let resolved = resolve_global_default(Some(&stored), &catalog, Some("grok-next"));
+        assert_eq!(resolved, Some(ModelRef::new("grok", "grok-next")));
+    }
 
-        // THEN the global default is the first model in catalog order
-        assert_eq!(
-            default_model.as_ref(),
-            Some(&ModelRef::new("claude-code", "opus"))
-        );
+    /// @spec harness/selection Default model resolution: Follow-backend with an empty catalog is not available
+    #[test]
+    fn follow_backend_with_an_empty_catalog_is_not_available() {
+        let catalog: Vec<ModelInfo> = Vec::new();
+        let resolved = resolve_global_default(None, &catalog, Some("grok-next"));
+        assert!(resolved.is_none());
+    }
+
+    /// @spec harness/selection Global default model setting: An unset global default is not persisted as a concrete model
+    #[test]
+    fn an_unset_global_default_is_not_persisted_as_a_concrete_model() {
+        let mut default_model: Option<ModelRef> = None;
+        let catalog = vec![
+            mi("claude-code", "sonnet", None),
+            mi("grok", "grok-next", Some(256_000)),
+        ];
+        assert!(!seed_global_default_if_unset(&mut default_model, &catalog));
+        assert!(default_model.is_none());
+        let resolved = resolve_global_default(default_model.as_ref(), &catalog, Some("grok-next"));
+        assert_eq!(resolved, Some(ModelRef::new("grok", "grok-next")));
+    }
+
+    /// @spec harness/selection Global default model setting: Clearing the global default returns to follow-backend
+    #[test]
+    fn clearing_the_global_default_returns_to_follow_backend() {
+        let stored: Option<ModelRef> = None;
+        assert!(is_follow_backend(stored.as_ref()));
+        let catalog = vec![
+            mi("claude-code", "opus", None),
+            mi("grok", "grok-next", Some(256_000)),
+        ];
+        let resolved = resolve_global_default(stored.as_ref(), &catalog, Some("grok-next"));
+        assert_eq!(resolved, Some(ModelRef::new("grok", "grok-next")));
     }
 }

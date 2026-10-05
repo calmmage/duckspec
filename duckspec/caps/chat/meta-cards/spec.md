@@ -33,7 +33,7 @@ recognition, even when they begin with `>`.
 - **AND** the card's inclusive line range covers exactly those three blockquote lines
 
 > test: code
-> - crates/duckcore/src/meta_card.rs:208
+> - crates/duckcore/src/meta_card.rs:201
 
 ### Scenario: Ordinary blockquote is not a meta card
 
@@ -45,7 +45,7 @@ recognition, even when they begin with `>`.
 - **THEN** no meta card is produced for that run
 
 > test: code
-> - crates/duckcore/src/meta_card.rs:233
+> - crates/duckcore/src/meta_card.rs:226
 
 ### Scenario: Known-kind line inside a fenced code block is not a meta card
 
@@ -57,21 +57,21 @@ recognition, even when they begin with `>`.
 - **THEN** no meta card is produced from that line
 
 > test: code
-> - crates/duckcore/src/meta_card.rs:248
+> - crates/duckcore/src/meta_card.rs:241
 
 ## Requirement: Trailing next actions
 
-Trailing next actions SHALL come only from a `next` meta card that is trailing: its
-inclusive line range ends at the last non-empty line of the source (blank lines after the
-card are allowed). When no such trailing `next` card exists, the trailing-action list
-SHALL be empty — including when a `next` card appears earlier in the message or only a
-`write` card is trailing. From a trailing `next` card, each body line after the kind line
-SHALL contribute at most one action: the send text is the content of the first inline code
-span on that line (text between the first pair of single backticks); if that line has no
-such span, the line SHALL be skipped. Optional text after the first code span, after trim,
-is reason only and SHALL NOT be part of the send text. Actions SHALL appear in source
-order. At most three actions SHALL be produced; further token-bearing body lines SHALL be
-ignored.
+Trailing next actions SHALL come from the **last** `next` meta card in the source (latest
+by line order). The card need not end at the last non-empty line — non-blank prose after
+the card is allowed and does not clear the action list. When no `next` card exists, the
+list SHALL be empty (including when only a `write` card is present). When multiple `next`
+cards exist, only the last one contributes actions. From that card, each body line after
+the kind line SHALL contribute at most one action: the send text is the content of the
+first inline code span on that line (text between the first pair of single backticks); if
+that line has no such span, the line SHALL be skipped. Optional text after the first code
+span, after trim, is reason only and SHALL NOT be part of the send text. Actions SHALL
+appear in source order. At most three actions SHALL be produced; further token-bearing
+body lines SHALL be ignored.
 
 > test: code
 
@@ -85,19 +85,33 @@ ignored.
 - **THEN** the action list has exactly those two send texts in source order
 
 > test: code
-> - crates/duckcore/src/meta_card.rs:265
+> - crates/duckcore/src/meta_card.rs:258
 
-### Scenario: Non-trailing next card yields no actions
+### Scenario: Last next card yields actions with prose after
 
 - **GIVEN** assistant markdown that contains a `next` meta card followed by non-blank
   non-blockquote content after the card
 
+- **AND** that card's body has two send tokens
+
 - **WHEN** trailing next actions are extracted
 
-- **THEN** the action list is empty
+- **THEN** the action list has exactly those two send texts in source order
 
 > test: code
-> - crates/duckcore/src/meta_card.rs:286
+> - crates/duckcore/src/meta_card.rs:279
+
+### Scenario: Later next card wins over an earlier one
+
+- **GIVEN** assistant markdown with an earlier `next` card and a later `next` card each
+  with distinct send tokens
+
+- **WHEN** trailing next actions are extracted
+
+- **THEN** the action list is exactly the later card's send tokens
+
+> test: code
+> - crates/duckcore/src/meta_card.rs:302
 
 ### Scenario: Actions capped at three in source order
 
@@ -111,7 +125,7 @@ ignored.
 - **AND** those entries are the first three send texts in source order
 
 > test: code
-> - crates/duckcore/src/meta_card.rs:303
+> - crates/duckcore/src/meta_card.rs:323
 
 ### Scenario: Body line without a token is skipped
 
@@ -125,7 +139,7 @@ ignored.
 - **AND** they are the tokens from the two token-bearing lines in source order
 
 > test: code
-> - crates/duckcore/src/meta_card.rs:324
+> - crates/duckcore/src/meta_card.rs:344
 
 ### Scenario: Reason after the token is not part of send text
 
@@ -139,4 +153,4 @@ ignored.
 - **AND** the reason text is not included in the send text
 
 > test: code
-> - crates/duckcore/src/meta_card.rs:344
+> - crates/duckcore/src/meta_card.rs:364

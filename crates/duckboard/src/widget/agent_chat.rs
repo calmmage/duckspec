@@ -20,7 +20,7 @@ use duckchat::{ModelInfo, ModelRef};
 
 use crate::agent::SlashCommand;
 use crate::area::interaction::{self, SelectionContext};
-use crate::chat_store::{ChatSession, ContentBlock, Role};
+use crate::chat_store::ChatSession;
 use crate::config::ViewerStyle;
 use crate::slash_commands::{slash_kind_rank, slash_kind_row_tag};
 use crate::theme;
@@ -89,19 +89,14 @@ pub fn focus_slice_uses_last_answer_band(slice: FocusSliceKind, is_last_answer: 
 ///
 /// Classic / passthrough / live → full Answer body. Focus sectioned → open
 /// region only (sections render as plain text from [`Block::lines`]).
-pub fn answer_editor_desired_lines(
-    block: &Block,
-    effective_style: ViewerStyle,
-) -> Vec<String> {
-    if block.kind != BlockKind::Assistant {
+pub fn answer_editor_desired_lines(block: &Block, effective_style: ViewerStyle) -> Vec<String> {
+    if !block_presentation_uses_viewer_style(block.kind) {
         return block.lines.clone();
     }
     let source = block.lines.join("\n");
     match answer_body_presentation(effective_style, block.is_live, &source) {
         AnswerBodyPresentation::ClassicFullBody => block.lines.clone(),
-        AnswerBodyPresentation::FocusSectioned { open, .. } => {
-            slice_line_vec(&block.lines, open)
-        }
+        AnswerBodyPresentation::FocusSectioned { open, .. } => slice_line_vec(&block.lines, open),
     }
 }
 
@@ -159,8 +154,10 @@ pub enum Msg {
     ChatScrolled(scrollable::Viewport),
     /// User picked a model from the meta-row selector.
     ModelSelected(ModelChoice),
-    /// Cycle empty-input next actions (`+1` Tab, `-1` Shift-Tab).
+    /// Cycle empty-input next actions (`+1` Shift-Tab, forward wrap).
     CycleNextAction(i8),
+    /// Insert active next-action send into the empty composer (no turn).
+    FillNextAction,
     /// Layout measure of the chat scrollable (viewport + content heights).
     /// Used to recompute the bottom-pin pad even when content fits the
     /// viewport and iced suppresses `on_scroll` notifications.
@@ -168,6 +165,13 @@ pub enum Msg {
         viewport_h: f32,
         content_h: f32,
     },
+    /// Layout measure of the last non-priming User block content top
+    /// (relative to the chat scrollable content origin).
+    StickyLastUserLayout {
+        content_top: Option<f32>,
+    },
+    /// Action from the sticky last-user read-only body editor (ignored).
+    StickyLastUserAction(text_edit::EditorAction),
     /// Phase-pill activation: empty-send next-stage text or `Commit`.
     PhasePillSend(String),
 }
@@ -227,10 +231,33 @@ pub fn chat_model_choices() -> Vec<ModelChoice> {
     model_entries()
 }
 
-/// Picker options for the global main-chat default in Settings. Catalog models
-/// only — no sentinel (the global default is always a concrete choice when set).
+/// Picker options for the global main-chat default in Settings. First entry
+/// is follow-backend (`id`/`harness` `None`); remaining rows are catalog models.
 pub fn global_model_choices() -> Vec<ModelChoice> {
-    model_entries()
+    let catalog = crate::agent::available_models();
+    let resolved = crate::agent::resolve_global_default(None, &catalog);
+    let mut out = vec![follow_backend_model_choice(resolved.as_ref())];
+    out.extend(group_choices(catalog));
+    out
+}
+
+/// Sentinel for follow-backend. `resolved` names the model that follow currently
+/// yields, used on the closed control.
+pub fn follow_backend_model_choice(resolved: Option<&ModelRef>) -> ModelChoice {
+    let closed = resolved
+        .and_then(|r| {
+            crate::agent::available_models()
+                .into_iter()
+                .find(|m| m.harness == r.harness && m.id == r.model)
+                .map(|m| format!("{} (backend default)", m.display))
+        })
+        .unwrap_or_else(|| "Follow backend default".to_string());
+    ModelChoice {
+        harness: None,
+        id: None,
+        label: "Follow backend default".to_string(),
+        closed_label: closed,
+    }
 }
 
 /// Picker options for the project override in Settings. First entry clears the
@@ -430,12 +457,11 @@ pub struct CompletionState {
 /// One contiguous run of the calm transcript: user/system prose, thinking,
 /// answer, or a grouped activity of tools.
 // Shared segment model — construction and collapse live in duckcore.
+// Re-export only names the bin uses; test-only helpers import duckcore directly.
 pub use duckcore::transcript::{
-    ActivityRowView, CollapseState, PRIMING_RECOLLAPSE_SECS, ToolRow, ToolRowStatus, TranscriptSeg,
-    activity_collapsed_label, build_transcript_segments, expanded_activity_rows, format_tool_summary,
-    is_host_choice_tool_name, priming_collapsed_label, recollapse_priming, strip_ansi_escapes,
-    strip_tool_wrapper_tags, sync_collapse_states, text_lines, thinking_collapsed_label,
-    toggle_collapse, tool_status_glyph, truncate_chars, truncate_output,
+    CollapseState, PRIMING_RECOLLAPSE_SECS, ToolRow, TranscriptSeg, activity_collapsed_label,
+    build_transcript_segments, expanded_activity_rows, priming_collapsed_label, recollapse_priming,
+    sync_collapse_states, text_lines, thinking_collapsed_label, toggle_collapse,
 };
 
 // ── Build blocks from session ──────────────────────────────────────────────
@@ -449,10 +475,7 @@ pub use duckcore::transcript::{
 pub fn blocks_from_segments(segs: &[TranscriptSeg]) -> Vec<Block> {
     segs.iter()
         .map(|seg| match seg {
-            TranscriptSeg::User {
-                lines,
-                is_priming,
-            } => Block {
+            TranscriptSeg::User { lines, is_priming } => Block {
                 kind: BlockKind::User,
                 label: if *is_priming {
                     "Setup".to_string()
@@ -570,6 +593,53 @@ pub fn next_answer_idx(anchors: &[usize], from: Option<usize>) -> Option<usize> 
 
 /// Float slack when comparing Answer tops to the viewport scroll offset.
 const VIEWPORT_TOP_EPS: f32 = 1.0;
+
+/// Sticky last-user panel max height: six content line heights.
+pub const STICKY_LAST_USER_LINE_CAP: f32 = 6.0;
+
+/// Index of the last non-priming User block in transcript order, if any.
+///
+/// Priming User, System, Thinking, Activity, Answer, and user-choice segments
+/// never own the sticky source.
+pub fn last_non_priming_user_idx(blocks: &[Block]) -> Option<usize> {
+    blocks
+        .iter()
+        .rposition(|b| b.kind == BlockKind::User && !b.is_priming)
+}
+
+/// Full body text of the sticky last-user source, when a source exists.
+pub fn sticky_last_user_body(blocks: &[Block]) -> Option<String> {
+    let idx = last_non_priming_user_idx(blocks)?;
+    Some(blocks[idx].lines.join("\n"))
+}
+
+/// Whether the sticky last-user panel should show.
+///
+/// Top-edge rule: show when a source exists, `content_top` is known, and
+/// `content_top + VIEWPORT_TOP_EPS < offset_y`. Missing scroll offset is treated
+/// as zero. Unknown `content_top` (not yet measured) hides the sticky.
+pub fn sticky_last_user_visible(
+    has_source: bool,
+    content_top: Option<f32>,
+    offset_y: Option<f32>,
+) -> bool {
+    if !has_source {
+        return false;
+    }
+    let Some(top) = content_top else {
+        return false;
+    };
+    let offset = offset_y.unwrap_or(0.0);
+    top + VIEWPORT_TOP_EPS < offset
+}
+
+/// Maximum sticky last-user panel height for a given content line height.
+///
+/// The live panel uses `max_rows(STICKY_LAST_USER_LINE_CAP)`; this helper
+/// exposes the same six-line cap in pixels for tests and callers.
+pub fn sticky_last_user_max_height(content_line_height: f32) -> f32 {
+    STICKY_LAST_USER_LINE_CAP * content_line_height
+}
 
 /// Resolve the current Answer for ⌘←/→ from stick-to-bottom or scroll position.
 ///
@@ -767,6 +837,10 @@ pub fn view<'a>(
         usize,
         std::collections::HashMap<String, crate::focus_answer::SectionFoldState>,
     >,
+    // Sticky last-user: cached content top + scroll offset + body editor.
+    sticky_content_top: Option<f32>,
+    sticky_offset_y: Option<f32>,
+    sticky_editor: &'a EditorState,
 ) -> Element<'a, Msg> {
     // Chat content — scrollable column of full-width sections.
     let mut chat_col = column![]
@@ -897,7 +971,7 @@ pub fn view<'a>(
     // word-nav, selection). Plain Enter sends via `on_submit`; Shift+Enter
     // inserts a newline. Grows via `fit_content`. Display-only key prefixes on
     // ghost text; send paths use next_actions.send only.
-    let show_tab_marker = crate::default_prompts::next_tab_marker_visible(
+    let show_cycle_marker = crate::default_prompts::next_cycle_marker_visible(
         input_empty,
         status.is_streaming,
         next_actions.len(),
@@ -907,8 +981,9 @@ pub fn view<'a>(
             .unwrap_or("");
     let ghost = if ghost_body.is_empty() {
         String::new()
-    } else if show_tab_marker {
-        format!("⇥  {ghost_body}")
+    } else if show_cycle_marker {
+        // Display-only Shift-Tab cue; fill/send use raw send text only.
+        format!("⇧⇥  {ghost_body}")
     } else {
         ghost_body.to_string()
     };
@@ -1013,13 +1088,11 @@ pub fn view<'a>(
     let mut composer_col = column![].spacing(theme::SPACING_XS);
 
     if let Some(display) = phase_display.as_ref() {
-        let on_lifecycle = display
-            .lifecycle_send
-            .as_ref()
-            .map(|t| Msg::PhasePillSend(t.clone()));
-        let on_vcs = display
-            .vcs_send
-            .map(|t| Msg::PhasePillSend(t.to_string()));
+        use crate::area::change::{PhasePillKind, phase_pill_activation_send};
+        let on_lifecycle =
+            phase_pill_activation_send(display, PhasePillKind::Lifecycle).map(Msg::PhasePillSend);
+        let on_vcs =
+            phase_pill_activation_send(display, PhasePillKind::Vcs).map(Msg::PhasePillSend);
         composer_col = composer_col.push(
             container(crate::widget::phase_pill::view_pair(
                 display,
@@ -1130,11 +1203,105 @@ pub fn view<'a>(
         .width(Length::Fill)
         .style(composer_style);
 
-    // Stable outer column (scroll → completion → divider → input) so showing
-    // or hiding in-scroll chrome never remounts the input and steals focus.
-    column![chat_area, completion_el, input_divider, input_row]
-        .height(Length::Fill)
+    // Sticky last-user slot above the scrollable (outside transcript scroll
+    // and outside the composer stack). Always present as the first child so
+    // show/hide does not remount the composer.
+    let has_sticky_source = last_non_priming_user_idx(blocks).is_some();
+    let show_sticky =
+        sticky_last_user_visible(has_sticky_source, sticky_content_top, sticky_offset_y);
+    let sticky_slot = view_sticky_last_user_slot(show_sticky, sticky_editor);
+
+    // Stable outer column (sticky → scroll → completion → divider → input) so
+    // showing or hiding chrome never remounts the input and steals focus.
+    column![
+        sticky_slot,
+        chat_area,
+        completion_el,
+        input_divider,
+        input_row
+    ]
+    .height(Length::Fill)
+    .into()
+}
+
+/// Sticky last-user panel or an empty stable placeholder when hidden.
+fn view_sticky_last_user_slot<'a>(show: bool, sticky_editor: &'a EditorState) -> Element<'a, Msg> {
+    if !show {
+        return container(Space::new().width(Length::Fill).height(0.0))
+            .width(Length::Fill)
+            .into();
+    }
+    // Six content line heights (see `sticky_last_user_max_height` for px form).
+    let _max_height_px = sticky_last_user_max_height(theme::content_cell_height());
+    let max_rows = STICKY_LAST_USER_LINE_CAP.round().max(1.0) as usize;
+    let body = text_edit::TextEdit::new(sticky_editor, Msg::StickyLastUserAction)
+        .show_gutter(false)
+        .word_wrap(true)
+        .read_only(true)
+        .fit_content(true)
+        .max_rows(max_rows)
+        .transparent_bg(true);
+    let padded = container(body)
+        .padding([theme::SPACING_SM, theme::SPACING_MD])
+        .width(Length::Fill)
+        .style(theme::chat_user_card);
+    container(padded)
+        .padding([theme::SPACING_XS, theme::SPACING_SM])
+        .width(Length::Fill)
         .into()
+}
+
+/// Measure the content-space top of a chat block (layout `y` relative to the
+/// chat scrollable content origin). Used to cache sticky last-user visibility.
+pub fn measure_block_content_top(block_idx: usize) -> iced::Task<Option<f32>> {
+    use iced::advanced::widget::Id;
+    use iced::advanced::widget::operation::{self, Operation, Outcome};
+
+    struct MeasureTop {
+        scrollable_id: Id,
+        block_id: Id,
+        block_y: Option<f32>,
+        scrollable_y: Option<f32>,
+    }
+
+    impl Operation<Option<f32>> for MeasureTop {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<Option<f32>>)) {
+            operate(self);
+        }
+
+        fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
+            if id == Some(&self.block_id) {
+                self.block_y = Some(bounds.y);
+            }
+        }
+
+        fn scrollable(
+            &mut self,
+            id: Option<&Id>,
+            bounds: Rectangle,
+            _content_bounds: Rectangle,
+            _translation: Vector,
+            _state: &mut dyn operation::Scrollable,
+        ) {
+            if id == Some(&self.scrollable_id) {
+                self.scrollable_y = Some(bounds.y);
+            }
+        }
+
+        fn finish(&self) -> Outcome<Option<f32>> {
+            match (self.block_y, self.scrollable_y) {
+                (Some(by), Some(sy)) => Outcome::Some(Some((by - sy).max(0.0))),
+                _ => Outcome::Some(None),
+            }
+        }
+    }
+
+    iced::advanced::widget::operate(MeasureTop {
+        scrollable_id: Id::from(CHAT_SCROLLABLE_ID),
+        block_id: find::chat_block_widget_id(block_idx),
+        block_y: None,
+        scrollable_y: None,
+    })
 }
 
 /// Measure the chat scrollable's viewport and content heights via a widget
@@ -1200,7 +1367,9 @@ fn view_block<'a>(
     hl_current: Option<text_edit::HighlightRange>,
     is_last_answer: bool,
     viewer_style: ViewerStyle,
-    focus_folds: Option<&'a std::collections::HashMap<String, crate::focus_answer::SectionFoldState>>,
+    focus_folds: Option<
+        &'a std::collections::HashMap<String, crate::focus_answer::SectionFoldState>,
+    >,
 ) -> Element<'a, Msg> {
     match block.kind {
         BlockKind::Reasoning => {
@@ -1218,18 +1387,16 @@ fn view_block<'a>(
                 AnswerBodyPresentation::ClassicFullBody => {
                     view_prose_block(idx, block, editor, hl_ranges, hl_current, is_last_answer)
                 }
-                AnswerBodyPresentation::FocusSectioned { sections, open: _ } => {
-                    view_focus_answer(
-                        idx,
-                        block,
-                        editor,
-                        &sections,
-                        focus_folds,
-                        hl_ranges,
-                        hl_current,
-                        is_last_answer,
-                    )
-                }
+                AnswerBodyPresentation::FocusSectioned { sections, open: _ } => view_focus_answer(
+                    idx,
+                    block,
+                    editor,
+                    &sections,
+                    focus_folds,
+                    hl_ranges,
+                    hl_current,
+                    is_last_answer,
+                ),
             }
         }
         BlockKind::User | BlockKind::System => {
@@ -1254,14 +1421,18 @@ fn view_focus_answer<'a>(
     block: &'a Block,
     editor: Option<&'a EditorState>,
     sections: &[crate::focus_answer::FoldableSection],
-    focus_folds: Option<&'a std::collections::HashMap<String, crate::focus_answer::SectionFoldState>>,
+    focus_folds: Option<
+        &'a std::collections::HashMap<String, crate::focus_answer::SectionFoldState>,
+    >,
     hl_ranges: Vec<text_edit::HighlightRange>,
     hl_current: Option<text_edit::HighlightRange>,
     is_last_answer: bool,
 ) -> Element<'a, Msg> {
     use crate::focus_answer::{range_line_count, section_collapsed_label, section_key};
 
-    debug_assert!(focus_slice_uses_classic_body_paint(FocusSliceKind::OpenRegion));
+    debug_assert!(focus_slice_uses_classic_body_paint(
+        FocusSliceKind::OpenRegion
+    ));
     debug_assert!(!focus_slice_uses_classic_body_paint(
         FocusSliceKind::ExpandedSection
     ));
@@ -1764,11 +1935,9 @@ fn view_completion_col<'a>(
                 .color(name_color),
         ];
         if let Some(tag) = slash_kind_row_tag(cmd.kind) {
-            label = label.push(Space::new().width(theme::SPACING_SM)).push(
-                text(tag)
-                    .size(theme::font_sm())
-                    .color(theme::text_muted()),
-            );
+            label = label
+                .push(Space::new().width(theme::SPACING_SM))
+                .push(text(tag).size(theme::font_sm()).color(theme::text_muted()));
         }
         label = label
             .push(Space::new().width(theme::SPACING_SM))
@@ -1873,7 +2042,12 @@ fn fuzzy_score(query: &str, target: &str) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat_store::{ContentBlock, Role};
     use duckchat::SlashCommandKind;
+    use duckcore::transcript::{
+        ToolRowStatus, format_tool_summary, is_host_choice_tool_name, strip_ansi_escapes,
+        strip_tool_wrapper_tags, truncate_chars, truncate_output,
+    };
 
     fn model(harness: &str, id: &str, window: Option<usize>) -> ModelInfo {
         ModelInfo {
@@ -1913,10 +2087,7 @@ mod tests {
         // GIVEN a System completion entry
         // WHEN the completion row tag is resolved
         // THEN the row includes a `sys` tag
-        assert_eq!(
-            slash_kind_row_tag(SlashCommandKind::System),
-            Some("sys")
-        );
+        assert_eq!(slash_kind_row_tag(SlashCommandKind::System), Some("sys"));
         assert_eq!(slash_kind_row_tag(SlashCommandKind::Workflow), None);
         assert_eq!(slash_kind_row_tag(SlashCommandKind::Agent), None);
     }
@@ -2877,15 +3048,18 @@ What.
         // WHEN the Answer is presented
         let mode = answer_body_presentation(ViewerStyle::Focus, false, src);
         // THEN the Answer uses Focus layout
-        assert!(matches!(mode, AnswerBodyPresentation::FocusSectioned { .. }));
+        assert!(matches!(
+            mode,
+            AnswerBodyPresentation::FocusSectioned { .. }
+        ));
     }
 
     /// @spec chat/focus-answer Fold defaults and toggles: First sight collapses foldable sections and shows open region
     #[test]
     fn first_sight_collapses_foldable_sections_and_shows_open_region() {
         use crate::focus_answer::{
-            focus_layout, range_line_count, section_key, sync_section_folds, FocusLayout,
-            SectionFoldState,
+            FocusLayout, SectionFoldState, focus_layout, range_line_count, section_key,
+            sync_section_folds,
         };
         use std::collections::HashMap;
 
@@ -2918,7 +3092,7 @@ What.
     #[test]
     fn user_expand_survives_rematerialize_for_the_same_section_key() {
         use crate::focus_answer::{
-            focus_layout, section_key, sync_section_folds, toggle_section_fold, FocusLayout,
+            FocusLayout, focus_layout, section_key, sync_section_folds, toggle_section_fold,
         };
         use std::collections::HashMap;
 
@@ -2975,10 +3149,15 @@ What.
         // GIVEN a Focus layout Answer with an open region
         let src = sample_focus_answer_source();
         let mode = answer_body_presentation(ViewerStyle::Focus, false, src);
-        assert!(matches!(mode, AnswerBodyPresentation::FocusSectioned { .. }));
+        assert!(matches!(
+            mode,
+            AnswerBodyPresentation::FocusSectioned { .. }
+        ));
         // WHEN the open region is presented
         // THEN the open region uses classic Answer body paint
-        assert!(focus_slice_uses_classic_body_paint(FocusSliceKind::OpenRegion));
+        assert!(focus_slice_uses_classic_body_paint(
+            FocusSliceKind::OpenRegion
+        ));
         // Editor content for Focus is open-region lines only (TextEdit recipe surface).
         let block = answer_block(src);
         let desired = answer_editor_desired_lines(&block, ViewerStyle::Focus);
@@ -3020,7 +3199,7 @@ What.
     /// @spec chat/focus-answer Focus slice presentation (Hybrid C): Collapsed preamble label uses line count form
     #[test]
     fn collapsed_preamble_label_uses_line_count_form() {
-        use crate::focus_answer::{section_collapsed_label, SectionKind};
+        use crate::focus_answer::{SectionKind, section_collapsed_label};
 
         // GIVEN a Focus layout Answer with a collapsed preamble section of known line count
         let kind = SectionKind::Preamble;
@@ -3032,10 +3211,7 @@ What.
             label.contains("4"),
             "preamble label should include line count: {label}"
         );
-        assert!(
-            label.to_lowercase().contains("preamble"),
-            "label: {label}"
-        );
+        assert!(label.to_lowercase().contains("preamble"), "label: {label}");
     }
 
     /// @spec chat/focus-answer Last-answer band under Focus: Last Focus Answer bands only the open region
@@ -3622,15 +3798,9 @@ What.
         sync_collapse_states(&mut states, &segs);
 
         // THEN the priming Setup block is collapsed and the real user is not.
-        assert!(
-            states[0].collapsed,
-            "priming Setup should start collapsed"
-        );
+        assert!(states[0].collapsed, "priming Setup should start collapsed");
         assert!(!states[0].user_set);
-        assert!(
-            !states[2].collapsed,
-            "real user message must stay expanded"
-        );
+        assert!(!states[2].collapsed, "real user message must stay expanded");
 
         let blocks = blocks_from_segments(&segs);
         assert!(blocks[0].is_priming);
@@ -3713,5 +3883,178 @@ What.
             label.contains("3 lines"),
             "collapsed priming label should include line count: {label}"
         );
+    }
+
+    // ── Sticky last-user pure helpers ───────────────────────────────────
+
+    fn priming_user_block(text: &str) -> Block {
+        Block {
+            kind: BlockKind::User,
+            label: "Setup".into(),
+            lines: vec![text.into()],
+            is_priming: true,
+            is_live: false,
+        }
+    }
+
+    fn user_choice_answer_block(text: &str) -> Block {
+        Block {
+            kind: BlockKind::UserChoiceAnswer,
+            label: "Answer".into(),
+            lines: vec![text.into()],
+            is_priming: false,
+            is_live: false,
+        }
+    }
+
+    /// @spec chat/sticky-last-user Source identity: Last non-priming User wins over priming and later non-user segments
+    #[test]
+    fn last_non_priming_user_wins_over_priming_and_later_non_user_segments() {
+        // GIVEN priming User, later non-priming User, then Answer
+        let blocks = vec![
+            priming_user_block("setup"),
+            user_block("real ask"),
+            answer_block("reply"),
+        ];
+
+        // WHEN the sticky source is resolved
+        let idx = last_non_priming_user_idx(&blocks);
+
+        // THEN the source is that non-priming User segment
+        assert_eq!(idx, Some(1));
+    }
+
+    /// @spec chat/sticky-last-user Source identity: Priming-only transcript has no source
+    #[test]
+    fn priming_only_transcript_has_no_sticky_source() {
+        // GIVEN a transcript whose only User segment is priming
+        let blocks = vec![priming_user_block("setup only"), answer_block("ok")];
+
+        // WHEN the sticky source is resolved
+        let idx = last_non_priming_user_idx(&blocks);
+
+        // THEN there is no sticky source
+        assert_eq!(idx, None);
+    }
+
+    /// @spec chat/sticky-last-user Source identity: User-choice answer is not the source
+    #[test]
+    fn user_choice_answer_is_not_sticky_source() {
+        // GIVEN earlier non-priming User and a later user-choice answer
+        let blocks = vec![
+            user_block("original ask"),
+            answer_block("question?"),
+            user_choice_answer_block("option A"),
+        ];
+
+        // WHEN the sticky source is resolved
+        let idx = last_non_priming_user_idx(&blocks);
+
+        // THEN the source is the earlier non-priming User, not the choice answer
+        assert_eq!(idx, Some(0));
+        assert_ne!(blocks[idx.unwrap()].kind, BlockKind::UserChoiceAnswer);
+    }
+
+    /// @spec chat/sticky-last-user Visibility: Content top above offset shows sticky
+    #[test]
+    fn content_top_above_offset_shows_sticky() {
+        // GIVEN a source with content top 100 and offset well below that top
+        // (offset greater than top + slack means top is above the viewport)
+        let content_top = 100.0;
+        let offset_y = content_top + VIEWPORT_TOP_EPS + 10.0;
+
+        // WHEN sticky visibility is evaluated
+        let shown = sticky_last_user_visible(true, Some(content_top), Some(offset_y));
+
+        // THEN the sticky is shown
+        assert!(shown);
+    }
+
+    /// @spec chat/sticky-last-user Visibility: Content top at or below offset hides sticky
+    #[test]
+    fn content_top_at_or_below_offset_hides_sticky() {
+        // GIVEN a source with content top 100 and offset at/below that top within slack
+        let content_top = 100.0;
+
+        // WHEN sticky visibility is evaluated at the top edge and just below
+        let at_edge = sticky_last_user_visible(true, Some(content_top), Some(content_top));
+        let within_slack = sticky_last_user_visible(
+            true,
+            Some(content_top),
+            Some(content_top + VIEWPORT_TOP_EPS),
+        );
+        let below = sticky_last_user_visible(true, Some(content_top), Some(content_top - 5.0));
+
+        // THEN the sticky is hidden
+        assert!(!at_edge);
+        assert!(!within_slack);
+        assert!(!below);
+    }
+
+    /// @spec chat/sticky-last-user Visibility: No source hides sticky
+    #[test]
+    fn no_source_hides_sticky() {
+        // GIVEN no sticky source
+        // WHEN sticky visibility is evaluated
+        let shown = sticky_last_user_visible(false, Some(0.0), Some(500.0));
+
+        // THEN the sticky is hidden
+        assert!(!shown);
+    }
+
+    /// @spec chat/sticky-last-user Visibility: Missing offset treated as zero
+    #[test]
+    fn missing_offset_treated_as_zero_for_sticky_visibility() {
+        // GIVEN a source whose content top is greater than zero
+        // AND no scroll offset is recorded
+        let content_top = 40.0;
+
+        // WHEN sticky visibility is evaluated
+        let shown = sticky_last_user_visible(true, Some(content_top), None);
+
+        // THEN the sticky is hidden (offset treated as 0)
+        assert!(!shown);
+        assert_eq!(
+            sticky_last_user_visible(true, Some(content_top), None),
+            sticky_last_user_visible(true, Some(content_top), Some(0.0))
+        );
+    }
+
+    /// @spec chat/sticky-last-user Mirror body: Body equals the source User segment text
+    #[test]
+    fn sticky_body_equals_source_user_segment_text() {
+        // GIVEN a sticky source User segment with known multi-line body
+        let body = "line one\nline two";
+        let blocks = vec![
+            priming_user_block("setup"),
+            Block {
+                kind: BlockKind::User,
+                label: "User".into(),
+                lines: body.lines().map(String::from).collect(),
+                is_priming: false,
+                is_live: false,
+            },
+            answer_block("reply"),
+        ];
+
+        // WHEN the sticky body text is resolved
+        let text = sticky_last_user_body(&blocks);
+
+        // THEN the body text equals that segment’s full text
+        assert_eq!(text.as_deref(), Some(body));
+    }
+
+    /// @spec chat/sticky-last-user Height cap: Maximum height is six content line heights
+    #[test]
+    fn sticky_max_height_is_six_content_line_heights() {
+        // GIVEN content line height metrics
+        let line_h = 14.0;
+
+        // WHEN the maximum sticky height is resolved
+        let max_h = sticky_last_user_max_height(line_h);
+
+        // THEN it equals six content line heights
+        assert_eq!(max_h, 6.0 * line_h);
+        assert_eq!(STICKY_LAST_USER_LINE_CAP, 6.0);
     }
 }

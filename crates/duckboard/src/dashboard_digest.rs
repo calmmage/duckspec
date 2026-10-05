@@ -146,10 +146,7 @@ pub fn exploration_rank_inputs(
 }
 
 /// Scopes to scan for Dashboard ranking: active change names + exploration ids.
-pub fn dashboard_scopes(
-    project: &ProjectData,
-    explorations: &[Exploration],
-) -> Vec<String> {
+pub fn dashboard_scopes(project: &ProjectData, explorations: &[Exploration]) -> Vec<String> {
     let mut scopes: Vec<String> = project
         .active_changes
         .iter()
@@ -179,9 +176,13 @@ pub fn ranked_exploration_ids(
 
 /// Local calendar day `YYYY-MM-DD` for the 2+1 shortlist seed.
 pub fn local_day_seed() -> String {
-    let dt = time::OffsetDateTime::now_local()
-        .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
-    format!("{:04}-{:02}-{:02}", dt.year(), u8::from(dt.month()), dt.day())
+    let dt = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+    format!(
+        "{:04}-{:02}-{:02}",
+        dt.year(),
+        u8::from(dt.month()),
+        dt.day()
+    )
 }
 
 /// Whether `name` is an allowed Dashboard left-column section heading.
@@ -324,10 +325,7 @@ pub fn rank_changes_leaves_path_untouched(duckspec_root: &Path, items: &[ChangeR
     let before = dir_fingerprint(duckspec_root);
     let _ = rank_changes(items);
     let after = dir_fingerprint(duckspec_root);
-    assert_eq!(
-        before, after,
-        "ranking must not write under duckspec/"
-    );
+    assert_eq!(before, after, "ranking must not write under duckspec/");
 }
 
 fn dir_fingerprint(root: &Path) -> Vec<(String, u64, i128)> {
@@ -383,10 +381,7 @@ mod tests {
     // @spec shell/dashboard-digest Change ranking: Newer attention ranks above older
     #[test]
     fn newer_attention_ranks_above_older() {
-        let items = [
-            change("cold", Some(100), 0),
-            change("hot", Some(200), 0),
-        ];
+        let items = [change("cold", Some(100), 0), change("hot", Some(200), 0)];
         assert_eq!(
             rank_changes(&items),
             vec!["hot".to_string(), "cold".to_string()]
@@ -396,10 +391,7 @@ mod tests {
     // @spec shell/dashboard-digest Change ranking: Needs-work breaks recency ties
     #[test]
     fn needs_work_breaks_recency_ties() {
-        let items = [
-            change("clean", Some(50), 0),
-            change("dirty", Some(50), 1),
-        ];
+        let items = [change("clean", Some(50), 0), change("dirty", Some(50), 1)];
         assert_eq!(
             rank_changes(&items),
             vec!["dirty".to_string(), "clean".to_string()]
@@ -409,10 +401,7 @@ mod tests {
     // @spec shell/dashboard-digest Change ranking: Missing activity sorts colder than known activity
     #[test]
     fn missing_activity_sorts_colder_than_known() {
-        let items = [
-            change("known", Some(10), 0),
-            change("unknown", None, 0),
-        ];
+        let items = [change("known", Some(10), 0), change("unknown", None, 0)];
         assert_eq!(
             rank_changes(&items),
             vec!["known".to_string(), "unknown".to_string()]
@@ -452,10 +441,7 @@ mod tests {
             exp("exploration-1", Some(50), false),
             exp("exploration-2", Some(90), true),
         ];
-        assert_eq!(
-            rank_explorations(&items),
-            vec!["exploration-1".to_string()]
-        );
+        assert_eq!(rank_explorations(&items), vec!["exploration-1".to_string()]);
     }
 
     // @spec shell/dashboard-digest Day-seeded shortlist cut: Resting shortlist is two heat plus one spun tail
@@ -543,7 +529,11 @@ mod tests {
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
-        assert!(!names.iter().any(|n| n.contains("heat") || n.contains("score")));
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.contains("heat") || n.contains("score"))
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

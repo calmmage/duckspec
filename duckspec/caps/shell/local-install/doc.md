@@ -9,10 +9,14 @@ From the project root:
 
 ```
 just install
-  ├─ cargo install  →  ~/.cargo/bin  (ds, duckboard, duckchat-claude-acp)
-  ├─ just bundle    →  dist/Duckboard.app
-  └─ copy           →  /Applications/Duckboard.app
+  ├─ just build-release  →  target/release/{ds,duckboard,duckchat-*-acp}
+  ├─ install bins        →  ~/.cargo/bin
+  ├─ just bundle-app     →  dist/Duckboard.app  (same binaries, no rebuild)
+  └─ copy                →  /Applications/Duckboard.app
 ```
+
+One workspace release build feeds both PATH binaries and the app bundle. Harness agents
+installed: `duckchat-claude-acp`, `duckchat-codex-acp`, `duckchat-agy-acp`.
 
 Terminal `duckboard` on PATH and the Dock/Finder app both come from the tree you just
 built. The recipe does not quit or relaunch a running process — quit first, install, then

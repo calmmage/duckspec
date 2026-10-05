@@ -18,7 +18,7 @@ classic.
 - **THEN** the stored style is classic
 
 > test: code
-> - crates/duckboard/src/config.rs:513
+> - crates/duckboard/src/config.rs:515
 
 ### Scenario: Chosen style round-trips through save and load
 
@@ -27,7 +27,7 @@ classic.
 - **THEN** the stored style is that selected value
 
 > test: code
-> - crates/duckboard/src/config.rs:526
+> - crates/duckboard/src/config.rs:528
 
 ## Requirement: Effective viewer style
 
@@ -45,7 +45,7 @@ style, the effective style SHALL be that stored style.
 - **THEN** the effective style is classic
 
 > test: code
-> - crates/duckboard/src/config.rs:549
+> - crates/duckboard/src/config.rs:551
 
 ### Scenario: Stored focus yields effective focus when Focus is implemented
 
@@ -55,7 +55,7 @@ style, the effective style SHALL be that stored style.
 - **THEN** the effective style is focus
 
 > test: code
-> - crates/duckboard/src/config.rs:577
+> - crates/duckboard/src/config.rs:579
 
 ### Scenario: Stored document yields effective classic while unimplemented
 
@@ -65,7 +65,7 @@ style, the effective style SHALL be that stored style.
 - **THEN** the effective style is classic
 
 > test: code
-> - crates/duckboard/src/config.rs:562
+> - crates/duckboard/src/config.rs:564
 
 ## Requirement: Settings choices
 
@@ -83,7 +83,7 @@ Document Answer presentation is not implemented.
 - **THEN** the choices are classic and focus
 
 > test: code
-> - crates/duckboard/src/area/settings.rs:700
+> - crates/duckboard/src/area/settings.rs:699
 
 ### Scenario: Document is not offered while unimplemented
 
@@ -92,7 +92,7 @@ Document Answer presentation is not implemented.
 - **THEN** document is not among the choices
 
 > test: code
-> - crates/duckboard/src/area/settings.rs:715
+> - crates/duckboard/src/area/settings.rs:714
 
 ## Requirement: Classic Answer identity path
 
@@ -110,7 +110,7 @@ Viewer style SHALL NOT change the presentation mode of non-Answer segments.
 - **THEN** the Answer uses the full-body classic presentation
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2767
+> - crates/duckboard/src/widget/agent_chat.rs:2938
 
 ### Scenario: Non-Answer segments ignore viewer style for presentation mode
 
@@ -120,4 +120,4 @@ Viewer style SHALL NOT change the presentation mode of non-Answer segments.
 - **THEN** their presentation mode is not selected by the viewer style
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2791
+> - crates/duckboard/src/widget/agent_chat.rs:2962

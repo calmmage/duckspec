@@ -4,20 +4,24 @@ Default equal free-space width for the content and interaction columns until the
 customizes via grip drag; absolute width after that; full remaining width for the
 interaction column when content is hidden.
 
+Default equal free-space width for the content and interaction columns until the user
+customizes via grip drag; absolute width after that; full remaining width for the
+interaction column when content is hidden. The list column width is session-mutable via
+its own grip and participates in free-space geometry.
+
 ## Requirement: Uncustomized equal width
 
 While an interaction panel is uncustomized and the content column is shown, the
 interaction column width SHALL equal half of free horizontal space: window width minus
-fixed left chrome (sidebar, list column, and their vertical dividers) and the interaction
-handle. That half SHALL be floored at the minimum panel width. Uncustomized half-width
-SHALL NOT be capped by a fixed maximum below free space (so a true half is allowed on wide
-windows). Window resize, door open, programmatic force-show of the panel, and other
-default layout refresh while uncustomized SHALL recompute this equal width from the
-current window. Constructing a new interaction panel with a known window width SHALL
-initialize the uncustomized width to half of free space for that window (not only a fixed
-default window size). Force-showing a panel SHALL NOT mark it customized.
-
-> test: code
+left chrome (sidebar and its vertical divider, the **current** list column width, the list
+resize grip, and the interaction handle). That half SHALL be floored at the minimum panel
+width. Uncustomized half-width SHALL NOT be capped by a fixed maximum below free space (so
+a true half is allowed on wide windows). Window resize, list-column width change, door
+open, programmatic force-show of the panel, and other default layout refresh while
+uncustomized SHALL recompute this equal width from the current free space. Constructing a
+new interaction panel with a known window width SHALL initialize the uncustomized width to
+half of free space for that window (not only a fixed default window size). Force-showing a
+panel SHALL NOT mark it customized.
 
 ### Scenario: Default half of free space
 
@@ -33,7 +37,7 @@ default window size). Force-showing a panel SHALL NOT mark it customized.
 - **THEN** the width equals half of free space for that window
 
 > test: code
-> - crates/duckboard/src/area/interaction.rs:2912
+> - crates/duckboard/src/area/interaction.rs:3157
 
 ### Scenario: Resize rebalances to half free space
 
@@ -47,7 +51,7 @@ default window size). Force-showing a panel SHALL NOT mark it customized.
 - **THEN** the interaction column width equals half of free space for the new window
 
 > test: code
-> - crates/duckboard/src/area/interaction.rs:2931
+> - crates/duckboard/src/area/interaction.rs:3176
 
 ### Scenario: Half floors at minimum panel width
 
@@ -57,7 +61,7 @@ default window size). Force-showing a panel SHALL NOT mark it customized.
 - **THEN** the width equals the minimum panel width
 
 > test: code
-> - crates/duckboard/src/area/interaction.rs:2945
+> - crates/duckboard/src/area/interaction.rs:3240
 
 ### Scenario: Half may exceed the old fixed max width
 
@@ -68,7 +72,7 @@ default window size). Force-showing a panel SHALL NOT mark it customized.
 - **AND** the width is greater than 800 logical pixels
 
 > test: code
-> - crates/duckboard/src/area/interaction.rs:2963
+> - crates/duckboard/src/area/interaction.rs:3258
 
 ### Scenario: Programmatic open rebalances to half free space
 
@@ -87,7 +91,7 @@ default window size). Force-showing a panel SHALL NOT mark it customized.
 - **AND** the panel remains uncustomized
 
 > test: code
-> - crates/duckboard/src/area/interaction.rs:3149
+> - crates/duckboard/src/area/interaction.rs:3444
 
 ### Scenario: Panel created for a known window starts at half free space
 
@@ -101,7 +105,25 @@ default window size). Force-showing a panel SHALL NOT mark it customized.
 - **THEN** the interaction column width equals half of free space for that window
 
 > test: code
-> - crates/duckboard/src/area/interaction.rs:3124
+> - crates/duckboard/src/area/interaction.rs:3419
+
+### Scenario: List width change rebalances uncustomized half free space
+
+- **GIVEN** an uncustomized interaction panel
+
+- **AND** the content column is shown
+
+- **AND** a window width whose free space with the stock list width allows a half above
+  the minimum panel width
+
+- **WHEN** the list column width changes to a larger session value still leaving free
+  space for a half above the minimum
+
+- **THEN** the interaction column width equals half of free space computed with the new
+  list width
+
+> test: code
+> - crates/duckboard/src/area/interaction.rs:3190
 
 ## Requirement: Grip customization
 
@@ -124,7 +146,7 @@ collapsing/restoring the content column SHALL NOT mark the panel customized by i
   is shown
 
 > test: code
-> - crates/duckboard/src/area/interaction.rs:2981
+> - crates/duckboard/src/area/interaction.rs:3276
 
 ### Scenario: Resize after lock keeps absolute width
 
@@ -134,7 +156,7 @@ collapsing/restoring the content column SHALL NOT mark the panel customized by i
 - **THEN** the interaction column width remains that absolute width
 
 > test: code
-> - crates/duckboard/src/area/interaction.rs:3002
+> - crates/duckboard/src/area/interaction.rs:3297
 
 ### Scenario: Open/close and content collapse do not lock
 
@@ -150,20 +172,19 @@ collapsing/restoring the content column SHALL NOT mark the panel customized by i
   window while the content column is shown
 
 > test: code
-> - crates/duckboard/src/area/interaction.rs:3071
+> - crates/duckboard/src/area/interaction.rs:3366
 
 ## Requirement: Content-hidden fill
 
 When the content column is not shown (no open tabs in a three-column area, or content
 collapsed), a visible interaction column SHALL take the remaining horizontal space after
-fixed left chrome (and the handle when present), not the equal-split absolute width.
+left chrome (sidebar and its divider, the current list column width, the list resize grip,
+and the handle when present), not the equal-split absolute width.
 
 In any three-column area, the content column SHALL NOT be shown when there are no open
 tabs (neither a preview tab nor file tabs). When a list selection opens a tab, the content
 column SHALL be shown again (interaction width follows equal or customized rules as when
 content is visible).
-
-> test: code
 
 ### Scenario: Interaction column fills when content column is hidden
 
@@ -177,7 +198,7 @@ content is visible).
   than a fixed equal-split width
 
 > test: code
-> - crates/duckboard/src/area/interaction.rs:3022
+> - crates/duckboard/src/area/interaction.rs:3317
 
 ### Scenario: No open tabs hides content column
 
@@ -189,7 +210,7 @@ content is visible).
 - **AND** the interaction column fills the remaining width after fixed left chrome
 
 > test: code
-> - crates/duckboard/src/area/interaction.rs:3039
+> - crates/duckboard/src/area/interaction.rs:3334
 
 ### Scenario: Opening a tab restores content column
 
@@ -205,4 +226,38 @@ content is visible).
 - **AND** the interaction column uses its equal or customized fixed width rather than fill
 
 > test: code
-> - crates/duckboard/src/area/interaction.rs:3055
+> - crates/duckboard/src/area/interaction.rs:3350
+
+## Requirement: List column width
+
+In three-column areas the list column width SHALL be user-adjustable via a drag grip
+between the list column and the content column. The width SHALL default to the stock list
+column width and SHALL be remembered only for the process session (not durable
+configuration). The width SHALL be clamped between a minimum list width and a maximum that
+respects a soft upper bound and remaining window room for minimum interaction chrome.
+Changing the list width SHALL update free space for the content ↔ interaction split.
+
+> test: code
+
+### Scenario: Free space uses live list width
+
+- **GIVEN** a fixed window width
+- **AND** free space computed at the stock list column width
+- **WHEN** free space is computed again with a larger list column width
+- **THEN** free space is strictly smaller than free space at the stock list width
+
+> test: code
+> - crates/duckboard/src/area/interaction.rs:3213
+
+### Scenario: Grip sets list width within clamps
+
+- **GIVEN** a three-column layout at the stock list width
+
+- **WHEN** the list resize grip sets the list column to a chosen width inside the allowed
+  range
+
+- **THEN** the list column width equals that chosen width for the rest of the session
+  until changed again
+
+> test: code
+> - crates/duckboard/src/area/interaction.rs:3225

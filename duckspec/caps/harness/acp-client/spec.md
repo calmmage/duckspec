@@ -21,7 +21,7 @@ allowed to spawn again and, when a prior session id is supplied, resume that id.
 - **THEN** the spawned agent process is that launch-supplied command
 
 > test: code
-> - crates/duckchat/src/acp/turn.rs:1003
+> - crates/duckchat/src/acp/turn.rs:1013
 
 ### Scenario: A second turn on a hot main path reuses the agent process
 
@@ -68,7 +68,7 @@ session-not-found outcome so the caller can drop the id and retry.
 - **AND** it surfaces the session id the agent assigned
 
 > test: code
-> - crates/duckchat/src/acp/turn.rs:880
+> - crates/duckchat/src/acp/turn.rs:889
 
 ### Scenario: A turn with a prior session id resumes that id
 
@@ -77,7 +77,7 @@ session-not-found outcome so the caller can drop the id and retry.
 - **THEN** it opens the session by resuming that same id
 
 > test: code
-> - crates/duckchat/src/acp/turn.rs:956
+> - crates/duckchat/src/acp/turn.rs:966
 
 ### Scenario: When the agent rebinds the session id during a turn, the client surfaces the rebound id
 
@@ -96,7 +96,7 @@ session-not-found outcome so the caller can drop the id and retry.
 - **THEN** the outcome is session-not-found rather than a successful resume
 
 > test: code
-> - crates/duckchat/src/acp/turn.rs:974
+> - crates/duckchat/src/acp/turn.rs:984
 
 ## Requirement: Profile event translation
 
@@ -160,7 +160,7 @@ after the auto-allow.
 - **AND** the client does not emit a host user-choice event for that request
 
 > test: code
-> - crates/duckchat/src/acp/turn.rs:1175
+> - crates/duckchat/src/acp/turn.rs:1185
 
 ## Requirement: Mid-turn user choice
 
@@ -194,7 +194,7 @@ protocol-correct cancelled outcome for that request.
 - **AND** the agent request remains open until answered or cancelled
 
 > test: code
-> - crates/duckchat/src/acp/turn.rs:1230
+> - crates/duckchat/src/acp/turn.rs:1240
 
 ### Scenario: Host selected answer completes the pending request
 
@@ -204,7 +204,7 @@ protocol-correct cancelled outcome for that request.
 - **AND** the turn may continue after the completion
 
 > test: code
-> - crates/duckchat/src/acp/turn.rs:1307
+> - crates/duckchat/src/acp/turn.rs:1317
 
 ### Scenario: Host custom freeform answer completes the pending request
 
@@ -218,7 +218,7 @@ protocol-correct cancelled outcome for that request.
 - **AND** the request is not completed as cancelled
 
 > test: code
-> - crates/duckchat/src/acp/turn.rs:1628
+> - crates/duckchat/src/acp/turn.rs:1638
 
 ### Scenario: Host cancel completes the pending request as cancelled
 
@@ -227,7 +227,7 @@ protocol-correct cancelled outcome for that request.
 - **THEN** the agent request is completed as cancelled
 
 > test: code
-> - crates/duckchat/src/acp/turn.rs:1364
+> - crates/duckchat/src/acp/turn.rs:1374
 
 ### Scenario: Turn cancel completes a pending choice as cancelled
 
@@ -236,7 +236,7 @@ protocol-correct cancelled outcome for that request.
 - **THEN** the agent request is completed as cancelled
 
 > test: code
-> - crates/duckchat/src/acp/turn.rs:1414
+> - crates/duckchat/src/acp/turn.rs:1424
 
 ### Scenario: Permission product choice carries prompt from tool title
 
@@ -254,7 +254,7 @@ protocol-correct cancelled outcome for that request.
 - **AND** the user-choice event carries the product options
 
 > test: code
-> - crates/duckchat/src/acp/turn.rs:1569
+> - crates/duckchat/src/acp/turn.rs:1579
 
 ## Requirement: Headless and oneshot safety
 
@@ -272,4 +272,4 @@ without parking on oneshot so headless oneshot work cannot deadlock.
 - **THEN** the call completes without waiting for a host UI answer
 
 > test: code
-> - crates/duckchat/src/acp/turn.rs:1479
+> - crates/duckchat/src/acp/turn.rs:1489

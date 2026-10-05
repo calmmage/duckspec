@@ -40,7 +40,7 @@ NOT appear on those lists.
 - **THEN** both the change and the exploration appear as rows
 
 > test: code
-> - crates/duckboard/src/area/change.rs:4182
+> - crates/duckboard/src/area/change.rs:4316
 
 ### Scenario: Mixed archive rows order by archive date descending
 
@@ -52,7 +52,7 @@ NOT appear on those lists.
 - **THEN** all rows appear in descending archive-date order
 
 > test: code
-> - crates/duckboard/src/area/change.rs:4196
+> - crates/duckboard/src/area/change.rs:4330
 
 ### Scenario: Idea-owned archived explorations stay off Change and Dashboard archived lists
 
@@ -61,7 +61,7 @@ NOT appear on those lists.
 - **THEN** that exploration does not appear as a row
 
 > test: code
-> - crates/duckboard/src/area/change.rs:4220
+> - crates/duckboard/src/area/change.rs:4354
 
 ### Scenario: Pending archived package is omitted from Archived lists
 
@@ -70,7 +70,7 @@ NOT appear on those lists.
 - **THEN** that package does not appear as a row
 
 > test: code
-> - crates/duckboard/src/area/change.rs:4238
+> - crates/duckboard/src/area/change.rs:4372
 
 ## Requirement: Archived section visibility
 
@@ -87,7 +87,7 @@ Archived section SHALL start collapsed until the user expands them.
 - **AND** it contains that exploration
 
 > test: code
-> - crates/duckboard/src/area/change.rs:4254
+> - crates/duckboard/src/area/change.rs:4388
 
 ### Scenario: Ideas Archive section starts collapsed
 
@@ -96,7 +96,7 @@ Archived section SHALL start collapsed until the user expands them.
 - **THEN** the Archive section is collapsed
 
 > test: code
-> - crates/duckboard/src/area/ideas.rs:1518
+> - crates/duckboard/src/area/ideas.rs:1511
 
 ### Scenario: Change Archived section starts collapsed
 
@@ -106,4 +106,4 @@ Archived section SHALL start collapsed until the user expands them.
 - **THEN** the Archived section is collapsed
 
 > test: code
-> - crates/duckboard/src/area/change.rs:4272
+> - crates/duckboard/src/area/change.rs:4406

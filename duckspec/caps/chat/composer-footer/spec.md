@@ -24,7 +24,7 @@ the effective harness, or when no agent session id is stored.
 - **THEN** the resend-history hint is shown
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2041
+> - crates/duckboard/src/widget/agent_chat.rs:2212
 
 ### Scenario: Hint hidden when stored session is resumable
 
@@ -34,7 +34,7 @@ the effective harness, or when no agent session id is stored.
 - **THEN** the resend-history hint is not shown
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2058
+> - crates/duckboard/src/widget/agent_chat.rs:2229
 
 ### Scenario: Hint hidden when transcript is empty
 
@@ -43,7 +43,7 @@ the effective harness, or when no agent session id is stored.
 - **THEN** the resend-history hint is not shown
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2075
+> - crates/duckboard/src/widget/agent_chat.rs:2246
 
 ### Scenario: Hint hidden when no stored agent session id
 
@@ -53,7 +53,7 @@ the effective harness, or when no agent session id is stored.
 - **THEN** the resend-history hint is not shown
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2091
+> - crates/duckboard/src/widget/agent_chat.rs:2262
 
 ## Requirement: Progressive usage readout
 
@@ -72,7 +72,7 @@ least 75%, the readout SHALL include used tokens, the window max, and the percen
 - **AND** the readout does not include absolute used or max token counts
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2107
+> - crates/duckboard/src/widget/agent_chat.rs:2278
 
 ### Scenario: Hot fill shows used, max, and percentage
 
@@ -82,7 +82,7 @@ least 75%, the readout SHALL include used tokens, the window max, and the percen
 - **THEN** the readout includes used tokens, the window max, and the fill percentage
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2121
+> - crates/duckboard/src/widget/agent_chat.rs:2292
 
 ## Requirement: Short closed model label
 
@@ -99,7 +99,7 @@ prefix.
 - **AND** the label does not include a harness prefix
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2133
+> - crates/duckboard/src/widget/agent_chat.rs:2304
 
 ## Requirement: Missing closed model label
 
@@ -115,4 +115,4 @@ show the label `Missing` instead of a model display name.
 - **THEN** the label is `Missing`
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2153
+> - crates/duckboard/src/widget/agent_chat.rs:2324

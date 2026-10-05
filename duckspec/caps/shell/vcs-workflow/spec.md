@@ -20,7 +20,7 @@ Settings SHALL expose the three workflows for selection.
 - **THEN** the workflow is plain git
 
 > test: code
-> - crates/duckboard/src/config.rs:662
+> - crates/duckboard/src/config.rs:676
 
 ### Scenario: Selected workflow persists in config
 
@@ -29,7 +29,7 @@ Settings SHALL expose the three workflows for selection.
 - **THEN** the same workflow is restored
 
 > test: code
-> - crates/duckboard/src/config.rs:671
+> - crates/duckboard/src/config.rs:685
 
 ### Scenario: Settings exposes the three workflows for selection
 
@@ -38,7 +38,7 @@ Settings SHALL expose the three workflows for selection.
 - **THEN** plain git, jujutsu, and git worktrees are all offered for selection
 
 > test: code
-> - crates/duckboard/src/area/settings.rs:651
+> - crates/duckboard/src/area/settings.rs:654
 
 ## Requirement: Standing instructions
 
@@ -60,7 +60,7 @@ prefer a dedicated git worktree per parallel change.
 - **AND** worktrees names git worktrees and not `jj`
 
 > test: code
-> - crates/duckboard/src/config.rs:684
+> - crates/duckboard/src/config.rs:698
 
 ### Scenario: Each workflow requires path-scoped change-only commits
 
@@ -70,7 +70,7 @@ prefer a dedicated git worktree per parallel change.
 - **AND** it forbids defaulting to the entire dirty tree
 
 > test: code
-> - crates/duckboard/src/config.rs:712
+> - crates/duckboard/src/config.rs:717
 
 ### Scenario: Each workflow forbids auto-commit and inventing an empty commit
 
@@ -84,7 +84,7 @@ prefer a dedicated git worktree per parallel change.
   the change
 
 > test: code
-> - crates/duckboard/src/config.rs:730
+> - crates/duckboard/src/config.rs:735
 
 ### Scenario: Worktrees workflow prefers a dedicated worktree per parallel change
 
@@ -93,7 +93,7 @@ prefer a dedicated git worktree per parallel change.
 - **THEN** the text prefers a dedicated worktree for each change when working in parallel
 
 > test: code
-> - crates/duckboard/src/config.rs:752
+> - crates/duckboard/src/config.rs:757
 
 ## Requirement: First-turn priming injection
 
@@ -110,4 +110,4 @@ delivery as project conventions and scope orientation when those are present.
 - **THEN** the body contains that workflow's standing instructions
 
 > test: code
-> - crates/duckboard/src/area/interaction.rs:1484
+> - crates/duckboard/src/area/interaction.rs:1729

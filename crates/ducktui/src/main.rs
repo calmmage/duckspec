@@ -55,11 +55,8 @@ async fn main() -> anyhow::Result<()> {
     } else {
         shell.refresh_picker_recents();
     }
-    shell.model = shell
-        .shared_config
-        .default_model
-        .clone()
-        .or(shell.model.clone());
+    shell.model =
+        ducktui::config::resolve_default_model(&shell.shared_config).or(shell.model.clone());
 
     enable_raw_mode().context("enable raw mode")?;
     let mut out = stdout();
@@ -163,11 +160,7 @@ async fn run_loop(
 }
 
 /// Spawn the project watcher once per bound root.
-fn ensure_watcher(
-    shell: &Shell,
-    tx: &mpsc::Sender<AppEvent>,
-    watcher_root: &mut Option<PathBuf>,
-) {
+fn ensure_watcher(shell: &Shell, tx: &mpsc::Sender<AppEvent>, watcher_root: &mut Option<PathBuf>) {
     let Some(root) = shell.project_root.clone() else {
         return;
     };
@@ -219,9 +212,7 @@ fn dispatch_key(
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 // j/k navigate list overlays; type into quick-idea buffer.
-                if matches!(c, 'j' | 'k')
-                    && !matches!(shell.overlay, Some(Overlay::QuickIdea))
-                {
+                if matches!(c, 'j' | 'k') && !matches!(shell.overlay, Some(Overlay::QuickIdea)) {
                     let _ = shell.handle_key(if c == 'j' { "j" } else { "k" });
                 } else {
                     let _ = shell.handle_key(&format!("char:{c}"));
@@ -273,12 +264,7 @@ fn dispatch_key(
             KeyCode::Enter => {
                 let action = shell.chat.handle_composer_key(ComposerKey::Enter);
                 if let ChatAction::Submitted(text) = action {
-                    runtime::activate_hint(
-                        shell,
-                        agent_rt,
-                        agent_tx,
-                        ChatAction::Submitted(text),
-                    );
+                    runtime::activate_hint(shell, agent_rt, agent_tx, ChatAction::Submitted(text));
                 }
                 return DispatchResult::Continue;
             }
@@ -335,9 +321,7 @@ fn dispatch_key(
                 return DispatchResult::Continue;
             }
             KeyCode::Char(c)
-                if !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && c != 'q'
-                    && c != '?' =>
+                if !key.modifiers.contains(KeyModifiers::CONTROL) && c != 'q' && c != '?' =>
             {
                 // j/k navigation when not typing a path fragment that needs them
                 // always available via arrows; j/k navigate when path empty or on

@@ -27,7 +27,7 @@ segment (not multiple Answer segments for the same uncommitted draft).
 - **AND** the reasoning body is not part of the Answer segment
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2410
+> - crates/duckboard/src/widget/agent_chat.rs:2581
 
 ### Scenario: Contiguous tools yield one Activity with multiple rows
 
@@ -41,7 +41,7 @@ segment (not multiple Answer segments for the same uncommitted draft).
 - **AND** the segment has one row per tool call
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2443
+> - crates/duckboard/src/widget/agent_chat.rs:2614
 
 ### Scenario: Thought, tools, thought, answer yields four segments in order
 
@@ -53,7 +53,7 @@ segment (not multiple Answer segments for the same uncommitted draft).
 - **THEN** the segments are Thinking, Activity, Thinking, Answer in that order
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2470
+> - crates/duckboard/src/widget/agent_chat.rs:2641
 
 ### Scenario: Live pending reasoning appears on an open Thinking segment
 
@@ -65,7 +65,7 @@ segment (not multiple Answer segments for the same uncommitted draft).
 - **THEN** a live Thinking segment includes that pending reasoning text
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2500
+> - crates/duckboard/src/widget/agent_chat.rs:2671
 
 ### Scenario: Live reasoning with an open answer draft yields Thinking then one Answer
 
@@ -79,7 +79,7 @@ segment (not multiple Answer segments for the same uncommitted draft).
 - **AND** there is exactly one Answer segment for that open draft
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2523
+> - crates/duckboard/src/widget/agent_chat.rs:2694
 
 ## Requirement: Activity pairing
 
@@ -98,7 +98,7 @@ generic "done" placeholder alone.
 - **AND** the row carries the tool summary and the result body
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2559
+> - crates/duckboard/src/widget/agent_chat.rs:2730
 
 ### Scenario: Non-adjacent use and result still pair by id
 
@@ -114,7 +114,7 @@ generic "done" placeholder alone.
 - **AND** no row is labeled only as a generic done placeholder
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2582
+> - crates/duckboard/src/widget/agent_chat.rs:2753
 
 ### Scenario: Orphan result is a named done row
 
@@ -124,7 +124,7 @@ generic "done" placeholder alone.
 - **AND** the row is not labeled only as a generic done placeholder
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2614
+> - crates/duckboard/src/widget/agent_chat.rs:2785
 
 ## Requirement: Collapse defaults
 
@@ -150,7 +150,7 @@ except for this priming User case.
 - **THEN** the Thinking segment is collapsed
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:3354
+> - crates/duckboard/src/widget/agent_chat.rs:3530
 
 ### Scenario: User-expanded Thinking is not auto-collapsed
 
@@ -159,7 +159,7 @@ except for this priming User case.
 - **THEN** the Thinking segment remains expanded
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:3411
+> - crates/duckboard/src/widget/agent_chat.rs:3587
 
 ### Scenario: Settled Activity starts collapsed
 
@@ -168,7 +168,7 @@ except for this priming User case.
 - **THEN** the Activity segment is collapsed
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:3451
+> - crates/duckboard/src/widget/agent_chat.rs:3627
 
 ### Scenario: Priming Setup starts collapsed
 
@@ -179,7 +179,7 @@ except for this priming User case.
 - **AND** the non-priming User segment is not collapsed
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:3571
+> - crates/duckboard/src/widget/agent_chat.rs:3747
 
 ### Scenario: User-expanded priming is not force-collapsed by sync
 
@@ -188,7 +188,7 @@ except for this priming User case.
 - **THEN** the priming User segment remains expanded
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:3641
+> - crates/duckboard/src/widget/agent_chat.rs:3811
 
 ### Scenario: Timed re-collapse forces priming collapsed
 
@@ -197,7 +197,7 @@ except for this priming User case.
 - **THEN** the priming User segment is collapsed
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:3670
+> - crates/duckboard/src/widget/agent_chat.rs:3840
 
 ## Requirement: Segment presentation
 
@@ -220,7 +220,7 @@ body SHALL remain readable as user-card content when open.
 - **AND** the label does not include a duration
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2636
+> - crates/duckboard/src/widget/agent_chat.rs:2807
 
 ### Scenario: Activity collapsed label includes count and sample names
 
@@ -230,7 +230,7 @@ body SHALL remain readable as user-card content when open.
 - **AND** the label includes sample tool names from the rows
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2665
+> - crates/duckboard/src/widget/agent_chat.rs:2836
 
 ### Scenario: Expanded activity exposes status, summary, and truncated output
 
@@ -246,7 +246,7 @@ body SHALL remain readable as user-card content when open.
 - **AND** no separate per-tool expand state is required to show that truncated output
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2697
+> - crates/duckboard/src/widget/agent_chat.rs:2868
 
 ### Scenario: Priming collapsed label uses Setup and line count
 
@@ -256,7 +256,7 @@ body SHALL remain readable as user-card content when open.
 - **AND** the label includes that line count
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:3694
+> - crates/duckboard/src/widget/agent_chat.rs:3864
 
 ## Requirement: Meta-card line background
 
@@ -279,7 +279,7 @@ text and from search-match and diff line backgrounds.
 - **THEN** every line index in that range has a meta-card line background
 
 > test: code
-> - crates/duckcore/src/meta_card.rs:363
+> - crates/duckcore/src/meta_card.rs:383
 
 ### Scenario: Non-meta lines on the same Answer do not get meta-card background
 
@@ -291,7 +291,7 @@ text and from search-match and diff line backgrounds.
 - **THEN** the ordinary prose lines do not have a meta-card line background
 
 > test: code
-> - crates/duckcore/src/meta_card.rs:387
+> - crates/duckcore/src/meta_card.rs:407
 
 ## Requirement: Thinking body fade
 
@@ -329,4 +329,4 @@ Activity rows under ordinary segment construction.
 - **AND** the Activity segment includes a row for the ordinary tool
 
 > test: code
-> - crates/duckboard/src/widget/agent_chat.rs:2335
+> - crates/duckboard/src/widget/agent_chat.rs:2506

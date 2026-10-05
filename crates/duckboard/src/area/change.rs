@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use iced::Element;
 use iced::Length;
-use iced::widget::{Space, button, column, container, row, svg, text, text_input};
+use iced::widget::{Space, button, column, container, pick_list, row, svg, text, text_input};
 
 use crate::chat_store::Exploration;
 use crate::data::{ChangeData, ProjectData, StepCompletion, TreeNode};
@@ -54,6 +54,28 @@ pub const EXPLORER_VIEWPORT_ID: &str = "change-list-viewport";
 /// position inside the scroll content.
 pub const EXPLORER_CONTENT_ID: &str = "files-explorer-content";
 
+/// A change offered by the manual exploration-link fallback.
+///
+/// `scope_name` is the actual chat/change row key (an archive folder name for
+/// archived changes); `change_name` is the stable base name stored in idea
+/// frontmatter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManualLinkTarget {
+    pub scope_name: String,
+    pub change_name: String,
+    pub archived: bool,
+}
+
+impl std::fmt::Display for ManualLinkTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.archived {
+            write!(f, "{} — archived", self.change_name)
+        } else {
+            f.write_str(&self.change_name)
+        }
+    }
+}
+
 // ── State ────────────────────────────────────────────────────────────────────
 
 pub struct State {
@@ -95,8 +117,9 @@ pub struct State {
     pub armed_remove_exploration: Option<String>,
     /// Vertical scroll offset for the list column.
     pub list_scroll: f32,
-    /// Folder-slug → originating exploration id, recorded when an exploration
-    /// session's agent runs `ds create change`. Consumed by
+    /// Change folder name → originating exploration id, recorded when an
+    /// exploration session's agent runs `ds create change`. Key is the CLI
+    /// argument verbatim (matches `changes/<name>`). Consumed by
     /// `reload_and_reconcile` to attribute the new folder to the session that
     /// created it. Not persisted; not cleaned up (changes are infrequent).
     pub pending_bindings: HashMap<String, String>,
@@ -407,13 +430,21 @@ pub fn archive_change(
             ax.session.scope = archived_name.to_string();
         }
         interaction::reconcile_display_names(&mut ix.sessions, archived_name);
-        interactions.insert(Scope::Change(archived_name.to_string()), ix);
+        let target = Scope::Change(archived_name.to_string());
+        if let Some(existing) = interactions.get_mut(&target) {
+            // A manual repair may link a late exploration to a change that is
+            // already archived and already has chats. Fold both histories into
+            // the archived scope instead of replacing the existing sessions.
+            interaction::merge_sessions(existing, ix.sessions, archived_name);
+        } else {
+            interactions.insert(target, ix);
+        }
     }
     if state.selected_change.as_deref() == Some(old_name) {
         state.selected_change = Some(archived_name.to_string());
     }
     rewrite_tab_ids_for_archive(tabs, old_name, archived_name);
-    crate::chat_store::rename_scope(old_name, archived_name, project_root);
+    crate::chat_store::merge_scope(old_name, archived_name, project_root);
 }
 
 fn row_icon_button<'a>(bytes: &'static [u8], on_press: Message) -> Element<'a, Message> {
@@ -554,6 +585,12 @@ pub enum Message {
     /// Re-run the title summarizer for the exploration's active session.
     /// Intercepted by `main::update` (needs AgentHandle + oneshot Task).
     RefreshExplorationTitle(String),
+    /// Manually promote an exploration when automatic create-change binding
+    /// missed it. Main owns the cross-area idea/chat migration.
+    LinkExplorationToChange {
+        exploration_id: String,
+        target: ManualLinkTarget,
+    },
     /// Cycle exclusive mark on the idea linked to this queue key (main saves).
     CycleQueueMark(crate::idea_store::QueueLinkKey),
     ToggleSortMenu,
@@ -830,6 +867,9 @@ pub fn update(
         }
         Message::RefreshExplorationTitle(_) => {
             // Intercepted by `main::update` (oneshot Task).
+        }
+        Message::LinkExplorationToChange { .. } => {
+            // Intercepted by `main::update` (cross-area idea/chat migration).
         }
         Message::AddExploration => {
             state.exploration_counter += 1;
@@ -1225,13 +1265,18 @@ fn short_from_facts(facts: &ChangeScopeFacts) -> PhaseShort {
         "specs drafted, steps not yet written" => PhaseShort::Specs,
         "implementing steps" => PhaseShort::Steps,
         "all steps complete" => PhaseShort::Ready,
-        "all steps complete, review on file" | "review on file, no open steps" => PhaseShort::Review,
+        "all steps complete, review on file" | "review on file, no open steps" => {
+            PhaseShort::Review
+        }
         // Unknown phase strings still need a face; treat as empty rather than panic.
         _ => PhaseShort::Empty,
     }
 }
 
-fn vcs_fields(short: PhaseShort, vcs_dirty: bool) -> (Option<VcsPill>, Option<&'static str>, Option<&'static str>) {
+fn vcs_fields(
+    short: PhaseShort,
+    vcs_dirty: bool,
+) -> (Option<VcsPill>, Option<&'static str>, Option<&'static str>) {
     if !short.is_late() {
         return (None, None, None);
     }
@@ -1242,11 +1287,7 @@ fn vcs_fields(short: PhaseShort, vcs_dirty: bool) -> (Option<VcsPill>, Option<&'
             Some("Commit"),
         )
     } else {
-        (
-            Some(VcsPill::Committed),
-            Some(VCS_HOVER_CLEAN),
-            None,
-        )
+        (Some(VcsPill::Committed), Some(VCS_HOVER_CLEAN), None)
     }
 }
 
@@ -1329,10 +1370,7 @@ pub fn phase_display_for_exploration(session_empty: bool) -> PhaseDisplay {
 }
 
 /// Prompt text submitted when a phase pill is activated.
-pub fn phase_pill_activation_send(
-    display: &PhaseDisplay,
-    kind: PhasePillKind,
-) -> Option<String> {
+pub fn phase_pill_activation_send(display: &PhaseDisplay, kind: PhasePillKind) -> Option<String> {
     match kind {
         PhasePillKind::Lifecycle => display.lifecycle_send.clone(),
         PhasePillKind::Vcs => display.vcs_send.map(str::to_string),
@@ -1392,8 +1430,7 @@ pub fn breadcrumbs(state: &State, project: &ProjectData, tabs: &tab_bar::TabStat
     }
 
     // Finished archives use Archive chrome; pending packages stay under Changes.
-    let list_archived =
-        is_list_finished_archive(selected, project, state.changed_files.as_slice());
+    let list_archived = is_list_finished_archive(selected, project, state.changed_files.as_slice());
 
     if let Some(tab) = tabs.active_tab() {
         return tab_breadcrumbs(&tab.id, selected, list_archived);
@@ -1546,11 +1583,7 @@ pub fn is_pending_commit_archive(ch: &ChangeData, dirty: &[ChangedFile]) -> bool
 
 /// Finished archive for list presentation: on disk under archive and not pending.
 /// Pending packages use Change-list chrome (`Changes` breadcrumb, `picker` section).
-pub fn is_list_finished_archive(
-    name: &str,
-    project: &ProjectData,
-    dirty: &[ChangedFile],
-) -> bool {
+pub fn is_list_finished_archive(name: &str, project: &ProjectData, dirty: &[ChangedFile]) -> bool {
     project
         .archived_changes
         .iter()
@@ -1631,6 +1664,35 @@ fn change_section_count(
     explorations.iter().filter(|e| e.is_on_live_list()).count()
         + active.len()
         + pending_archive_count
+}
+
+/// Active and archived changes available to the manual exploration-link
+/// fallback. A change may already have an idea: the fallback is specifically
+/// for recovering a missed relationship, so hiding that real target would make
+/// the repair impossible. The promotion path preserves both idea files.
+pub(crate) fn manual_link_targets(
+    project: &ProjectData,
+    _ideas: &super::ideas::State,
+) -> Vec<ManualLinkTarget> {
+    let mut targets = Vec::new();
+    for change in &project.active_changes {
+        targets.push(ManualLinkTarget {
+            scope_name: change.name.clone(),
+            change_name: change.name.clone(),
+            archived: false,
+        });
+    }
+    for change in &project.archived_changes {
+        let Some(base_name) = crate::data::strip_archive_prefix(&change.name) else {
+            continue;
+        };
+        targets.push(ManualLinkTarget {
+            scope_name: change.name.clone(),
+            change_name: base_name.to_string(),
+            archived: true,
+        });
+    }
+    targets
 }
 
 enum LiveQueueEntry<'a> {
@@ -1735,17 +1797,18 @@ pub(crate) fn painted_live_queue_ids(
         .collect()
 }
 
-fn list_phase_pill_pair<'a>(
-    display: &PhaseDisplay,
-    target: &str,
-) -> Element<'a, Message> {
-    let on_lifecycle = display.lifecycle_send.as_ref().map(|text| Message::PhasePillSend {
-        target: target.to_string(),
-        text: text.clone(),
+fn list_phase_pill_pair<'a>(display: &PhaseDisplay, target: &str) -> Element<'a, Message> {
+    let on_lifecycle = phase_pill_activation_send(display, PhasePillKind::Lifecycle).map(|text| {
+        Message::PhasePillSend {
+            target: target.to_string(),
+            text,
+        }
     });
-    let on_vcs = display.vcs_send.map(|text| Message::PhasePillSend {
-        target: target.to_string(),
-        text: text.to_string(),
+    let on_vcs = phase_pill_activation_send(display, PhasePillKind::Vcs).map(|text| {
+        Message::PhasePillSend {
+            target: target.to_string(),
+            text,
+        }
     });
     // Clone display into owned data for the lifetime of the element: labels are
     // &'static but hover is String. view_pair borrows PhaseDisplay — we need
@@ -1770,10 +1833,8 @@ fn pending_uncommitted_plaque<'a>(archive_id: &str) -> Element<'a, Message> {
 fn pillow_trail<'a>(pillows: &crate::queue_list::RowPillows) -> Element<'a, Message> {
     let mut r = row![].spacing(theme::SPACING_XS).align_y(iced::Center);
     for tag in &pillows.type_tags {
-        let label = crate::queue_list::truncate_tag_display(
-            tag,
-            crate::queue_list::TYPE_TAG_DISPLAY_MAX,
-        );
+        let label =
+            crate::queue_list::truncate_tag_display(tag, crate::queue_list::TYPE_TAG_DISPLAY_MAX);
         r = r.push(
             container(
                 text(format!("#{label}"))
@@ -1906,21 +1967,21 @@ pub fn view_list<'a>(
                 let is_hovered = state.hovered_exploration.as_deref() == Some(exp.id.as_str())
                     || state.hovered_queue_row.as_deref() == Some(exp.id.as_str());
                 let is_renaming = state.renaming_exploration.as_deref() == Some(exp.id.as_str());
-                let mark = crate::idea_store::mark_for_exploration(&ideas.ideas, &exp.id);
+                let mark = crate::idea_store::mark_for_link(
+                    &ideas.ideas,
+                    &crate::idea_store::QueueLinkKey::Exploration(exp.id.clone()),
+                );
                 let idea = crate::idea_store::idea_for_exploration(&ideas.ideas, &exp.id);
                 let tags = idea.map(|i| i.frontmatter.tags.as_slice()).unwrap_or(&[]);
                 let pillows = crate::queue_list::project_row_pillows(tags, None, list_prefs);
                 // Title stays plain; mark lives only on the interactive after_icon control.
                 let title_base = exp.display_name.as_str();
-                let sessions =
-                    crate::chat_store::load_sessions_for(&exp.id, project_root);
+                let sessions = crate::chat_store::load_sessions_for(&exp.id, project_root);
                 let session_empty =
                     sessions.is_empty() || sessions.iter().all(|s| s.messages.is_empty());
-                let can_refresh = sessions
-                    .iter()
-                    .any(|s| crate::chat_store::title_refresh_target(s).is_some());
-                let phase_disp = phase_pill_list
-                    .then(|| phase_display_for_exploration(session_empty));
+                let can_refresh = crate::chat_store::any_session_has_title_refresh(&sessions);
+                let phase_disp =
+                    phase_pill_list.then(|| phase_display_for_exploration(session_empty));
 
                 let mut r = if is_renaming {
                     ListRow::new("")
@@ -1969,8 +2030,7 @@ pub fn view_list<'a>(
                                 vcs_workflow,
                             ));
                             actions = actions.push(stack_base_button(&exp.id, placements));
-                            actions =
-                                actions.push(require_base_button(&exp.id, placements));
+                            actions = actions.push(require_base_button(&exp.id, placements));
                             if crate::worktree::scope_has_sidecar(placements, &exp.id) {
                                 actions = actions.push(merge_to_main_button(&exp.id));
                             }
@@ -1997,8 +2057,7 @@ pub fn view_list<'a>(
                 };
 
                 if is_hovered && !is_renaming {
-                    let armed =
-                        state.armed_remove_exploration.as_deref() == Some(exp.id.as_str());
+                    let armed = state.armed_remove_exploration.as_deref() == Some(exp.id.as_str());
                     let action = exploration_hover_action(exp, armed);
                     r = r.leading(exploration_hover_button(action));
                 } else {
@@ -2015,7 +2074,10 @@ pub fn view_list<'a>(
                     .is_some_and(|v| v.total_count() > 0);
                 // Ideas link by base slug; archive folder ids strip the date prefix.
                 let idea_key = crate::data::strip_archive_prefix(&ch.name).unwrap_or(&ch.name);
-                let mark = crate::idea_store::mark_for_change(&ideas.ideas, idea_key);
+                let mark = crate::idea_store::mark_for_link(
+                    &ideas.ideas,
+                    &crate::idea_store::QueueLinkKey::Change(idea_key.to_string()),
+                );
                 let idea = crate::idea_store::idea_for_change(&ideas.ideas, idea_key);
                 let tags = idea.map(|i| i.frontmatter.tags.as_slice()).unwrap_or(&[]);
                 // Prefer short clickable phase pills when enabled; otherwise keep
@@ -2088,11 +2150,7 @@ pub fn view_list<'a>(
                     has_trail = true;
                 }
                 if placement_enabled && (is_hovered || is_selected) {
-                    trail = trail.push(placement_cycle_button(
-                        &ch.name,
-                        placements,
-                        vcs_workflow,
-                    ));
+                    trail = trail.push(placement_cycle_button(&ch.name, placements, vcs_workflow));
                     trail = trail.push(stack_base_button(&ch.name, placements));
                     trail = trail.push(require_base_button(&ch.name, placements));
                     if crate::worktree::scope_has_sidecar(placements, &ch.name) {
@@ -2114,8 +2172,7 @@ pub fn view_list<'a>(
     debug_assert_eq!(rows.len(), change_count);
     let selector = list_view::view(rows, None);
 
-    let archived_list =
-        archived_entries(&project.archived_changes, &state.explorations, dirty);
+    let archived_list = archived_entries(&project.archived_changes, &state.explorations, dirty);
     let archived_count = archived_list.len();
     let archived_rows: Vec<ListRow<'a, Message>> = archived_list
         .into_iter()
@@ -2160,8 +2217,7 @@ pub fn view_list<'a>(
                     r = r.icon(ICON_EXPLORE);
                 }
                 if phase_pill_list {
-                    let sessions =
-                        crate::chat_store::load_sessions_for(&exp.id, project_root);
+                    let sessions = crate::chat_store::load_sessions_for(&exp.id, project_root);
                     let session_empty =
                         sessions.is_empty() || sessions.iter().all(|s| s.messages.is_empty());
                     let d = phase_display_for_exploration(session_empty);
@@ -2182,8 +2238,8 @@ pub fn view_list<'a>(
                 list_view::view(archived_rows, None),
             ))
         } else {
-        None
-    };
+            None
+        };
 
     let header_actions = row![
         sort_menu_controls(state.sort_menu_open, list_prefs, phase_pill_list),
@@ -2208,14 +2264,36 @@ pub fn view_list<'a>(
     }
 
     if is_exploration {
-        list_col = list_col.push(
-            container(
-                text("Exploration mode — use the agent or terminal to work freely.")
-                    .size(theme::font_md())
-                    .color(theme::text_muted()),
-            )
-            .padding([theme::SPACING_SM, theme::SPACING_SM]),
-        );
+        let mut exploration_tools = column![
+            text("Exploration mode — use the agent or terminal to work freely.")
+                .size(theme::font_md())
+                .color(theme::text_muted())
+        ]
+        .spacing(theme::SPACING_XS);
+        let targets = manual_link_targets(project, ideas);
+        if let Some(exploration_id) = state.selected_change.clone() {
+            if targets.is_empty() {
+                exploration_tools = exploration_tools.push(
+                    text("No unlinked changes available.")
+                        .size(theme::font_sm())
+                        .color(theme::text_muted()),
+                );
+            } else {
+                let picker = pick_list(targets, None::<ManualLinkTarget>, move |target| {
+                    Message::LinkExplorationToChange {
+                        exploration_id: exploration_id.clone(),
+                        target,
+                    }
+                })
+                .placeholder("Link to change…")
+                .width(Length::Fill)
+                .style(theme::pick_list_style)
+                .menu_style(theme::pick_list_menu);
+                exploration_tools = exploration_tools.push(picker);
+            }
+        }
+        list_col = list_col
+            .push(container(exploration_tools).padding([theme::SPACING_SM, theme::SPACING_SM]));
     } else if let Some(change) = change {
         let error_ids: HashSet<String> = project
             .validations
@@ -2718,11 +2796,15 @@ fn placement_cycle_button<'a>(
 ) -> Element<'a, Message> {
     let placement = crate::worktree::effective_placement(placements, scope_key, workflow);
     let label = crate::worktree::placement_label(placement);
-    button(text(label).size(theme::font_sm()).color(theme::text_muted()))
-        .on_press(Message::CyclePlacement(scope_key.to_string()))
-        .padding([0.0, theme::SPACING_XS])
-        .style(theme::icon_button)
-        .into()
+    button(
+        text(label)
+            .size(theme::font_sm())
+            .color(theme::text_muted()),
+    )
+    .on_press(Message::CyclePlacement(scope_key.to_string()))
+    .padding([0.0, theme::SPACING_XS])
+    .style(theme::icon_button)
+    .into()
 }
 
 fn stack_base_button<'a>(
@@ -2739,11 +2821,15 @@ fn stack_base_button<'a>(
             format!("on:{short}")
         })
         .unwrap_or_else(|| "base".into());
-    button(text(label).size(theme::font_sm()).color(theme::text_muted()))
-        .on_press(Message::CycleStackBase(scope_key.to_string()))
-        .padding([0.0, theme::SPACING_XS])
-        .style(theme::icon_button)
-        .into()
+    button(
+        text(label)
+            .size(theme::font_sm())
+            .color(theme::text_muted()),
+    )
+    .on_press(Message::CycleStackBase(scope_key.to_string()))
+    .padding([0.0, theme::SPACING_XS])
+    .style(theme::icon_button)
+    .into()
 }
 
 fn require_base_button<'a>(
@@ -2756,19 +2842,27 @@ fn require_base_button<'a>(
         .map(|b| b.require_base_merged)
         .unwrap_or(false);
     let label = if on { "lock" } else { "free" };
-    button(text(label).size(theme::font_sm()).color(theme::text_muted()))
-        .on_press(Message::ToggleRequireBaseMerged(scope_key.to_string()))
-        .padding([0.0, theme::SPACING_XS])
-        .style(theme::icon_button)
-        .into()
+    button(
+        text(label)
+            .size(theme::font_sm())
+            .color(theme::text_muted()),
+    )
+    .on_press(Message::ToggleRequireBaseMerged(scope_key.to_string()))
+    .padding([0.0, theme::SPACING_XS])
+    .style(theme::icon_button)
+    .into()
 }
 
 fn merge_to_main_button<'a>(scope_key: &str) -> Element<'a, Message> {
-    button(text("merge").size(theme::font_sm()).color(theme::text_muted()))
-        .on_press(Message::MergeToMain(scope_key.to_string()))
-        .padding([0.0, theme::SPACING_XS])
-        .style(theme::icon_button)
-        .into()
+    button(
+        text("merge")
+            .size(theme::font_sm())
+            .color(theme::text_muted()),
+    )
+    .on_press(Message::MergeToMain(scope_key.to_string()))
+    .padding([0.0, theme::SPACING_XS])
+    .style(theme::icon_button)
+    .into()
 }
 
 fn idea_link_button<'a>(change_name: &str) -> Element<'a, Message> {
@@ -2992,6 +3086,48 @@ mod breadcrumb_tests {
     }
 
     #[test]
+    fn manual_link_picker_lists_active_and_archived_changes_even_when_linked() {
+        let project = make_project(
+            &["active-free", "active-linked"],
+            &["2026-08-13-01-archived-free"],
+        );
+        let mut ideas = super::super::ideas::State::default();
+        ideas.ideas.push(crate::idea_store::Idea {
+            abs_path: PathBuf::from("/ideas/change/active-linked.md"),
+            state: crate::idea_store::IdeaState::Change,
+            primary_tag_path: vec![],
+            frontmatter: crate::idea_store::Frontmatter {
+                title: "Linked".into(),
+                created: "2026-08-13T00:00:00+03:00".into(),
+                change: Some("active-linked".into()),
+                ..Default::default()
+            },
+        });
+
+        let targets = manual_link_targets(&project, &ideas);
+        assert_eq!(
+            targets,
+            vec![
+                ManualLinkTarget {
+                    scope_name: "active-free".into(),
+                    change_name: "active-free".into(),
+                    archived: false,
+                },
+                ManualLinkTarget {
+                    scope_name: "active-linked".into(),
+                    change_name: "active-linked".into(),
+                    archived: false,
+                },
+                ManualLinkTarget {
+                    scope_name: "2026-08-13-01-archived-free".into(),
+                    change_name: "archived-free".into(),
+                    archived: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn exploration_root_after_selection() {
         let state = make_state("exploration-1000", &[("exploration-1000", "Exploration 1")]);
         let project = make_project(&[], &[]);
@@ -3021,10 +3157,7 @@ mod breadcrumb_tests {
             crate::config::VcsWorkflow::default(),
             crate::config::ViewerStyle::Classic,
         );
-        assert_eq!(
-            state.renaming_exploration.as_deref(),
-            Some("exploration-1")
-        );
+        assert_eq!(state.renaming_exploration.as_deref(), Some("exploration-1"));
         assert_eq!(state.rename_draft, "Cloud agent options");
         assert_eq!(state.selected_change.as_deref(), Some("exploration-1"));
     }
@@ -3048,10 +3181,7 @@ mod breadcrumb_tests {
             crate::config::VcsWorkflow::default(),
             crate::config::ViewerStyle::Classic,
         );
-        assert_eq!(
-            state.renaming_exploration.as_deref(),
-            Some("exploration-1")
-        );
+        assert_eq!(state.renaming_exploration.as_deref(), Some("exploration-1"));
         assert_eq!(state.rename_draft, "Exploration 1");
     }
 
@@ -3965,7 +4095,7 @@ mod breadcrumb_tests {
                 false,
                 1200.0,
                 crate::config::VcsWorkflow::default(),
-            crate::config::ViewerStyle::Classic,
+                crate::config::ViewerStyle::Classic,
             );
 
             let exp = state.explorations.iter().find(|e| e.id == exp_id).unwrap();
@@ -4017,7 +4147,7 @@ mod breadcrumb_tests {
                 false,
                 1200.0,
                 crate::config::VcsWorkflow::default(),
-            crate::config::ViewerStyle::Classic,
+                crate::config::ViewerStyle::Classic,
             );
 
             assert!(state.explorations.iter().all(|e| e.id != exp_id));
@@ -4133,9 +4263,7 @@ mod breadcrumb_tests {
     #[test]
     fn pending_when_dirty_under_archive_folder() {
         let id = "2026-07-11-08-foo";
-        let dirty = vec![dirty_path(&format!(
-            "duckspec/archive/{id}/proposal.md"
-        ))];
+        let dirty = vec![dirty_path(&format!("duckspec/archive/{id}/proposal.md"))];
         assert!(archive_package_dirty(id, &dirty));
         let ch = ChangeData {
             name: id.into(),
@@ -4282,11 +4410,7 @@ mod breadcrumb_tests {
         assert!(!state.expanded_sections.contains("archived"));
         // Section still has rows to show when archives exist; collapsed by default.
         let project = make_project(&[], &["2026-07-01-01-done"]);
-        assert!(has_archived_section(
-            &project.archived_changes,
-            &[],
-            &[]
-        ));
+        assert!(has_archived_section(&project.archived_changes, &[], &[]));
     }
 
     #[test]
@@ -4336,18 +4460,11 @@ mod breadcrumb_tests {
     /// @spec archive/pending-commit Change list placement: Pending package appears in the Change section
     #[test]
     fn pending_package_appears_in_change_section_after_actives() {
-        let project = make_project(
-            &["active-wip"],
-            &["2026-07-11-08-pending"],
-        );
+        let project = make_project(&["active-wip"], &["2026-07-11-08-pending"]);
         let dirty = vec![dirty_path(
             "duckspec/archive/2026-07-11-08-pending/proposal.md",
         )];
-        let ids = change_queue_ids(
-            &project.active_changes,
-            &project.archived_changes,
-            &dirty,
-        );
+        let ids = change_queue_ids(&project.active_changes, &project.archived_changes, &dirty);
         assert_eq!(
             ids,
             vec![
@@ -4356,27 +4473,19 @@ mod breadcrumb_tests {
             ]
         );
         // Not on finished Archived list.
-        let archived =
-            archived_entries(&project.archived_changes, &[], &dirty);
+        let archived = archived_entries(&project.archived_changes, &[], &dirty);
         assert!(archived.is_empty());
     }
 
     /// @spec archive/pending-commit Change list placement: Multiple pending archives order newest-first after actives
     #[test]
     fn multiple_pending_archives_newest_first_after_actives() {
-        let project = make_project(
-            &["active-wip"],
-            &["2026-01-01-01-old", "2026-07-12-09-new"],
-        );
+        let project = make_project(&["active-wip"], &["2026-01-01-01-old", "2026-07-12-09-new"]);
         let dirty = vec![
             dirty_path("duckspec/archive/2026-01-01-01-old/proposal.md"),
             dirty_path("duckspec/archive/2026-07-12-09-new/design.md"),
         ];
-        let ids = change_queue_ids(
-            &project.active_changes,
-            &project.archived_changes,
-            &dirty,
-        );
+        let ids = change_queue_ids(&project.active_changes, &project.archived_changes, &dirty);
         assert_eq!(
             ids,
             vec![
@@ -4417,15 +4526,10 @@ mod breadcrumb_tests {
     fn pending_archive_breadcrumb_uses_changes_root() {
         let id = "2026-07-11-08-pending";
         let mut state = make_state(id, &[]);
-        state.changed_files = vec![dirty_path(&format!(
-            "duckspec/archive/{id}/proposal.md"
-        ))];
+        state.changed_files = vec![dirty_path(&format!("duckspec/archive/{id}/proposal.md"))];
         let project = make_project(&[], &[id]);
         let tabs = tab_bar::TabState::default();
-        assert_eq!(
-            breadcrumbs(&state, &project, &tabs),
-            vec!["Changes", id]
-        );
+        assert_eq!(breadcrumbs(&state, &project, &tabs), vec!["Changes", id]);
     }
 
     #[test]
@@ -4447,10 +4551,7 @@ mod breadcrumb_tests {
         let state = make_state(id, &[]);
         let project = make_project(&[], &[id]);
         let tabs = tab_bar::TabState::default();
-        assert_eq!(
-            breadcrumbs(&state, &project, &tabs),
-            vec!["Archive", id]
-        );
+        assert_eq!(breadcrumbs(&state, &project, &tabs), vec!["Archive", id]);
     }
 
     #[test]
@@ -4458,9 +4559,7 @@ mod breadcrumb_tests {
         let id = "2026-07-11-08-pending";
         let mut state = State::new(None);
         state.expanded_sections.clear();
-        state.changed_files = vec![dirty_path(&format!(
-            "duckspec/archive/{id}/proposal.md"
-        ))];
+        state.changed_files = vec![dirty_path(&format!("duckspec/archive/{id}/proposal.md"))];
         let project = make_project(&[], &[id]);
         let mut tabs = tab_bar::TabState::default();
         let mut interactions = HashMap::new();
@@ -4506,6 +4605,63 @@ mod breadcrumb_tests {
         assert_eq!(state.selected_change.as_deref(), Some(id));
         assert!(state.expanded_sections.contains("archived"));
         assert!(!state.expanded_sections.contains("picker"));
+    }
+
+    /// @spec chat/build-pilot Focus independence: Select other change leaves armed pilot intact
+    #[test]
+    fn select_other_change_leaves_armed_pilot_intact() {
+        use crate::area::interaction::{AgentSession, InteractionState};
+        use crate::build_pilot::PilotState;
+        use crate::scope::{Scope, ScopeKind};
+        use crate::slash_commands::BuildPilotMode;
+
+        // GIVEN a session armed in auto mode on change A with a main turn streaming
+        let project = make_project(&["change-a", "change-b"], &[]);
+        let mut state = State::new(None);
+        state.selected_change = Some("change-a".into());
+        let mut interactions = HashMap::new();
+        let mut ix_a = InteractionState::default();
+        let mut ax = AgentSession::new("change-a".into(), ScopeKind::Change);
+        ax.session.id = "sess-a".into();
+        ax.pilot = PilotState::Armed(BuildPilotMode::Auto);
+        ax.session.is_streaming = true;
+        ix_a.sessions.push(ax);
+        ix_a.active_session = 0;
+        ix_a.visible = true;
+        interactions.insert(Scope::Change("change-a".into()), ix_a);
+
+        let mut tabs = tab_bar::TabState::default();
+        let highlighter = crate::highlight::SyntaxHighlighter::new();
+
+        // WHEN the user selects a different change B
+        update(
+            &mut state,
+            &mut tabs,
+            &mut interactions,
+            Message::SelectChange("change-b".into()),
+            &project,
+            &highlighter,
+            false,
+            1200.0,
+            crate::config::VcsWorkflow::default(),
+            crate::config::ViewerStyle::Classic,
+        );
+
+        // THEN the pilot on change A's session remains armed
+        // AND the streaming turn on change A is not cancelled solely by that selection
+        let ax_a = interactions
+            .get(&Scope::Change("change-a".into()))
+            .and_then(|ix| ix.sessions.first())
+            .expect("change-a session");
+        assert!(
+            ax_a.pilot.is_armed(),
+            "SelectChange must not disarm background pilot"
+        );
+        assert!(
+            ax_a.session.is_streaming,
+            "SelectChange must not cancel background streaming turn"
+        );
+        assert_eq!(state.selected_change.as_deref(), Some("change-b"));
     }
 }
 
