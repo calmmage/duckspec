@@ -6,7 +6,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::audit::{self, AuditError, ChangeMergeError, ChangeScenario, ScenarioKey};
+use crate::audit::{
+    self, AuditError, ChangeMergeError, ChangeScenario, ScenarioKey,
+};
 use crate::config::Config;
 
 /// Progress snapshot for a single change's `test:code` scenarios.

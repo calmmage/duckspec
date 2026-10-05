@@ -5,8 +5,8 @@
 
 use std::path::Path;
 
-use duckpond::check::{CheckContext, check_artifact};
-use duckpond::layout::{ArtifactKind, classify};
+use duckpond::check::{check_artifact, CheckContext};
+use duckpond::layout::{classify, ArtifactKind};
 
 // @spec review Review recognition and validation: A well-formed review validates
 #[test]

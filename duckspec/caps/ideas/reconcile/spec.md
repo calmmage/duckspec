@@ -24,7 +24,7 @@ particular, an already-archived idea SHALL retain its existing archive reason.
 - **AND** its recorded archive reason is via-change
 
 > test: code
-> - crates/duckboard/src/idea_store.rs:1500
+> - crates/duckboard/src/idea_store.rs:820
 
 ### Scenario: Linked change gone classifies the idea as orphaned
 
@@ -35,7 +35,7 @@ particular, an already-archived idea SHALL retain its existing archive reason.
 - **AND** its recorded archive reason is orphaned
 
 > test: code
-> - crates/duckboard/src/idea_store.rs:1514
+> - crates/duckboard/src/idea_store.rs:834
 
 ### Scenario: Active linked change leaves the idea unchanged
 
@@ -45,7 +45,7 @@ particular, an already-archived idea SHALL retain its existing archive reason.
 - **THEN** the idea remains a change-state idea
 
 > test: code
-> - crates/duckboard/src/idea_store.rs:1525
+> - crates/duckboard/src/idea_store.rs:845
 
 ### Scenario: Already-archived idea keeps its archive reason
 
@@ -55,7 +55,7 @@ particular, an already-archived idea SHALL retain its existing archive reason.
 - **AND** its recorded archive reason is still manual
 
 > test: code
-> - crates/duckboard/src/idea_store.rs:1536
+> - crates/duckboard/src/idea_store.rs:856
 
 ## Requirement: Relocation reporting
 
@@ -72,7 +72,7 @@ the new location. A reconciliation that relocates no idea SHALL report no reloca
 - **AND** it names the idea's former location and its new location
 
 > test: code
-> - crates/duckboard/src/idea_store.rs:1555
+> - crates/duckboard/src/idea_store.rs:875
 
 ### Scenario: A no-op reconciliation reports no relocations
 
@@ -81,7 +81,7 @@ the new location. A reconciliation that relocates no idea SHALL report no reloca
 - **THEN** no relocations are reported
 
 > test: code
-> - crates/duckboard/src/idea_store.rs:1577
+> - crates/duckboard/src/idea_store.rs:897
 
 ## Requirement: Selection and editor follow relocations
 
@@ -98,7 +98,7 @@ one.
 - **THEN** the selection references the idea at its new location
 
 > test: code
-> - crates/duckboard/src/area/ideas.rs:1476
+> - crates/duckboard/src/area/ideas.rs:1127
 
 ### Scenario: The open idea editor tracks the idea after relocation
 
@@ -108,7 +108,7 @@ one.
 - **AND** its label reflects the idea's current title
 
 > test: code
-> - crates/duckboard/src/area/ideas.rs:1493
+> - crates/duckboard/src/area/ideas.rs:1144
 
 ## Requirement: Reconciliation on archival detection
 

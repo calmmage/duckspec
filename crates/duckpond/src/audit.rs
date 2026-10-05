@@ -268,7 +268,8 @@ fn audit_full(
 ) -> Result<(), AuditError> {
     // 1. Validate every artifact individually and split results between
     //    per-change groups and project-level groups.
-    let mut change_file_errors: ChangeFileErrors = HashMap::new();
+    let mut change_file_errors: ChangeFileErrors =
+        HashMap::new();
     check_all_artifacts(
         duckspec_root,
         canonical_root,
@@ -380,7 +381,9 @@ fn audit_full(
     // 7. For each active change: test:code scenarios covered by step tasks
     //    and step refs resolve.
     for change_name in &change_names {
-        let change_scenarios = per_change_scenarios.remove(change_name).unwrap_or_default();
+        let change_scenarios = per_change_scenarios
+            .remove(change_name)
+            .unwrap_or_default();
         let test_code: Vec<ScenarioKey> = change_scenarios
             .iter()
             .filter(|s| s.test_code)
@@ -496,9 +499,7 @@ fn audit_change(
             }
         }
     }
-    report
-        .pending_backlink_scenarios
-        .sort_by_key(|k| k.display());
+    report.pending_backlink_scenarios.sort_by_key(|k| k.display());
 
     // 6. Every test:code scenario must be covered by a step task.
     let test_code: Vec<ScenarioKey> = change_scenarios
@@ -1250,11 +1251,7 @@ mod tests {
         let config = Config::default();
         let backlinks = scan_source_files(root, &root.join("duckspec"), &config).unwrap();
 
-        assert_eq!(
-            backlinks.len(),
-            1,
-            "the backlink under the root is returned"
-        );
+        assert_eq!(backlinks.len(), 1, "the backlink under the root is returned");
         assert!(backlinks[0].file.ends_with("deep/nested/code.rs"));
     }
 

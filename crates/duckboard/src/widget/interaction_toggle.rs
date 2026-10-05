@@ -20,8 +20,7 @@ use iced::{Border, Color, Element, Event, Length, Rectangle, Size, Theme};
 
 use crate::theme;
 
-/// Width of the door strip between content and interaction columns.
-pub const HANDLE_WIDTH: f32 = 16.0;
+const HANDLE_WIDTH: f32 = 16.0;
 const CHEVRON_SIZE: f32 = 12.0;
 /// Horizontal inset centers a chevron in the strip.
 const CHEVRON_INSET_X: f32 = (HANDLE_WIDTH - CHEVRON_SIZE) / 2.0;
@@ -36,8 +35,8 @@ const GRIP_DOT: f32 = 3.0;
 const GRIP_DOT_GAP: f32 = 3.0;
 const GRIP_DOT_COUNT: usize = 3;
 
-/// Minimum interaction-column width when content is shown (equal split and drag).
-pub const MIN_PANEL_WIDTH: f32 = 200.0;
+const MIN_PANEL_WIDTH: f32 = 200.0;
+const MAX_PANEL_WIDTH: f32 = 800.0;
 
 const ICON_CHEVRON_RIGHT: &[u8] = include_bytes!("../../assets/icon_chevron_right.svg");
 const ICON_CHEVRON_LEFT: &[u8] = include_bytes!("../../assets/icon_chevron_left.svg");
@@ -81,8 +80,6 @@ pub struct InteractionHandle<'a, M> {
     /// Whether the content column is collapsed (panel filling its space).
     collapsed: bool,
     current_width: f32,
-    /// Upper clamp for grip drag — free content↔chat space (not a fixed max).
-    max_width: f32,
     on_event: Box<dyn Fn(HandleMsg) -> M + 'a>,
 }
 
@@ -91,14 +88,12 @@ impl<'a, M> InteractionHandle<'a, M> {
         expanded: bool,
         collapsed: bool,
         current_width: f32,
-        max_width: f32,
         on_event: impl Fn(HandleMsg) -> M + 'a,
     ) -> Self {
         Self {
             expanded,
             collapsed,
             current_width,
-            max_width,
             on_event: Box::new(on_event),
         }
     }
@@ -183,11 +178,11 @@ impl<'a, M: Clone> Widget<M, Theme, iced::Renderer> for InteractionHandle<'a, M>
                         state.dragging = true;
                     }
                     if state.dragging {
-                        // Negative dx (drag left) = grow panel. Min panel width
-                        // and free-space max — collapsing content is bottom
-                        // chevron only, never a drag past free space.
-                        let max = self.max_width.max(MIN_PANEL_WIDTH);
-                        let new_width = (state.base_width - dx).clamp(MIN_PANEL_WIDTH, max);
+                        // Negative dx (drag left) = grow panel. Clamped to a
+                        // fixed range — collapsing the content column is a
+                        // deliberate click on the bottom chevron, never a drag.
+                        let new_width =
+                            (state.base_width - dx).clamp(MIN_PANEL_WIDTH, MAX_PANEL_WIDTH);
                         shell.publish((self.on_event)(HandleMsg::SetWidth(new_width)));
                     }
                 }
@@ -311,8 +306,7 @@ impl<'a, M: Clone> Widget<M, Theme, iced::Renderer> for InteractionHandle<'a, M>
         );
 
         // Middle grip — vertical "⋮" dots signalling the strip is draggable.
-        let total_h =
-            GRIP_DOT_COUNT as f32 * GRIP_DOT + (GRIP_DOT_COUNT as f32 - 1.0) * GRIP_DOT_GAP;
+        let total_h = GRIP_DOT_COUNT as f32 * GRIP_DOT + (GRIP_DOT_COUNT as f32 - 1.0) * GRIP_DOT_GAP;
         let dot_x = bounds.x + (HANDLE_WIDTH - GRIP_DOT) / 2.0;
         let mut dot_y = bounds.y + (bounds.height - total_h) / 2.0;
         for _ in 0..GRIP_DOT_COUNT {
@@ -387,8 +381,7 @@ pub fn view<'a, M: Clone + 'a>(
     expanded: bool,
     collapsed: bool,
     current_width: f32,
-    max_width: f32,
     on_event: impl Fn(HandleMsg) -> M + 'a,
 ) -> Element<'a, M> {
-    InteractionHandle::new(expanded, collapsed, current_width, max_width, on_event).into()
+    InteractionHandle::new(expanded, collapsed, current_width, on_event).into()
 }

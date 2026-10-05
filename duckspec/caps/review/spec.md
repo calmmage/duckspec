@@ -76,7 +76,7 @@ change.
 - **AND** its slug begins with `review-`
 
 > test: code
-> - crates/duckpond/src/plan.rs:743
+> - crates/duckpond/src/plan.rs:742
 
 ### Scenario: A review whose slug already exists is rejected
 
@@ -85,7 +85,7 @@ change.
 - **THEN** creation is rejected
 
 > test: code
-> - crates/duckpond/src/plan.rs:763
+> - crates/duckpond/src/plan.rs:765
 
 ### Scenario: A followup continues the shared sequence after a review
 
@@ -96,7 +96,7 @@ change.
 - **AND** the existing review is left unchanged
 
 > test: code
-> - crates/duckpond/src/plan.rs:776
+> - crates/duckpond/src/plan.rs:778
 
 ### Scenario: Review and followup with the same title portion both create
 
@@ -110,7 +110,7 @@ change.
 - **AND** the new file's full slug is `followup-post-impl`
 
 > test: code
-> - crates/duckpond/src/plan.rs:796
+> - crates/duckpond/src/plan.rs:798
 
 ## Requirement: Filename slug
 
@@ -131,7 +131,7 @@ empty title slug.
 - **THEN** the new review file's slug is `review-post-impl-soundness-fidelity`
 
 > test: code
-> - crates/duckpond/src/plan.rs:901
+> - crates/duckpond/src/plan.rs:897
 
 ### Scenario: A title with no alphanumeric characters is rejected
 
@@ -141,7 +141,7 @@ empty title slug.
 - **AND** no review file is written
 
 > test: code
-> - crates/duckpond/src/plan.rs:919
+> - crates/duckpond/src/plan.rs:915
 
 ### Scenario: A followup create prefixes the slug with followup-
 
@@ -150,4 +150,4 @@ empty title slug.
 - **THEN** the new file's slug is `followup-collapse-policy`
 
 > test: code
-> - crates/duckpond/src/plan.rs:815
+> - crates/duckpond/src/plan.rs:817

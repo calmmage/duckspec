@@ -320,9 +320,7 @@ mod tests {
     #[test]
     fn archived_spec_delta() {
         assert_eq!(
-            classify(&p(
-                "archive/2026-03-15-01-add-oauth/caps/auth/spec.delta.md"
-            )),
+            classify(&p("archive/2026-03-15-01-add-oauth/caps/auth/spec.delta.md")),
             Some(ArtifactKind::SpecDelta)
         );
     }
@@ -330,9 +328,7 @@ mod tests {
     #[test]
     fn archived_change_cap_spec() {
         assert_eq!(
-            classify(&p(
-                "archive/2026-03-15-01-add-oauth/caps/auth/oauth/spec.md"
-            )),
+            classify(&p("archive/2026-03-15-01-add-oauth/caps/auth/oauth/spec.md")),
             Some(ArtifactKind::ChangeCapSpec)
         );
     }
@@ -390,10 +386,7 @@ mod tests {
 
     #[test]
     fn parse_nn_slug_basic() {
-        assert_eq!(
-            parse_nn_slug("01-scaffold.md"),
-            Some((1, "scaffold".into()))
-        );
+        assert_eq!(parse_nn_slug("01-scaffold.md"), Some((1, "scaffold".into())));
     }
 
     #[test]

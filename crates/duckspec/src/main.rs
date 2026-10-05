@@ -5,7 +5,6 @@
 use clap::{Parser, Subcommand};
 
 mod cmd;
-mod content;
 
 /// duckspec CLI — spec-driven development framework.
 #[derive(Parser, Debug)]
@@ -19,7 +18,7 @@ struct Cli {
 enum Command {
     /// Create duckspec/ directory structure, optionally install agent templates.
     Init {
-        /// Harness to install templates for (claude, opencode, codex).
+        /// Harness to install templates for (claude, opencode).
         harness: Option<String>,
     },
     /// Print active changes, capability/codex counts, or details for a path.

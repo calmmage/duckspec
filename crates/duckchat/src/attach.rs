@@ -11,7 +11,10 @@ use crate::request::Attachment;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Segment {
     Text(String),
-    Image { media_type: String, bytes: Vec<u8> },
+    Image {
+        media_type: String,
+        bytes: Vec<u8>,
+    },
 }
 
 /// Walk `prompt` for markdown links of the form `[label](attach:<id>)`.

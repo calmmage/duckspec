@@ -25,7 +25,7 @@ neither.
 - **AND** does not count it as an error
 
 > test: code
-> - crates/duckpond/tests/audit.rs:389
+> - crates/duckpond/tests/audit.rs:386
 
 ### Scenario: Checked referencing task is an error
 
@@ -37,7 +37,7 @@ neither.
 - **AND** does not list it as pending
 
 > test: code
-> - crates/duckpond/tests/audit.rs:404
+> - crates/duckpond/tests/audit.rs:401
 
 ### Scenario: A scenario claimed by any checked task is an error
 
@@ -48,7 +48,7 @@ neither.
 - **THEN** the report lists the scenario as an error
 
 > test: code
-> - crates/duckpond/tests/audit.rs:419
+> - crates/duckpond/tests/audit.rs:416
 
 ### Scenario: A backlinked scenario is neither pending nor an error
 
@@ -59,7 +59,7 @@ neither.
 - **THEN** the report lists the scenario as neither pending nor an error
 
 > test: code
-> - crates/duckpond/tests/audit.rs:432
+> - crates/duckpond/tests/audit.rs:429
 
 ## Requirement: Pending scenarios do not fail the audit
 
@@ -78,7 +78,7 @@ error SHALL make the audit report at least one error.
 - **AND** the pending scenarios are still listed
 
 > test: code
-> - crates/duckpond/tests/audit.rs:445
+> - crates/duckpond/tests/audit.rs:442
 
 ### Scenario: A checked-but-unlinked scenario makes the audit report an error
 
@@ -92,7 +92,7 @@ error SHALL make the audit report at least one error.
 - **THEN** the audit reports at least one error
 
 > test: code
-> - crates/duckpond/tests/audit.rs:465
+> - crates/duckpond/tests/audit.rs:462
 
 ## Requirement: Classification is scoped to the change audit
 
@@ -111,4 +111,4 @@ scenarios.
 - **AND** produces no pending scenarios
 
 > test: code
-> - crates/duckpond/tests/audit.rs:476
+> - crates/duckpond/tests/audit.rs:473

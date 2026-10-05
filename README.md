@@ -55,86 +55,28 @@ duckboard is a companion to `ds`, not a replacement — install `ds` first. duck
 
 Download `Duckboard-<version>.dmg` from the [latest release](https://github.com/squareduck/duckspec/releases/latest), open it, and drag `Duckboard.app` to `Applications`.
 
-The app bundle includes harness ACP agents (`duckchat-claude-acp`, `duckchat-codex-acp`)
-next to the `duckboard` binary. Finder-launched Duckboard does **not** need those agents
-on your `PATH` for Claude or Codex turns.
-
 The bundle is ad-hoc signed but not notarized. On first launch macOS blocks it with an "unidentified developer" warning; open *System Settings → Privacy & Security*, scroll to the bottom, and click *Open Anyway* next to Duckboard. Later launches are normal.
 
-Or build from source (install the GUI and harness agents — cargo install does not bundle
-them together the way the DMG does):
+Or build from source:
 
 ```sh
 cargo install --locked --git https://github.com/squareduck/duckspec.git duckboard
-cargo install --locked --git https://github.com/squareduck/duckspec.git duckchat-claude-acp
-cargo install --locked --git https://github.com/squareduck/duckspec.git duckchat-codex-acp
-```
-
-That puts them on `~/.cargo/bin` (must be on your `PATH` when you launch duckboard from a
-terminal). From a clone you can also use `just install` to install `ds`, `duckboard`, and
-both harness agents together.
-
-### 3. Agent harnesses (upstream CLIs)
-
-Duckboard turns run on a **harness** — a backend agent. Each harness needs its **upstream
-CLI** installed and authenticated separately. Auth is always the upstream product’s
-(Claude / ChatGPT / SuperGrok / etc.); duckboard does not replace that.
-
-| Harness | duckboard id | `ds init` | CLI on `PATH` | Install / docs |
-| --- | --- | --- | --- | --- |
-| Claude Code | `claude-code` | `claude` | `claude` | [Claude Code quickstart](https://code.claude.com/docs/en/quickstart) |
-| Grok Build | `grok` | — | `grok` | [Grok Build CLI](https://x.ai/cli) · [docs](https://docs.x.ai/build/overview) |
-| OpenAI Codex | `openai-codex` | `codex` | `codex` | [Codex CLI](https://developers.openai.com/codex/cli) |
-| OpenCode | — (skills only) | `opencode` | `opencode` | [OpenCode install](https://opencode.ai/docs/) |
-
-**What duckboard ships vs what you install:**
-
-- **Owned ACP agents** (`duckchat-claude-acp`, `duckchat-codex-acp`) ship next to duckboard
-  in the DMG / `just bundle`, or via `cargo install` / `just install`. Override discovery
-  with `DUCKCHAT_CLAUDE_ACP` / `DUCKCHAT_CODEX_ACP` (then sibling of the running exe, then
-  `PATH`). See [Development](#development).
-- **Upstream CLIs** (`claude`, `grok`, `codex`) are **not** bundled. Install them from the
-  links above, sign in as that product requires, and keep them on your `PATH`.
-- Grok does not use a separate owned ACP binary; duckboard launches the official `grok`
-  CLI directly.
-- `ds init opencode` only installs stage skills under `.opencode/commands/`; it is not a
-  duckboard model-catalog harness.
-
-Quick install examples (see each product’s docs for updates and Windows):
-
-```sh
-# Claude Code
-curl -fsSL https://claude.ai/install.sh | bash
-
-# Grok Build
-curl -fsSL https://x.ai/cli/install.sh | bash
-
-# Codex CLI
-curl -fsSL https://chatgpt.com/codex/install.sh | sh
-
-# OpenCode (skills / terminal agent)
-curl -fsSL https://opencode.ai/install | bash
 ```
 
 ## Quick start
 
-Pick a harness whose upstream CLI you already installed (section 3), then:
-
 ```sh
 cd your-project
-ds init claude   # or: ds init opencode | ds init codex
+ds init claude   # or: ds init opencode
 ```
 
-`ds init <harness>` creates the `duckspec/` skeleton and installs stage commands/skills for
-that harness. You still need the matching upstream CLI on `PATH` for live agent turns
-(except that OpenCode is install-for-skills only relative to duckboard).
+`ds init <harness>` creates the `duckspec/` skeleton and installs the agent slash commands:
 
 - `duckspec/caps/` — capability tree (each capability is a folder with `spec.md` + `doc.md`)
 - `duckspec/codex/` — cross-cutting project knowledge outside the change lifecycle
 - `duckspec/changes/` — active changes
 - `duckspec/archive/` — completed changes
-- `.claude/commands/ds-*.md`, `.opencode/commands/`, or `.agents/skills/*/SKILL.md` (codex) —
-  the `ds-*` stage commands/skills
+- `.claude/commands/ds-*.md` (or `.opencode/commands/`) — the `ds-*` slash commands
 
 Two optional files are written by hand, not by `init`:
 
@@ -256,7 +198,7 @@ Commands you'll use directly:
 
 | Command | Description |
 |---|---|
-| `ds init <harness>` | Initialize a project for an agent harness (`claude`, `opencode`, `codex`) |
+| `ds init <harness>` | Initialize a project for an agent harness (`claude`, `opencode`) |
 | `ds status [name]` | Show active changes, capability / codex counts, or details for a path |
 | `ds audit [change]` | Validate the whole project (or one change): backlinks, test coverage, cross-artifact integrity |
 | `ds check <path>` | Validate specs, steps, codex pages, or whole directories against schemas |
@@ -331,39 +273,12 @@ This repo is a Cargo workspace:
 - `crates/duckspec/` — CLI crate (binary: `ds`)
 - `crates/duckboard/` — GUI crate (binary: `duckboard`)
 - `crates/duckchat/` — agent-harness abstraction used by duckboard
-- `crates/duckchat-claude-acp/` — owned ACP agent that wraps the official `claude` CLI
-- `crates/duckchat-codex-acp/` — owned ACP agent that wraps official `codex app-server`
 
-Harness agent binary discovery (first match wins):
-
-| Harness | Env override | Sibling binary |
-| --- | --- | --- |
-| Claude | `DUCKCHAT_CLAUDE_ACP` | `duckchat-claude-acp` |
-| OpenAI Codex | `DUCKCHAT_CODEX_ACP` | `duckchat-codex-acp` |
-
-Then `PATH`. Sibling means next to the running `duckboard` executable.
-
-- **DMG / `just bundle`:** agents are copied next to `duckboard` inside the app
-  (primary GUI path; no separate install).
-- **Local dev / `cargo run`:** build agents into the same `target/` tree so sibling
-  resolution works:
+Common tasks via [just](https://github.com/casey/just):
 
 ```sh
-cargo build -p duckchat-claude-acp -p duckchat-codex-acp -p duckboard
-# or a full workspace build
-cargo build
-```
-
-That places `target/debug/duckboard` next to the agent binaries (same under
-`target/release/`). Override with `DUCKCHAT_CLAUDE_ACP=…` or `DUCKCHAT_CODEX_ACP=…`
-when needed.
-
-Common tasks via [just](https://github.com/casey/just) (`just help` / `make help` lists them):
-
-```sh
-just help          # list recipes (also: make help)
-just install       # install ds + duckboard + harness agents to ~/.cargo/bin
-just bundle        # build dist/Duckboard.app (includes sibling agents)
+just install       # build and install both binaries to ~/.cargo/bin
+just bundle        # build dist/Duckboard.app
 just bundle-dmg    # build dist/Duckboard-<version>.dmg
 just release 0.2.0 # bump workspace version, commit, tag, push → triggers CI release
 ```

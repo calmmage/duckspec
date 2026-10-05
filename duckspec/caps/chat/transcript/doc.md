@@ -40,14 +40,9 @@ call. A completed row carries a short tool summary and the result body. A result
 matching use still becomes a done row labeled from the tool name; it is never shown only
 as a bare "done" placeholder.
 
-Structured host-choice tools (AskUserQuestion and equivalents) are omitted from Activity
-entirely — mid-turn questions use fast-response chips, not Activity rows. Ordinary tools
-in the same stream still group as usual.
-
-Activity uses the same flat secondary chrome as Thinking: a collapsible muted header with
-no bordered card frame and no filled header or body surface. When expanded, each tool is
-one quiet row (status + summary) with truncated output under the row when present.
-Collapse is group-level only: there is no nested per-tool expand state.
+When the group is expanded, each tool is one quiet row (status + summary) with truncated
+output under the row when present. Collapse is group-level only: there is no nested
+per-tool expand state.
 
 Collapsed, the group summarizes as a count plus sample tool names (for example
 `4 tools · Read, grep, shell`).
@@ -55,26 +50,19 @@ Collapsed, the group summarizes as a count plus sample tool names (for example
 ## Collapse defaults
 
 ```
-| Segment        | Live default | Settled / reload default | Auto-collapse                     |
-| -------------- | ------------ | ------------------------ | --------------------------------- |
-| Thinking       | expanded     | collapsed                | when Answer follows or turn ends  |
-| Activity       | expanded     | collapsed                | when Answer follows or turn ends  |
-| Answer         | always shown | always shown             | not collapsible                   |
-| User (normal)  | always shown | always shown             | not collapsible                   |
-| User (priming) | collapsed    | collapsed                | timed re-hide after expand (~15s) |
+| Segment  | Live default | Settled / reload default | Auto-collapse            |
+| -------- | ------------ | ------------------------ | ------------------------ |
+| Thinking | expanded     | collapsed                | when Answer follows or   |
+|          |              |                          | the turn completes       |
+| Activity | expanded     | collapsed                | when Answer follows or   |
+|          |              |                          | the turn completes       |
+| Answer   | always shown | always shown             | not collapsible          |
 ```
 
 If the user toggles a Thinking or Activity segment, that choice wins: later auto-collapse
 does not force it shut again for that segment.
 
-The synthetic first-turn priming user message (AGENTS.md / orientation inject, answered
-with `.`) is presented as a collapsible **Setup** block. It starts collapsed so
-scroll-to-top reaches the first real user message. Click expands it; after a short delay
-it auto-collapses again. Sync rebuilds do not force-shut a user-expanded Setup block —
-only the expand timer (or a manual collapse) does.
-
-Collapsed Thinking labels use line count (`Thinking · N lines`), not duration. Collapsed
-priming Setup labels use the same line-count pattern (`Setup · N lines`).
+Collapsed Thinking labels use line count (`Thinking · N lines`), not duration.
 
 ## Live vs settled
 
@@ -82,15 +70,15 @@ priming Setup labels use the same line-count pattern (`Setup · N lines`).
 LIVE                                      SETTLED
 ────                                      ──────
 Thinking open (streaming body, faded)     Thinking collapsed (line count)
-Activity expanded (quiet rows, faded)     Activity collapsed (count · names)
+Activity expanded (current tool clear)    Activity collapsed (count · names)
 Answer streaming as plain prose           Answer as plain prose
 ```
 
-Thinking and expanded Activity body ink is slightly more faded than Answer prose
-(secondary text color) so supporting work stays quiet. Headers are more muted still.
-Harnesses that never emit reasoning simply never open Thinking segments; Activity and
-Answer behavior still apply. Presentation is driven only from neutral session content and
-stream buffers — not from harness-specific UI branches.
+Thinking body ink is slightly more faded than Answer prose (secondary text color) so
+reasoning reads as supporting work. Headers may be more muted still. Harnesses that never
+emit reasoning simply never open Thinking segments; Activity and Answer behavior still
+apply. Presentation is driven only from neutral session content and stream buffers — not
+from harness-specific UI branches.
 
 ## Meta-card highlighting
 
@@ -98,19 +86,3 @@ Answer text that contains chat meta cards (`write` / `next` quote runs from chat
 recognition) marks those lines with a quiet background so gates and handoffs scan
 differently from ordinary reply prose. Only lines inside a recognized card range are
 tinted; surrounding Answer lines stay plain. Thinking and Activity segments are unchanged.
-
-## Secondary chrome
-
-User messages keep a paper card and Answer prose stays primary on the chat background.
-Thinking and Activity share one secondary presentation: flat collapsible header (chevron
-and muted label) and no group-level card chrome. Labels alone disambiguate the two kinds
-(`Thinking · N lines` vs `N tools · …`).
-
-```
-| Segment  | Chrome                         | Role            |
-| -------- | ------------------------------ | --------------- |
-| User     | paper card                     | primary object  |
-| Answer   | plain / last-answer band       | primary reply   |
-| Thinking | flat header (muted label)      | secondary (why) |
-| Activity | flat header + quiet tool rows  | tertiary (what) |
-```

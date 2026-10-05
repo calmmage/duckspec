@@ -1,132 +1,117 @@
 # Followup schema
 
-A followup is the durable synthesis of user-led concerns, the investigation
-they prompted, and the finding-by-finding discussion that followed. It records
-evidence, important trade-offs, the agreed resolution, and the earliest
-corrective stage so a new session can act without reconstructing the
-conversation.
+A followup is a **user-led critique record** on a change: same purpose as a
+review (issues, judgment, recommended next steps), sourced from conversation
+rather than a solo agent scan. Append-only under
+`duckspec/changes/<name>/reviews/NN-followup-<slug>.md` (shared log with
+reviews).
 
 ## Structure
 
 ```markdown
-# <Followup title>
+# <Followup Title>
 
-<compact outcome summary>
+<1-2 sentence summary: discussion, stage, headline outcome>
 
 ## Scope
 
-<concerns, artifacts, source, tests, and stage examined>
+<artifacts examined; stage; deepest layer discussed>
 
 ## Summary
 
-| # | finding | resolution | → next |
-| --- | --- | --- | --- |
-| 1 | <short title> | <agreed conclusion> | /ds-design |
+| # | sev | lens | title | → next |
+| --- | --- | --- | --- | --- |
+| 1 | major | quality | <short title> | /ds-step |
+| 2 | minor | fidelity | <short title> | /ds-spec |
 
-## Findings
+## Issues
 
-### 1. <Finding title>
+### 1. <Issue title> - <lens>/<severity>
 
-**Where:** <paths, lines, artifacts, or sections>
+**Where:** <`path:line` or artifact + section>
 
-**Evidence:** <what was observed>
+**Why:** <why it matters>
 
-**Impact:** <why it matters if unchanged>
+**Action:** <recommended stage or approach - not work already done>
 
-**Discussion:** <material alternatives and trade-offs considered>
+## Open questions
 
-**Resolution:** <agreed conclusion>
-
-**Next:** </ds-design, /ds-spec, or /ds-step> - <specific work the stage can act on>
-
-## Resolved concerns
-
-<optional dismissed candidates whose resolution is durable>
+<genuine unresolved decisions. Omit if none.>
 
 ## Outcome
 
-<aggregate readiness and primary next route>
+<what was agreed; possible next moves; archive-readiness. Do not claim
+plan/code changed unless that happened outside this write.>
 ```
 
-`Resolved concerns` is optional. Empty Summary is valid when no accepted
-findings remain; Outcome still states readiness.
+```
+proposal --> design --> caps (spec/doc) --> code
+```
+
+May cover any layer the user cares about. Number Summary rows and Issues
+headings the same. Column `→ next` is a stage or path - not "already fixed".
+
+## Lenses and severity
+
+Same as **review** (`ds schema review`): soundness, fidelity, quality; critical /
+major / minor by lasting harm if frozen as-is.
 
 ## Rules
 
-- Path: `duckspec/changes/<name>/reviews/NN-followup-<slug>.md`
+- Path: `duckspec/changes/<name>/reviews/NN-followup-<slug>.md` (`followup-`
+  prefix on create)
 - H1 title required; non-empty summary paragraph follows it
-- Body is freeform markdown; Structure is the expected durable shape
-- Summary rows and Findings headings use the same numbering
-- Every accepted finding has a resolved conclusion and one earliest next stage
-- Valid finding routes: `/ds-design`, `/ds-spec`, `/ds-step`
-- The record contains no unresolved findings or open questions
-- Append-only log: create a new file; do not renumber or rewrite history
+- Body freeform; Structure is recommended (document schema only for `ds check`)
+- Append-only log - new file per followup; do not renumber or rewrite history
 
 ## Quality
 
-- **User-led, evidence-grounded.** Start from the concerns the user raised, then
-  preserve what inspection and discussion established rather than recording
-  the initial impression as fact.
-- **Full decision context.** Evidence, impact, important alternatives, agreed
-  resolution, and specific next work let a cold stage act without redoing the
-  followup conversation.
-- **Upstream routing.** Route to design when direction is invalid, spec when
-  design is sound but behavior is wrong, and step when design and contracts are
-  sound but implementation needs work.
-- **One finding, one issue.** Merge duplicate symptoms and keep related
-  evidence together. Order findings from the earliest affected layer.
-- **Resolved concerns sparingly.** Omit false leads unless the dismissal
-  captures a durable intentional trade-off or prevents repeated investigation.
-- **Cohesive record.** Summary supports scanning; Findings preserve reasoning;
-  Outcome states the aggregate readiness without repeating every row.
-- Body markdown follows `style` (load only if not already in context).
+- **Scannable first.** Triage from Summary; depth under Where / Why / Action
+- **User-led.** Record what the human raised and agreed - not a performative
+  solo re-review of settled choices
+- **Recommend, don't apply.** Action is next path, not a log of in-session edits
+- **Don't re-verify** what check/audit already prove
+- **Issues are actionable.** Observations without a path are prose, not rows
+- Body markdown follows `style` (load only if not already in context)
 
 ## Formatting
 
-After write or edit: `ds format <path>`. Presentation follows `style` - load
-only if not already in context.
+After write or edit: `ds format <path>`. Presentation follows `style` - load only
+if not already in context.
 
 ## Example
 
 ```markdown
-# Followup: transcript collapse timing
+# Followup: collapse policy
 
-The user's collapse concern is valid, but the design and contract already say
-the right thing; only the implementation needs correction.
+User-led pass after review: collapse should wait for Answer / TurnComplete, not
+tool start.
 
 ## Scope
 
-Investigated Thinking collapse across the user's report, transcript design,
-capability spec, implementation, and streaming tests.
+Post-implementation followup on `chat-calm-transcript`: design collapse table,
+`caps/chat/transcript`, and the open review finding on Thinking collapse.
 
 ## Summary
 
-| # | finding | resolution | → next |
-| --- | --- | --- | --- |
-| 1 | Thinking collapses on tool start | Code diverges from settled contract | /ds-step |
+| # | sev | lens | title | → next |
+| --- | --- | --- | --- | --- |
+| 1 | critical | soundness | Thinking collapses on tool start | /ds-step |
 
-## Findings
+## Issues
 
-### 1. Thinking collapses on tool start
+### 1. Thinking collapses on tool start - soundness/critical
 
-**Where:** `src/transcript.rs:142`; collapse-default scenarios
+**Where:** design collapse table; `caps/chat/transcript` Collapse defaults
 
-**Evidence:** The implementation closes Thinking on the first tool event. The
-design and spec both keep it open until Answer or TurnComplete.
+**Why:** Live Thinking should stay open through tools until Answer or
+TurnComplete; early collapse breaks the calm UX.
 
-**Impact:** Reasoning disappears while tool activity is still streaming,
-contrary to the intended calm transcript.
-
-**Discussion:** Changing the contract to tool-start collapse would reduce open
-content sooner but recreate the abrupt transition the design rejected. The
-existing Answer-or-completion boundary remains clearer.
-
-**Resolution:** Keep the design and spec unchanged; correct the implementation.
-
-**Next:** `/ds-step` - plan the collapse-trigger fix and regression coverage.
+**Action:** Retarget triggers to Answer / TurnComplete; fix via `/ds-step` /
+`/ds-apply` (and `/ds-spec` if the cap is not updated yet).
 
 ## Outcome
 
-Design and contract are sound. The change is not archive-ready until the code
-follows them.
+Agreed on the collapse contract. Plan and code unchanged in this session.
+Suggested next: `/ds-step`. Not archive-ready until the fix lands.
 ```

@@ -729,8 +729,7 @@ mod tests {
     // @spec review Sequential numbering: The first review in a change is numbered 01
     #[test]
     fn review_first_is_numbered_01() {
-        let plan =
-            create_review("post implementation", "add-oauth", &[s("add-oauth")], &[]).unwrap();
+        let plan = create_review("post implementation", "add-oauth", &[s("add-oauth")], &[]).unwrap();
         assert_eq!(
             plan.creates,
             vec![PathBuf::from(
@@ -747,7 +746,10 @@ mod tests {
             "third pass",
             "add-oauth",
             &[s("add-oauth")],
-            &ss(&["01-review-initial.md", "02-review-mid-implementation.md"]),
+            &ss(&[
+                "01-review-initial.md",
+                "02-review-mid-implementation.md",
+            ]),
         )
         .unwrap();
         assert_eq!(
@@ -882,14 +884,8 @@ mod tests {
 
     #[test]
     fn create_step_punctuated_title_is_dash_normalized() {
-        let plan = create_step(
-            "Fix: parser & lexer",
-            "add-oauth",
-            &[s("add-oauth")],
-            &[],
-            None,
-        )
-        .unwrap();
+        let plan =
+            create_step("Fix: parser & lexer", "add-oauth", &[s("add-oauth")], &[], None).unwrap();
         assert_eq!(
             plan.creates,
             vec![PathBuf::from(
